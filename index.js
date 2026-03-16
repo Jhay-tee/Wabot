@@ -9,7 +9,7 @@ import qrcode from "qrcode-terminal";
 import QRCode from "qrcode";
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
-import { delay, createMentions, isAdmin } from "./utils/helpers.js";
+import { delay, isAdmin } from "./utils/helpers.js";
 
 const app = express();
 
@@ -19,18 +19,14 @@ let botActive = true;
 let isActionRunning = false;
 let waVersion = null;
 
-// --------- Supabase Setup ----------
-const SUPABASE_URL = "https://utuncywcoapsqudpovdt.supabase.co"
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0dW5jeXdjb2Fwc3F1ZHBvdmR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NjM2NzMsImV4cCI6MjA4OTIzOTY3M30._wk8kY0hlLlAot66LraBaamz4N7b7juVV1T_mJwYyAU"
+// ---------------- Bot Config ----------------
+const BOT_PHONE_NUMBER = "2348105686810"; // <-- Replace with your bot account number
+const SUPABASE_URL = "https://your-project.supabase.co";
+const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-
 const WA_TABLE = "wa_sessions";
 
-// --------- Auto Cleanup Groups ----------
-const autoCleanupGroups = {};
-const AUTO_CLEANUP_HOURS = 12;
-
-// --------- Express UI for QR ----------
+// ---------------- Express UI for QR ----------------
 app.get("/", async (req, res) => {
   let qrImageTag = "";
   if (currentQR) {
@@ -78,7 +74,7 @@ app.listen(5000, "0.0.0.0", () => {
   console.log("Web UI running at http://0.0.0.0:5000");
 });
 
-// --------- Helper: Load Session from Supabase ----------
+// ---------------- Supabase Session Helpers ----------------
 async function loadSession() {
   const { data, error } = await supabase
     .from(WA_TABLE)
@@ -86,46 +82,34 @@ async function loadSession() {
     .limit(1)
     .single();
 
-  if (error) {
-    console.log("No existing session found in Supabase.");
-    return null;
-  }
-
-  if (!data?.auth_data) return null;
+  if (error || !data?.auth_data) return null;
 
   try {
-    const raw = typeof data.auth_data === "string"
-      ? data.auth_data
-      : JSON.stringify(data.auth_data);
+    const raw = typeof data.auth_data === "string" ? data.auth_data : JSON.stringify(data.auth_data);
     const parsed = JSON.parse(raw, BufferJSON.reviver);
     const creds = parsed?.creds ?? parsed;
     if (!creds || !creds.noiseKey) return null;
     return creds;
-  } catch (e) {
-    console.error("Failed to parse session from Supabase:", e.message);
+  } catch {
     return null;
   }
 }
 
-// --------- Helper: Save Session to Supabase ----------
 async function saveSession(creds) {
   const { error } = await supabase
     .from(WA_TABLE)
     .upsert({ id: 1, auth_data: JSON.stringify(creds, BufferJSON.replacer), updated_at: new Date().toISOString() });
-
   if (error) console.error("Error saving session:", error.message);
 }
 
-// --------- Helper: Clear Session from Supabase ----------
 async function clearSession() {
   const { error } = await supabase
     .from(WA_TABLE)
     .upsert({ id: 1, auth_data: "{}", updated_at: new Date().toISOString() });
   if (error) console.error("Error clearing session:", error.message);
-  else console.log("🗑️ Corrupted session cleared from Supabase.");
 }
 
-// --------- WhatsApp Bot Logic ----------
+// ---------------- WhatsApp Bot Logic ----------------
 async function startBot() {
   if (!waVersion) {
     const { version } = await fetchLatestBaileysVersion();
@@ -176,12 +160,8 @@ async function startBot() {
 
       console.log(`❌ Connection closed. Code: ${statusCode}`);
 
-      if (isLoggedOut) {
-        console.log("🔒 Logged out. Clearing session — re-scan QR to reconnect.");
-        await clearSession();
-        setTimeout(startBot, 3000);
-      } else if (isBadSession) {
-        console.log("⚠️ Bad/corrupted session detected. Clearing and restarting fresh.");
+      if (isLoggedOut || isBadSession) {
+        console.log("🔒 Clearing session and restarting...");
         await clearSession();
         setTimeout(startBot, 3000);
       } else {
@@ -195,10 +175,16 @@ async function startBot() {
     if (!msg.message || msg.key.fromMe) return;
 
     const groupId = msg.key.remoteJid;
-    if (!groupId.endsWith("@g.us")) return;
+    if (!groupId.endsWith("@g.us")) return; // ignore DMs
 
     try {
       const sender = msg.key.participant || msg.key.remoteJid;
+      const ext = msg.message?.extendedTextMessage || {};
+      const mentionedJid = ext.contextInfo?.mentionedJid || [];
+
+      // ---------------- Check if bot phone number is mentioned ----------------
+      const isBotMentioned = mentionedJid.some(jid => jid.split("@")[0] === BOT_PHONE_NUMBER);
+      if (!isBotMentioned) return;
 
       const text =
         msg.message?.conversation ||
@@ -208,11 +194,6 @@ async function startBot() {
         "";
 
       const command = text.trim().toLowerCase();
-      const ext = msg.message?.extendedTextMessage || {};
-      const mentionedJid = ext.contextInfo?.mentionedJid || [];
-
-      if (!mentionedJid.includes(sock.user.id)) return;
-
       const metadata = await sock.groupMetadata(groupId);
       if (!isAdmin(sender, metadata.participants)) return;
       if (!botActive && command !== ".activate") return;
@@ -250,7 +231,7 @@ async function startBot() {
         }
 
         case ".kick": {
-          const targets = mentionedJid.filter(j => j !== sock.user.id);
+          const targets = mentionedJid.filter(j => j.split("@")[0] !== BOT_PHONE_NUMBER);
           if (!targets.length) {
             await sock.sendMessage(groupId, { text: "Tag a user" });
             break;
@@ -268,7 +249,7 @@ async function startBot() {
         }
 
         case ".warn": {
-          const targets = mentionedJid.filter(j => j !== sock.user.id);
+          const targets = mentionedJid.filter(j => j.split("@")[0] !== BOT_PHONE_NUMBER);
           if (!targets.length) {
             await sock.sendMessage(groupId, { text: "Tag user to warn" });
             break;
@@ -315,4 +296,4 @@ async function startBot() {
   });
 }
 
-startBot(); 
+startBot();
