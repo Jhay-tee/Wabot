@@ -1,7 +1,8 @@
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  BufferJSON
 } from "@whiskeysockets/baileys";
 
 import qrcode from "qrcode-terminal";
@@ -19,8 +20,8 @@ let isActionRunning = false;
 let waVersion = null;
 
 // --------- Supabase Setup ----------
-const SUPABASE_URL = "https://utuncywcoapsqudpovdt.supabase.co" 
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0dW5jeXdjb2Fwc3F1ZHBvdmR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NjM2NzMsImV4cCI6MjA4OTIzOTY3M30._wk8kY0hlLlAot66LraBaamz4N7b7juVV1T_mJwYyAU" 
+const SUPABASE_URL = "https://utuncywcoapsqudpovdt.supabase.co"
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0dW5jeXdjb2Fwc3F1ZHBvdmR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NjM2NzMsImV4cCI6MjA4OTIzOTY3M30._wk8kY0hlLlAot66LraBaamz4N7b7juVV1T_mJwYyAU"
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const WA_TABLE = "wa_sessions";
@@ -90,16 +91,38 @@ async function loadSession() {
     return null;
   }
 
-  return data?.auth_data || null;
+  if (!data?.auth_data) return null;
+
+  try {
+    const raw = typeof data.auth_data === "string"
+      ? data.auth_data
+      : JSON.stringify(data.auth_data);
+    const parsed = JSON.parse(raw, BufferJSON.reviver);
+    const creds = parsed?.creds ?? parsed;
+    if (!creds || !creds.noiseKey) return null;
+    return creds;
+  } catch (e) {
+    console.error("Failed to parse session from Supabase:", e.message);
+    return null;
+  }
 }
 
 // --------- Helper: Save Session to Supabase ----------
-async function saveSession(authData) {
-  const { data, error } = await supabase
+async function saveSession(creds) {
+  const { error } = await supabase
     .from(WA_TABLE)
-    .upsert({ id: 1, auth_data: authData, updated_at: new Date().toISOString() });
+    .upsert({ id: 1, auth_data: JSON.stringify(creds, BufferJSON.replacer), updated_at: new Date().toISOString() });
 
   if (error) console.error("Error saving session:", error.message);
+}
+
+// --------- Helper: Clear Session from Supabase ----------
+async function clearSession() {
+  const { error } = await supabase
+    .from(WA_TABLE)
+    .upsert({ id: 1, auth_data: "{}", updated_at: new Date().toISOString() });
+  if (error) console.error("Error clearing session:", error.message);
+  else console.log("🗑️ Corrupted session cleared from Supabase.");
 }
 
 // --------- WhatsApp Bot Logic ----------
@@ -110,13 +133,11 @@ async function startBot() {
     console.log(`Using WA v${version.join('.')}`);
   }
 
-  // Load session from Supabase
-  let savedState = await loadSession();
+  let savedCreds = await loadSession();
   const { state, saveCreds } = await useMultiFileAuthState("auth_info");
 
-  // If session exists in Supabase, load it
-  if (savedState) {
-    Object.assign(state, savedState);
+  if (savedCreds) {
+    state.creds = savedCreds;
     console.log("✅ Session loaded from Supabase!");
   }
 
@@ -125,14 +146,13 @@ async function startBot() {
     auth: state
   });
 
-  // Save creds locally AND to Supabase on update
+  let isConnected = false;
   sock.ev.on("creds.update", async () => {
     saveCreds();
-    await saveSession(state);
+    if (isConnected) await saveSession(state.creds);
   });
 
-  // Connection events
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
+  sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       currentQR = qr;
       botStatus = "waiting_qr";
@@ -140,28 +160,42 @@ async function startBot() {
       qrcode.generate(qr, { small: true });
     }
     if (connection === "open") {
+      isConnected = true;
       botStatus = "connected";
       currentQR = null;
       console.log("✅ Bot connected!");
+      await saveSession(state.creds);
     }
     if (connection === "close") {
       currentQR = null;
       botStatus = "disconnected";
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log(`❌ Connection closed. Reconnecting: ${shouldReconnect}`);
-      if (shouldReconnect) setTimeout(startBot, 3000);
-      else console.log("🔒 Logged out. Delete auth_info to re-scan QR.");
+      const err = lastDisconnect?.error;
+      const statusCode = err?.output?.statusCode;
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+      const isBadSession = err instanceof TypeError || (err && !statusCode);
+
+      console.log(`❌ Connection closed. Code: ${statusCode}`);
+
+      if (isLoggedOut) {
+        console.log("🔒 Logged out. Clearing session — re-scan QR to reconnect.");
+        await clearSession();
+        setTimeout(startBot, 3000);
+      } else if (isBadSession) {
+        console.log("⚠️ Bad/corrupted session detected. Clearing and restarting fresh.");
+        await clearSession();
+        setTimeout(startBot, 3000);
+      } else {
+        setTimeout(startBot, 3000);
+      }
     }
   });
 
-  // Messages
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const msg = messages[0];
     if (!msg.message || msg.key.fromMe) return;
 
     const groupId = msg.key.remoteJid;
-    if (!groupId.endsWith("@g.us")) return; // ignore DMs
+    if (!groupId.endsWith("@g.us")) return;
 
     try {
       const sender = msg.key.participant || msg.key.remoteJid;
@@ -281,4 +315,4 @@ async function startBot() {
   });
 }
 
-startBot();
+startBot(); 
