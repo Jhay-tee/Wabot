@@ -1,0 +1,13 @@
+{
+  "name": "my-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp bot using Baileys",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@adiwajshing/baileys": "^5.0.0"
+  }
+}
