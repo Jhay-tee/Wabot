@@ -1,210 +1,326 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from "@whiskeysockets/baileys";
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} from "@whiskeysockets/baileys";
+
 import qrcode from "qrcode-terminal";
 import QRCode from "qrcode";
 import express from "express";
-import { delay, createMentions, isAdmin } from './utils/helpers.js';
+import { delay, createMentions, isAdmin } from "./utils/helpers.js";
 
 const app = express();
+
 let currentQR = null;
 let botStatus = "starting";
-let isActionRunning = false;
 let botActive = true;
+let isActionRunning = false;
 let waVersion = null;
 
-const autoCleanupGroups = {};
-const AUTO_CLEANUP_HOURS = 12;
-
 app.get("/", async (req, res) => {
-    let qrImageTag = "";
-    if (currentQR) {
-        try {
-            const dataUrl = await QRCode.toDataURL(currentQR);
-            qrImageTag = `<img src="${dataUrl}" alt="WhatsApp QR Code" style="width:80%; max-width:300px; height:auto; border:8px solid white; border-radius:12px;" />`;
-        } catch (e) {
-            qrImageTag = `<p style="color:red">Failed to generate QR image</p>`;
-        }
-    }
 
-    const statusColor = botStatus === "connected" ? "#22c55e" : botStatus === "waiting_qr" ? "#f59e0b" : "#94a3b8";
-    const statusText = {
-        starting: "Starting up...",
-        waiting_qr: "Waiting for QR scan",
-        connected: "Connected to WhatsApp",
-        disconnected: "Disconnected — reconnecting..."
-    }[botStatus] || botStatus;
+let qrImageTag = "";
 
-    res.send(`<!DOCTYPE html>
-<html lang="en">
+if (currentQR) {
+const dataUrl = await QRCode.toDataURL(currentQR);
+
+qrImageTag = `
+<img src="${dataUrl}"
+style="width:80%;max-width:300px;height:auto;border-radius:12px;border:8px solid white"/>
+`;
+}
+
+res.send(`
+<html>
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>WhatsApp Bot</title>
-  <meta http-equiv="refresh" content="60" />
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #0f172a;
-      color: #e2e8f0;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .card {
-      background: #1e293b;
-      border-radius: 20px;
-      padding: 40px;
-      text-align: center;
-      max-width: 420px;
-      width: 90%;
-      box-shadow: 0 25px 50px rgba(0,0,0,0.5);
-    }
-    .logo { font-size: 48px; margin-bottom: 16px; }
-    h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; }
-    .status-badge {
-      display: inline-block;
-      padding: 6px 16px;
-      border-radius: 999px;
-      font-size: 14px;
-      font-weight: 600;
-      margin-bottom: 28px;
-      background: ${statusColor}22;
-      color: ${statusColor};
-      border: 1px solid ${statusColor}44;
-    }
-    .qr-box {
-      background: white;
-      border-radius: 16px;
-      padding: 20px;
-      display: inline-block;
-      margin-bottom: 24px;
-    }
-    .instructions {
-      font-size: 14px;
-      color: #94a3b8;
-      line-height: 1.7;
-    }
-    .instructions strong { color: #e2e8f0; }
-    .refresh-note {
-      margin-top: 20px;
-      font-size: 12px;
-      color: #475569;
-    }
-  </style>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>WhatsApp Bot</title>
+<style>
+body{
+background:#0f172a;
+color:white;
+font-family:sans-serif;
+display:flex;
+align-items:center;
+justify-content:center;
+height:100vh;
+margin:0
+}
+.card{
+background:#1e293b;
+padding:40px;
+border-radius:20px;
+text-align:center;
+width:90%;
+max-width:420px
+}
+</style>
 </head>
-<body>
-  <div class="card">
-    <div class="logo">🤖</div>
-    <h1>WhatsApp Bot</h1>
-    <div class="status-badge">${statusText}</div>
 
-    ${botStatus === "connected" ? `
-      <div style="font-size:64px; margin-bottom:20px;">✅</div>
-      <p class="instructions">Bot is <strong>active</strong> and listening in your WhatsApp groups.<br><br>
-      Mention the bot in a group and use commands like <strong>.kick</strong>, <strong>.warn</strong>, <strong>.tagall</strong>, <strong>.delete</strong>, <strong>.autocleanup</strong>.</p>
-    ` : currentQR ? `
-      <div class="qr-box">${qrImageTag}</div>
-      <p class="instructions">
-        Open <strong>WhatsApp</strong> on your phone<br>
-        Go to <strong>Settings → Linked Devices → Link a Device</strong><br>
-        Scan the QR code above
-      </p>
-      <p class="refresh-note">⟳ Page refreshes every 1 minute for a new code</p>
-    ` : `
-      <div style="font-size:48px; margin-bottom:16px;">⏳</div>
-      <p class="instructions">Bot is starting up, please wait...<br>The QR code will appear here shortly.</p>
-      <p class="refresh-note">⟳ Page refreshes every 1 minute</p>
-    `}
-  </div>
+<body>
+
+<div class="card">
+
+<h2>WhatsApp Bot</h2>
+
+${
+botStatus === "connected"
+? "<h1>✅ Connected</h1>"
+: currentQR
+? qrImageTag
+: "<p>Starting...</p>"
+}
+
+</div>
+
 </body>
-</html>`);
+</html>
+`);
 });
 
 app.listen(5000, "0.0.0.0", () => {
-    console.log("Web UI running at http://0.0.0.0:5000");
+console.log("Server running");
 });
 
-// ---- WhatsApp Bot logic below remains exactly the same ----
-async function startBot() {
-    if (!waVersion) {
-        const { version } = await fetchLatestBaileysVersion();
-        waVersion = version;
-        console.log(`Using WA v${waVersion.join('.')}`);
-    }
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    const sock = makeWASocket({ version: waVersion, auth: state });
-    sock.ev.on('creds.update', saveCreds);
+async function startBot(){
 
-    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-        if (qr) {
-            currentQR = qr;
-            botStatus = "waiting_qr";
-            console.log('\n📱 QR code updated — scan it at the web preview.\n');
-            qrcode.generate(qr, { small: true });
-        }
-        if (connection === 'open') {
-            currentQR = null;
-            botStatus = "connected";
-            console.log('✅ Bot connected to WhatsApp!');
-        }
-        if (connection === 'close') {
-            currentQR = null;
-            botStatus = "disconnected";
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            console.log(`❌ Connection closed. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`);
-            if (shouldReconnect) {
-                setTimeout(startBot, 3000);
-            } else {
-                console.log('🔒 Logged out. Please delete the auth_info folder and restart to re-scan QR.');
-            }
-        }
-    });
+if(!waVersion){
+const { version } = await fetchLatestBaileysVersion();
+waVersion = version;
+}
 
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        const msg = messages[0];
-        if (!msg.message || msg.key.fromMe) return;
+const { state, saveCreds } = await useMultiFileAuthState("auth_info");
 
-        try {
-            const sender = msg.key.participant || msg.key.remoteJid;
-            const groupId = msg.key.remoteJid;
-            const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-            const command = text.trim().toLowerCase();
+const sock = makeWASocket({
+version: waVersion,
+auth: state
+});
 
-            const groupMetadata = await sock.groupMetadata(groupId);
-            const ext = msg.message.extendedTextMessage;
-            const mentionedJid = ext?.contextInfo?.mentionedJid ?? [];
+sock.ev.on("creds.update", saveCreds);
 
-            if (!mentionedJid.includes(sock.user.id)) return;
-            if (!isAdmin(sender, groupMetadata.participants)) return;
-            if (!botActive && command !== '.activate') return;
+sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
 
-            if (isActionRunning) {
-                await sock.sendMessage(groupId, { text: '⚠️ Another action is currently running. Please wait.' });
-                return;
-            }
+if(qr){
+currentQR = qr;
+botStatus = "waiting_qr";
+qrcode.generate(qr,{small:true});
+}
 
-            isActionRunning = true;
+if(connection === "open"){
+botStatus = "connected";
+currentQR = null;
+console.log("Bot connected");
+}
 
-            switch(command) {
-                case '.kick': { /* ... same logic ... */ break; }
-                case '.warn': { /* ... same logic ... */ break; }
-                case '.tagall': { /* ... same logic ... */ break; }
-                case '.delete': { /* ... same logic ... */ break; }
-                case '.autocleanup': { /* ... same logic ... */ break; }
-                case '.deactivate': { /* ... same logic ... */ break; }
-                case '.activate': { /* ... same logic ... */ break; }
-                default: break;
-            }
+if(connection === "close"){
 
-        } catch(error) {
-            console.error(error);
-            await sock.sendMessage(msg.key.remoteJid, { text: `❌ Error: ${error.message}` });
-        } finally {
-            isActionRunning = false;
-        }
-    });
+botStatus = "disconnected";
+
+const shouldReconnect =
+lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+
+if(shouldReconnect){
+setTimeout(startBot,3000);
+}
+}
+
+});
+
+sock.ev.on("messages.upsert", async ({ messages }) => {
+
+const msg = messages[0];
+
+if(!msg.message || msg.key.fromMe) return;
+
+const groupId = msg.key.remoteJid;
+
+// ignore DM
+if(!groupId.endsWith("@g.us")) return;
+
+try{
+
+const sender = msg.key.participant || msg.key.remoteJid;
+
+const text =
+msg.message?.conversation ||
+msg.message?.extendedTextMessage?.text ||
+msg.message?.imageMessage?.caption ||
+msg.message?.videoMessage?.caption ||
+"";
+
+const command = text.trim().toLowerCase();
+
+const ext = msg.message?.extendedTextMessage || {};
+const mentionedJid = ext.contextInfo?.mentionedJid || [];
+
+if(!mentionedJid.includes(sock.user.id)) return;
+
+const metadata = await sock.groupMetadata(groupId);
+
+if(!isAdmin(sender, metadata.participants)) return;
+
+if(!botActive && command !== ".activate") return;
+
+const validCommands = [
+".kick",
+".warn",
+".tagall",
+".delete",
+".activate",
+".deactivate"
+];
+
+if(!validCommands.includes(command)) return;
+
+if(isActionRunning){
+await sock.sendMessage(groupId,{
+text:"⚠️ Another command is running"
+});
+return;
+}
+
+isActionRunning = true;
+
+switch(command){
+
+case ".tagall":{
+
+const users = metadata.participants;
+const batchSize = 20;
+
+for(let i=0;i<users.length;i+=batchSize){
+
+const batch = users.slice(i,i+batchSize);
+
+const mentions = batch.map(p=>p.id);
+
+const tagText = batch
+.map(p=>"@"+p.id.split("@")[0])
+.join(" ");
+
+await sock.sendMessage(groupId,{
+text:tagText,
+mentions
+});
+
+await delay(4000);
+}
+
+break;
+}
+
+case ".kick":{
+
+const targets = mentionedJid.filter(j=>j!==sock.user.id);
+
+if(!targets.length){
+await sock.sendMessage(groupId,{text:"Tag a user"});
+break;
+}
+
+for(const user of targets){
+
+const isTargetAdmin =
+metadata.participants.find(p=>p.id===user)?.admin;
+
+if(isTargetAdmin){
+await sock.sendMessage(groupId,{
+text:"❌ Cannot remove admin"
+});
+continue;
+}
+
+await sock.groupParticipantsUpdate(
+groupId,
+[user],
+"remove"
+);
+
+await delay(4000);
+}
+
+break;
+}
+
+case ".warn":{
+
+const targets = mentionedJid.filter(j=>j!==sock.user.id);
+
+if(!targets.length){
+await sock.sendMessage(groupId,{text:"Tag user to warn"});
+break;
+}
+
+await sock.sendMessage(groupId,{
+text:"⚠️ Warning issued",
+mentions:targets
+});
+
+break;
+}
+
+case ".delete":{
+
+const quoted =
+msg.message?.extendedTextMessage?.contextInfo;
+
+if(!quoted){
+await sock.sendMessage(groupId,{
+text:"Reply to message to delete"
+});
+break;
+}
+
+await sock.sendMessage(groupId,{
+delete:{
+remoteJid:groupId,
+fromMe:false,
+id:quoted.stanzaId,
+participant:quoted.participant
+}
+});
+
+break;
+}
+
+case ".deactivate":{
+
+botActive=false;
+
+await sock.sendMessage(groupId,{
+text:"Bot deactivated"
+});
+
+break;
+}
+
+case ".activate":{
+
+botActive=true;
+
+await sock.sendMessage(groupId,{
+text:"Bot activated"
+});
+
+break;
+}
+
+}
+
+}catch(err){
+
+console.log(err);
+
+}
+
+finally{
+
+isActionRunning=false;
+
+}
+
+});
+
 }
 
 startBot();
