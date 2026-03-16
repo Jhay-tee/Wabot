@@ -1,23 +1,42 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@adiwajshing/baileys";
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from "@whiskeysockets/baileys";
+import qrcode from "qrcode-terminal";
 // import { supabase } from './supabaseClient.js'; // comment out if not configured yet
 import { delay, createMentions, isAdmin } from './utils/helpers.js';
 
 let isActionRunning = false;
 let botActive = true;
+let waVersion = null;
 
 // Per-group auto-cleanup info
 const autoCleanupGroups = {};
 const AUTO_CLEANUP_HOURS = 12; // default 12 hours
 
 async function startBot() {
+    if (!waVersion) {
+        const { version } = await fetchLatestBaileysVersion();
+        waVersion = version;
+        console.log(`Using WA v${waVersion.join('.')}`);
+    }
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    const sock = makeWASocket({ auth: state, printQRInTerminal: true });
+    const sock = makeWASocket({ version: waVersion, auth: state });
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-        if(connection === 'close') {
-            if ((lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut) {
-                startBot(); // reconnect
+    sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+        if (qr) {
+            console.log('\n📱 Scan the QR code below with your WhatsApp app:\n');
+            qrcode.generate(qr, { small: true });
+        }
+        if (connection === 'open') {
+            console.log('✅ Bot connected to WhatsApp!');
+        }
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            console.log(`❌ Connection closed. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+            if (shouldReconnect) {
+                setTimeout(startBot, 3000); // wait 3s before reconnecting
+            } else {
+                console.log('🔒 Logged out. Please delete the auth_info folder and restart to re-scan QR.');
             }
         }
     });
@@ -116,14 +135,6 @@ async function startBot() {
 
                 // ---- Auto-cleanup ----
                 case '.autocleanup': {
-                    // If Supabase not ready, send message
-                    try {
-                        // await supabase.from('users').select('*'); // test supabase
-                    } catch(e) {
-                        await sock.sendMessage(groupId, { text: '❌ Supabase is not initialized. Cannot run auto-cleanup.' });
-                        break;
-                    }
-
                     if (autoCleanupGroups[groupId]) {
                         await sock.sendMessage(groupId, { text: '⚠️ Auto-cleanup already running for this group!' });
                         break;
@@ -177,4 +188,4 @@ async function startBot() {
     });
 }
 
-startBot(); 
+startBot();
