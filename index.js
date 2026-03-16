@@ -19,10 +19,9 @@ let botActive = true;
 let isActionRunning = false;
 let waVersion = null;
 
-// ---------------- Bot Config ----------------
-const BOT_PHONE_NUMBER = "2348105686810"; // <-- Replace with your bot account number
-const SUPABASE_URL = "https://your-project.supabase.co";
-const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
+// ---------------- Supabase Setup ----------------
+const SUPABASE_URL = "YOUR_SUPABASE_URL"; // replace with your Supabase URL
+const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY"; // replace with your anon key
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const WA_TABLE = "wa_sessions";
 
@@ -74,7 +73,7 @@ app.listen(5000, "0.0.0.0", () => {
   console.log("Web UI running at http://0.0.0.0:5000");
 });
 
-// ---------------- Supabase Session Helpers ----------------
+// ---------------- Helper: Load Session from Supabase ----------------
 async function loadSession() {
   const { data, error } = await supabase
     .from(WA_TABLE)
@@ -85,28 +84,30 @@ async function loadSession() {
   if (error || !data?.auth_data) return null;
 
   try {
-    const raw = typeof data.auth_data === "string" ? data.auth_data : JSON.stringify(data.auth_data);
-    const parsed = JSON.parse(raw, BufferJSON.reviver);
-    const creds = parsed?.creds ?? parsed;
-    if (!creds || !creds.noiseKey) return null;
-    return creds;
-  } catch {
+    const parsed = JSON.parse(data.auth_data, BufferJSON.reviver);
+    return parsed?.creds ?? parsed;
+  } catch (e) {
+    console.error("Failed to parse session from Supabase:", e.message);
     return null;
   }
 }
 
+// ---------------- Helper: Save Session to Supabase ----------------
 async function saveSession(creds) {
   const { error } = await supabase
     .from(WA_TABLE)
     .upsert({ id: 1, auth_data: JSON.stringify(creds, BufferJSON.replacer), updated_at: new Date().toISOString() });
+
   if (error) console.error("Error saving session:", error.message);
 }
 
+// ---------------- Helper: Clear Session from Supabase ----------------
 async function clearSession() {
   const { error } = await supabase
     .from(WA_TABLE)
     .upsert({ id: 1, auth_data: "{}", updated_at: new Date().toISOString() });
   if (error) console.error("Error clearing session:", error.message);
+  else console.log("🗑️ Corrupted session cleared from Supabase.");
 }
 
 // ---------------- WhatsApp Bot Logic ----------------
@@ -131,6 +132,7 @@ async function startBot() {
   });
 
   let isConnected = false;
+
   sock.ev.on("creds.update", async () => {
     saveCreds();
     if (isConnected) await saveSession(state.creds);
@@ -161,7 +163,7 @@ async function startBot() {
       console.log(`❌ Connection closed. Code: ${statusCode}`);
 
       if (isLoggedOut || isBadSession) {
-        console.log("🔒 Clearing session and restarting...");
+        console.log("🔒 Clearing session — re-scan QR to reconnect.");
         await clearSession();
         setTimeout(startBot, 3000);
       } else {
@@ -179,12 +181,9 @@ async function startBot() {
 
     try {
       const sender = msg.key.participant || msg.key.remoteJid;
-      const ext = msg.message?.extendedTextMessage || {};
-      const mentionedJid = ext.contextInfo?.mentionedJid || [];
+      const metadata = await sock.groupMetadata(groupId);
 
-      // ---------------- Check if bot phone number is mentioned ----------------
-      const isBotMentioned = mentionedJid.some(jid => jid.split("@")[0] === BOT_PHONE_NUMBER);
-      if (!isBotMentioned) return;
+      if (!isAdmin(sender, metadata.participants)) return; // only admins trigger bot
 
       const text =
         msg.message?.conversation ||
@@ -194,17 +193,19 @@ async function startBot() {
         "";
 
       const command = text.trim().toLowerCase();
-      const metadata = await sock.groupMetadata(groupId);
-      if (!isAdmin(sender, metadata.participants)) return;
-      if (!botActive && command !== ".activate") return;
+      const ext = msg.message?.extendedTextMessage || {};
+      const mentionedJid = ext.contextInfo?.mentionedJid || [];
 
+      // Only respond if admin typed a valid command
       const validCommands = [
         ".kick",
         ".warn",
         ".tagall",
         ".delete",
         ".activate",
-        ".deactivate"
+        ".deactivate",
+        ".lock",
+        ".unlock"
       ];
 
       if (!validCommands.includes(command)) return;
@@ -217,6 +218,7 @@ async function startBot() {
       isActionRunning = true;
 
       switch (command) {
+
         case ".tagall": {
           const users = metadata.participants;
           const batchSize = 20;
@@ -231,9 +233,9 @@ async function startBot() {
         }
 
         case ".kick": {
-          const targets = mentionedJid.filter(j => j.split("@")[0] !== BOT_PHONE_NUMBER);
+          const targets = mentionedJid.filter(j => j !== sock.user.id);
           if (!targets.length) {
-            await sock.sendMessage(groupId, { text: "Tag a user" });
+            await sock.sendMessage(groupId, { text: "Tag a user to remove" });
             break;
           }
           for (const user of targets) {
@@ -243,13 +245,14 @@ async function startBot() {
               continue;
             }
             await sock.groupParticipantsUpdate(groupId, [user], "remove");
+            await sock.sendMessage(groupId, { text: "✅ User has been removed from the group." });
             await delay(4000);
           }
           break;
         }
 
         case ".warn": {
-          const targets = mentionedJid.filter(j => j.split("@")[0] !== BOT_PHONE_NUMBER);
+          const targets = mentionedJid.filter(j => j !== sock.user.id);
           if (!targets.length) {
             await sock.sendMessage(groupId, { text: "Tag user to warn" });
             break;
@@ -260,10 +263,7 @@ async function startBot() {
 
         case ".delete": {
           const quoted = msg.message?.extendedTextMessage?.contextInfo;
-          if (!quoted) {
-            await sock.sendMessage(groupId, { text: "Reply to message to delete" });
-            break;
-          }
+          if (!quoted) break; // admins delete silently
           await sock.sendMessage(groupId, {
             delete: {
               remoteJid: groupId,
@@ -275,19 +275,30 @@ async function startBot() {
           break;
         }
 
-        case ".deactivate":
-          botActive = false;
-          await sock.sendMessage(groupId, { text: "Bot deactivated" });
-          break;
-
         case ".activate":
           botActive = true;
-          await sock.sendMessage(groupId, { text: "Bot activated" });
+          await sock.sendMessage(groupId, {
+            text: "✅ Bot is now active. Automation is ON for admin users."
+          });
           break;
 
-        default:
+        case ".deactivate":
+          botActive = false;
+          await sock.sendMessage(groupId, {
+            text: "⚠️ Bot has been turned off."
+          });
           break;
+
+        case ".lock":
+          await sock.sendMessage(groupId, { text: "🔒 This group has been locked." });
+          break;
+
+        case ".unlock":
+          await sock.sendMessage(groupId, { text: "🔓 This group has been unlocked." });
+          break;
+
       }
+
     } catch (err) {
       console.error(err);
     } finally {
