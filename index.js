@@ -25,8 +25,8 @@ const normalize = str => str.replace(/\s+/g, "").toLowerCase();
 // -------- APP --------
 const app = express();
 
-let currentQR = null;
-let botStatus = "starting";
+let currentQR = null;       // Will hold QR if session not valid
+let botStatus = "starting"; // "waiting_qr" | "connected"
 let waVersion = null;
 
 // -------- SPAM TRACKER --------
@@ -57,24 +57,24 @@ function isValidSession(session) {
 
 // -------- LOAD SESSION --------
 async function loadSession() {
+  // Check Supabase for saved session
   const { data } = await supabase
     .from(WA_TABLE)
     .select("*")
     .eq("id", "main")
     .maybeSingle();
 
-  if (!data?.auth_data) return null;
-
+  if (!data?.auth_data) return null; // No session exists
   if (isValidSession(data.auth_data)) {
     console.log("✅ Session loaded from Supabase");
     return data.auth_data;
   }
 
-  console.log("⚠️ Corrupted session ignored");
+  console.log("⚠️ Corrupted session ignored, will require new QR scan");
   return null;
 }
 
-// -------- SAVE SESSION (SAFE) --------
+// -------- SAVE SESSION --------
 let saveTimer;
 let isSaving = false;
 
@@ -96,8 +96,7 @@ function scheduleSave(state) {
         })),
         updated_at: new Date().toISOString()
       });
-
-      console.log("💾 Session saved");
+      console.log("💾 Session saved to Supabase");
     } catch (err) {
       console.log("❌ Save error:", err.message);
     } finally {
@@ -116,22 +115,26 @@ async function clearSession() {
   });
 }
 
-// -------- WEB QR --------
+// -------- WEB QR & STATUS --------
 app.get("/", async (req, res) => {
-  let qr = "";
+  let content = "";
 
-  if (currentQR) {
+  if (botStatus === "connected") {
+    content = `<h1>✅ Connected</h1><p>Session exists in Supabase</p>`;
+  } else if (currentQR) {
     const dataUrl = await QRCode.toDataURL(currentQR);
-    qr = `<img src="${dataUrl}" style="width:250px"/>`;
+    content = `<img src="${dataUrl}" style="width:250px"/>`;
+  } else {
+    content = "<p>Waiting for QR...</p>";
   }
 
   res.send(`
-  <html>
-    <body style="background:#0f172a;color:white;text-align:center">
-      <h2>WhatsApp Bot</h2>
-      ${botStatus === "connected" ? "<h1>✅ Connected</h1>" : qr}
-    </body>
-  </html>
+    <html>
+      <body style="background:#0f172a;color:white;text-align:center">
+        <h2>WhatsApp Bot</h2>
+        ${content}
+      </body>
+    </html>
   `);
 });
 
@@ -147,6 +150,7 @@ async function startBot() {
     waVersion = version;
   }
 
+  // Load session from Supabase (if exists)
   const state = (await loadSession()) || { creds: {}, keys: {} };
 
   const sock = makeWASocket({
@@ -155,9 +159,7 @@ async function startBot() {
     logger: pino({ level: "silent" })
   });
 
-  sock.ev.on("creds.update", () => {
-    scheduleSave(state);
-  });
+  sock.ev.on("creds.update", () => scheduleSave(state));
 
   sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
 
@@ -170,7 +172,7 @@ async function startBot() {
     if (connection === "open") {
       currentQR = null;
       botStatus = "connected";
-      console.log("✅ Connected");
+      console.log("✅ Connected to WhatsApp");
     }
 
     if (connection === "close") {
@@ -191,23 +193,16 @@ async function startBot() {
       if (update.action === "add" && update.participants?.length > 0) {
         const groupJid = update.id;
         const mentions = update.participants;
-        const metadata = await sock.groupMetadata(groupJid);
-        const groupName = metadata.subject || "this group";
-        const mentionNames = mentions.map(u => `@${u.split("@")[0]}`).join(", ");
 
-        const welcomeText = `🎉 Welcome ${mentionNames} to "${groupName}"!
-
-We are thrilled to have you here and hope you enjoy connecting with everyone.
-
-Please follow our group rules:
-🚫 Do not spam the group
-🚫 Do not send links
-🚫 Do not use vulgar language
-
-Thank you for being part of our community!`;
+        // Fetch group name
+        let groupName = "";
+        try { 
+          const meta = await sock.groupMetadata(groupJid); 
+          groupName = meta.subject || "";
+        } catch {}
 
         await sock.sendMessage(groupJid, {
-          text: welcomeText,
+          text: `👋 Hi ${mentions.map(u => `@${u.split("@")[0]}`).join(", ")}, welcome to ${groupName}!\n\nPlease do not spam the group, do not send links or use vulgar words. Thank you, we are happy to have you.`,
           mentions
         });
       }
@@ -241,49 +236,41 @@ Thank you for being part of our community!`;
       // -------- ANTI-LINK --------
       const linkRegex = /(https?:\/\/\S+|wa\.me\/\S+|chat\.whatsapp\.com\/\S+)/i;
       if (!isUserAdmin && linkRegex.test(text)) {
-        await sock.sendMessage(jid, {
-          delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
-        });
+        await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
         await sock.sendMessage(jid, { text: "🚫 No links allowed" });
         return;
       }
 
-      // -------- ANTI-VULGAR --------
-      const vulgarWords = ["fuck", "nigga", "shit", "bitch"]; // adjust as needed
-      if (!isUserAdmin && vulgarWords.some(w => text.toLowerCase().includes(w))) {
-        await sock.sendMessage(jid, {
-          delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
-        });
-        await sock.sendMessage(jid, { text: "🚫 Please avoid using vulgar language" });
-        return;
-      }
-
       // -------- ANTI-SPAM --------
-      const now = Date.now();
       if (!isUserAdmin) {
-        if (!spamTracker[sender]) {
-          spamTracker[sender] = { lastMsg: text, count: 1, time: now };
-        } else {
+        const now = Date.now();
+        if (!spamTracker[sender]) spamTracker[sender] = { lastMsg: text, count: 1, time: now };
+        else {
           const user = spamTracker[sender];
-          if (normalize(user.lastMsg) === normalize(text) && now - user.time < 5000) {
-            user.count++;
-          } else user.count = 1;
-          user.lastMsg = text;
-          user.time = now;
+          if (normalize(user.lastMsg) === normalize(text) && now - user.time < 5000) user.count++;
+          else user.count = 1;
+          user.lastMsg = text; user.time = now;
           if (user.count >= 4) {
-            await sock.sendMessage(jid, {
-              delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
-            });
+            await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
             await sock.sendMessage(jid, { text: "🚫 No spamming allowed" });
-            user.count = 0;
-            return;
+            user.count = 0; return;
           }
         }
       }
 
+      // -------- VULGAR WORD FILTER --------
+      const vulgarWords = ["fuck", "nigga", "bitch", "asshole", "shit"];
+      const msgLower = text.toLowerCase();
+      if (!isUserAdmin && vulgarWords.some(w => msgLower.includes(w))) {
+        await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
+        await sock.sendMessage(jid, { text: "🚫 Vulgar words are not allowed" });
+        return;
+      }
+
       // -------- COMMANDS --------
       const command = text.trim().toLowerCase();
-      if (!command.startsWith(".") || !isUserAdmin) return;
+      if (!command.startsWith(".")) return;
+      if (!isUserAdmin) return;
 
       // Cooldown
       if (commandCooldown[sender] && Date.now() - commandCooldown[sender] < 3000) return;
@@ -322,22 +309,19 @@ Thank you for being part of our community!`;
         }
       }
 
-      // ---- DELETE ----
-      else if (command === ".delete") {
-        if (!ctx?.stanzaId) return;
+      // ---- TAGALL ----
+      else if (command === ".tagall") {
+        const allMembers = metadata.participants.map(p => p.id);
         await sock.sendMessage(jid, {
-          delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant }
+          text: `@everyone`,
+          mentions: allMembers
         });
       }
 
-      // ---- TAGALL ----
-      else if (command === ".tagall") {
-        const participants = metadata.participants.map(p => p.id);
-        const mentionsText = participants.map(u => `@${u.split("@")[0]}`).join(", ");
-        await sock.sendMessage(jid, {
-          text: `📢 Attention everyone:\n${mentionsText}`,
-          mentions: participants
-        });
+      // ---- DELETE ----
+      else if (command === ".delete") {
+        if (!ctx?.stanzaId) return;
+        await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant } });
       }
 
     } catch (err) {
