@@ -137,8 +137,8 @@ app.get("/", async (req, res) => {
 
 app.get("/health", (req, res) => res.send("OK"));
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, "0.0.0.0");
+//const PORT = process.env.PORT || 5000;
+//app.listen(PORT, "0.0.0.0");
 
 // -------- BOT --------
 async function startBot() {
