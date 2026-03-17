@@ -138,7 +138,7 @@ app.get("/", async (req, res) => {
 app.get("/health", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, "0.0.0.0");
+app.listen(PORT, "0.0.0.0", () => console.log(`🌐 Server running on port ${PORT}`));
 
 // -------- BOT --------
 async function startBot() {
@@ -147,10 +147,7 @@ async function startBot() {
     waVersion = version;
   }
 
-  const state = (await loadSession()) || {
-    creds: {},
-    keys: {}
-  };
+  const state = (await loadSession()) || { creds: {}, keys: {} };
 
   const sock = makeWASocket({
     version: waVersion,
@@ -194,8 +191,23 @@ async function startBot() {
       if (update.action === "add" && update.participants?.length > 0) {
         const groupJid = update.id;
         const mentions = update.participants;
+        const metadata = await sock.groupMetadata(groupJid);
+        const groupName = metadata.subject || "this group";
+        const mentionNames = mentions.map(u => `@${u.split("@")[0]}`).join(", ");
+
+        const welcomeText = `🎉 Welcome ${mentionNames} to "${groupName}"!
+
+We are thrilled to have you here and hope you enjoy connecting with everyone.
+
+Please follow our group rules:
+🚫 Do not spam the group
+🚫 Do not send links
+🚫 Do not use vulgar language
+
+Thank you for being part of our community!`;
+
         await sock.sendMessage(groupJid, {
-          text: `👋 Hi ${mentions.map(u => `@${u.split("@")[0]}`).join(", ")}, welcome!\n\n🚫 No links\n🚫 No spam`,
+          text: welcomeText,
           mentions
         });
       }
@@ -228,49 +240,40 @@ async function startBot() {
 
       // -------- ANTI-LINK --------
       const linkRegex = /(https?:\/\/\S+|wa\.me\/\S+|chat\.whatsapp\.com\/\S+)/i;
-
       if (!isUserAdmin && linkRegex.test(text)) {
         await sock.sendMessage(jid, {
-          delete: {
-            remoteJid: jid,
-            fromMe: false,
-            id: msg.key.id,
-            participant: sender
-          }
+          delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
         });
-
         await sock.sendMessage(jid, { text: "🚫 No links allowed" });
         return;
       }
 
-      // -------- ANTI-SPAM --------
-      if (!isUserAdmin) {
-        const now = Date.now();
+      // -------- ANTI-VULGAR --------
+      const vulgarWords = ["fuck", "nigga", "shit", "bitch"]; // adjust as needed
+      if (!isUserAdmin && vulgarWords.some(w => text.toLowerCase().includes(w))) {
+        await sock.sendMessage(jid, {
+          delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
+        });
+        await sock.sendMessage(jid, { text: "🚫 Please avoid using vulgar language" });
+        return;
+      }
 
+      // -------- ANTI-SPAM --------
+      const now = Date.now();
+      if (!isUserAdmin) {
         if (!spamTracker[sender]) {
           spamTracker[sender] = { lastMsg: text, count: 1, time: now };
         } else {
           const user = spamTracker[sender];
-
           if (normalize(user.lastMsg) === normalize(text) && now - user.time < 5000) {
             user.count++;
-          } else {
-            user.count = 1;
-          }
-
+          } else user.count = 1;
           user.lastMsg = text;
           user.time = now;
-
           if (user.count >= 4) {
             await sock.sendMessage(jid, {
-              delete: {
-                remoteJid: jid,
-                fromMe: false,
-                id: msg.key.id,
-                participant: sender
-              }
+              delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
             });
-
             await sock.sendMessage(jid, { text: "🚫 No spamming allowed" });
             user.count = 0;
             return;
@@ -307,23 +310,15 @@ async function startBot() {
         let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
         if (!targets.length) return sock.sendMessage(jid, { text: "Tag or reply to user" });
 
-        try {
-          const metadata = await sock.groupMetadata(jid);
-
-          for (const user of targets) {
-            const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
-            if (isTargetAdmin) {
-              await sock.sendMessage(jid, { text: "❌ Cannot remove admin" });
-              continue;
-            }
-
-            await delay(500); // small delay
-            await sock.groupParticipantsUpdate(jid, [user], "remove");
-            await sock.sendMessage(jid, { text: `✅ Removed ${user.split("@")[0]}` });
+        for (const user of targets) {
+          const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
+          if (isTargetAdmin) {
+            await sock.sendMessage(jid, { text: "❌ Cannot remove admin" });
+            continue;
           }
-        } catch (err) {
-          console.log("Kick error:", err.message);
-          await sock.sendMessage(jid, { text: "❌ Failed to remove user" });
+          await delay(500);
+          await sock.groupParticipantsUpdate(jid, [user], "remove");
+          await sock.sendMessage(jid, { text: `✅ Removed ${user.split("@")[0]}` });
         }
       }
 
@@ -331,12 +326,17 @@ async function startBot() {
       else if (command === ".delete") {
         if (!ctx?.stanzaId) return;
         await sock.sendMessage(jid, {
-          delete: {
-            remoteJid: jid,
-            fromMe: false,
-            id: ctx.stanzaId,
-            participant: ctx.participant
-          }
+          delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant }
+        });
+      }
+
+      // ---- TAGALL ----
+      else if (command === ".tagall") {
+        const participants = metadata.participants.map(p => p.id);
+        const mentionsText = participants.map(u => `@${u.split("@")[0]}`).join(", ");
+        await sock.sendMessage(jid, {
+          text: `📢 Attention everyone:\n${mentionsText}`,
+          mentions: participants
         });
       }
 
