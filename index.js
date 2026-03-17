@@ -1,8 +1,4 @@
-import makeWASocket, {
-  DisconnectReason,
-  fetchLatestBaileysVersion
-} from "@whiskeysockets/baileys";
-
+import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion } from "@whiskeysockets/baileys";
 import qrcode from "qrcode-terminal";
 import QRCode from "qrcode";
 import express from "express";
@@ -57,19 +53,17 @@ function isValidSession(session) {
 
 // -------- LOAD SESSION --------
 async function loadSession() {
-  // Check Supabase for saved session
   const { data } = await supabase
     .from(WA_TABLE)
     .select("*")
     .eq("id", "main")
     .maybeSingle();
 
-  if (!data?.auth_data) return null; // No session exists
+  if (!data?.auth_data) return null; 
   if (isValidSession(data.auth_data)) {
     console.log("✅ Session loaded from Supabase");
     return data.auth_data;
   }
-
   console.log("⚠️ Corrupted session ignored, will require new QR scan");
   return null;
 }
@@ -86,14 +80,10 @@ function scheduleSave(state) {
     if (!isValidSession(state)) return;
 
     isSaving = true;
-
     try {
       await supabase.from(WA_TABLE).upsert({
         id: "main",
-        auth_data: JSON.parse(JSON.stringify({
-          creds: state.creds,
-          keys: state.keys
-        })),
+        auth_data: JSON.parse(JSON.stringify({ creds: state.creds, keys: state.keys })),
         updated_at: new Date().toISOString()
       });
       console.log("💾 Session saved to Supabase");
@@ -102,7 +92,6 @@ function scheduleSave(state) {
     } finally {
       isSaving = false;
     }
-
   }, 1000);
 }
 
@@ -118,7 +107,6 @@ async function clearSession() {
 // -------- WEB QR & STATUS --------
 app.get("/", async (req, res) => {
   let content = "";
-
   if (botStatus === "connected") {
     content = `<h1>✅ Connected</h1><p>Session exists in Supabase</p>`;
   } else if (currentQR) {
@@ -150,8 +138,15 @@ async function startBot() {
     waVersion = version;
   }
 
-  // Load session from Supabase (if exists)
-  const state = (await loadSession()) || { creds: {}, keys: {} };
+  // Load session from Supabase
+  const savedState = await loadSession();
+  let state;
+  if (savedState) {
+    state = savedState;
+    botStatus = "connected"; // Supabase session exists, no QR needed
+  } else {
+    state = { creds: {}, keys: {} };
+  }
 
   const sock = makeWASocket({
     version: waVersion,
@@ -177,12 +172,10 @@ async function startBot() {
 
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
-
       if (code === DisconnectReason.loggedOut) {
         console.log("🚫 Logged out, clearing session");
         await clearSession();
       }
-
       setTimeout(() => startBot().catch(console.error), 5000);
     }
   });
@@ -269,8 +262,7 @@ async function startBot() {
 
       // -------- COMMANDS --------
       const command = text.trim().toLowerCase();
-      if (!command.startsWith(".")) return;
-      if (!isUserAdmin) return;
+      if (!command.startsWith(".") || !isUserAdmin) return;
 
       // Cooldown
       if (commandCooldown[sender] && Date.now() - commandCooldown[sender] < 3000) return;
@@ -296,7 +288,6 @@ async function startBot() {
       else if (command === ".kick") {
         let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
         if (!targets.length) return sock.sendMessage(jid, { text: "Tag or reply to user" });
-
         for (const user of targets) {
           const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
           if (isTargetAdmin) {
@@ -313,7 +304,7 @@ async function startBot() {
       else if (command === ".tagall") {
         const allMembers = metadata.participants.map(p => p.id);
         await sock.sendMessage(jid, {
-          text: `@everyone`,
+          text: "@everyone",
           mentions: allMembers
         });
       }
