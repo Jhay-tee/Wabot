@@ -2,7 +2,6 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion
 } from "@whiskeysockets/baileys";
-
 import qrcode from "qrcode-terminal";
 import QRCode from "qrcode";
 import express from "express";
@@ -22,26 +21,25 @@ const isAdmin = (jid, participants) => {
 
 const normalize = str => str.replace(/\s+/g, "").toLowerCase();
 
-// -------- APP --------
+// -------- EXPRESS APP --------
 const app = express();
-
 let currentQR = null;
 let botStatus = "starting";
 let waVersion = null;
 
-// -------- SPAM TRACKER --------
-const spamTracker = {};
-const commandCooldown = {};
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`🚀 Server running on port ${PORT}`)
+);
 
 // -------- SUPABASE --------
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
-
 const WA_TABLE = "wa_sessions";
 
-// -------- SESSION VALIDATION --------
+// -------- SESSION HELPERS --------
 function isValidSession(session) {
   return (
     session &&
@@ -55,7 +53,6 @@ function isValidSession(session) {
   );
 }
 
-// -------- LOAD SESSION --------
 async function loadSession() {
   const { data } = await supabase
     .from(WA_TABLE)
@@ -74,10 +71,8 @@ async function loadSession() {
   return null;
 }
 
-// -------- SAVE SESSION (SAFE) --------
 let saveTimer;
 let isSaving = false;
-
 function scheduleSave(state) {
   clearTimeout(saveTimer);
 
@@ -86,28 +81,21 @@ function scheduleSave(state) {
     if (!isValidSession(state)) return;
 
     isSaving = true;
-
     try {
       await supabase.from(WA_TABLE).upsert({
         id: "main",
-        auth_data: JSON.parse(JSON.stringify({
-          creds: state.creds,
-          keys: state.keys
-        })),
+        auth_data: JSON.parse(JSON.stringify({ creds: state.creds, keys: state.keys })),
         updated_at: new Date().toISOString()
       });
-
       console.log("💾 Session saved");
     } catch (err) {
       console.log("❌ Save error:", err.message);
     } finally {
       isSaving = false;
     }
-
   }, 1000);
 }
 
-// -------- CLEAR SESSION --------
 async function clearSession() {
   await supabase.from(WA_TABLE).upsert({
     id: "main",
@@ -116,29 +104,24 @@ async function clearSession() {
   });
 }
 
-// -------- WEB QR --------
+// -------- WEB ROUTES --------
 app.get("/", async (req, res) => {
-  let qr = "";
-
+  let qrHtml = "";
   if (currentQR) {
     const dataUrl = await QRCode.toDataURL(currentQR);
-    qr = `<img src="${dataUrl}" style="width:250px"/>`;
+    qrHtml = `<img src="${dataUrl}" style="width:250px"/>`;
   }
-
   res.send(`
-  <html>
-    <body style="background:#0f172a;color:white;text-align:center">
-      <h2>WhatsApp Bot</h2>
-      ${botStatus === "connected" ? "<h1>✅ Connected</h1>" : qr}
-    </body>
-  </html>
+    <html>
+      <body style="background:#0f172a;color:white;text-align:center">
+        <h2>WhatsApp Bot</h2>
+        ${botStatus === "connected" ? "<h1>✅ Connected</h1>" : qrHtml}
+      </body>
+    </html>
   `);
 });
 
 app.get("/health", (req, res) => res.send("OK"));
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, "0.0.0.0");
 
 // -------- BOT --------
 async function startBot() {
@@ -147,10 +130,15 @@ async function startBot() {
     waVersion = version;
   }
 
-  const state = (await loadSession()) || {
-    creds: {},
-    keys: {}
-  };
+  const savedSession = await loadSession();
+  let state;
+
+  if (savedSession && isValidSession(savedSession)) {
+    state = savedSession;
+  } else {
+    state = undefined; // Let Baileys generate new QR
+    console.log("⚠️ No valid session, waiting for QR scan...");
+  }
 
   const sock = makeWASocket({
     version: waVersion,
@@ -158,15 +146,15 @@ async function startBot() {
     logger: pino({ level: "silent" })
   });
 
-  sock.ev.on("creds.update", () => {
-    scheduleSave(state);
-  });
+  // Save credentials safely
+  sock.ev.on("creds.update", () => scheduleSave(sock.authState));
 
+  // Connection updates
   sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
-
     if (qr) {
       currentQR = qr;
       botStatus = "waiting_qr";
+      console.log("🟡 QR generated");
       qrcode.generate(qr, { small: true });
     }
 
@@ -178,32 +166,30 @@ async function startBot() {
 
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
-
       if (code === DisconnectReason.loggedOut) {
         console.log("🚫 Logged out, clearing session");
         await clearSession();
       }
-
       setTimeout(() => startBot().catch(console.error), 5000);
     }
   });
 
-  // -------- WELCOME --------
+  // Welcome message
   sock.ev.on("group-participants.update", async (update) => {
     if (update.action === "add") {
       for (const user of update.participants) {
         await sock.sendMessage(update.id, {
-          text: `👋 Hi @${user.split("@")[0]}, welcome!
-
-🚫 No links
-🚫 No spam`,
+          text: `👋 Hi @${user.split("@")[0]}, welcome!\n\n🚫 No links\n🚫 No spam`,
           mentions: [user]
         });
       }
     }
   });
 
-  // -------- MESSAGES --------
+  // Message handler
+  const spamTracker = {};
+  const commandCooldown = {};
+
   sock.ev.on("messages.upsert", async ({ messages }) => {
     try {
       const msg = messages[0];
@@ -213,7 +199,6 @@ async function startBot() {
       if (jid === "status@broadcast" || !jid.endsWith("@g.us")) return;
 
       const sender = msg.key.participant;
-
       const metadata = await sock.groupMetadata(jid);
       const isUserAdmin = isAdmin(sender, metadata.participants);
 
@@ -223,75 +208,40 @@ async function startBot() {
         msg.message?.imageMessage?.caption ||
         msg.message?.videoMessage?.caption ||
         "";
-
       if (!text) return;
 
-      // -------- ANTI-LINK --------
+      // ANTI-LINK
       const linkRegex = /(https?:\/\/\S+|wa\.me\/\S+|chat\.whatsapp\.com\/\S+)/i;
-
       if (!isUserAdmin && linkRegex.test(text)) {
-        await sock.sendMessage(jid, {
-          delete: {
-            remoteJid: jid,
-            fromMe: false,
-            id: msg.key.id,
-            participant: sender
-          }
-        });
-
+        await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
         await sock.sendMessage(jid, { text: "🚫 No links allowed" });
         return;
       }
 
-      // -------- ANTI-SPAM --------
+      // ANTI-SPAM
+      const now = Date.now();
       if (!isUserAdmin) {
-        const now = Date.now();
-
-        if (!spamTracker[sender]) {
-          spamTracker[sender] = { lastMsg: text, count: 1, time: now };
-        } else {
+        if (!spamTracker[sender]) spamTracker[sender] = { lastMsg: text, count: 1, time: now };
+        else {
           const user = spamTracker[sender];
-
-          if (
-            normalize(user.lastMsg) === normalize(text) &&
-            now - user.time < 5000
-          ) {
-            user.count++;
-          } else {
-            user.count = 1;
-          }
-
+          if (normalize(user.lastMsg) === normalize(text) && now - user.time < 5000) user.count++;
+          else user.count = 1;
           user.lastMsg = text;
           user.time = now;
 
           if (user.count >= 4) {
-            await sock.sendMessage(jid, {
-              delete: {
-                remoteJid: jid,
-                fromMe: false,
-                id: msg.key.id,
-                participant: sender
-              }
-            });
-
-            await sock.sendMessage(jid, {
-              text: "🚫 No spamming allowed"
-            });
-
+            await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
+            await sock.sendMessage(jid, { text: "🚫 No spamming allowed" });
             user.count = 0;
             return;
           }
         }
       }
 
-      // -------- COMMANDS --------
+      // COMMANDS
       const command = text.trim().toLowerCase();
-      if (!command.startsWith(".")) return;
-      if (!isUserAdmin) return;
-
-      if (commandCooldown[sender] && Date.now() - commandCooldown[sender] < 3000) {
-        return;
-      }
+      if (!command.startsWith(".") || !isUserAdmin) return;
+      if (commandCooldown[sender] && Date.now() - commandCooldown[sender] < 3000) return;
       commandCooldown[sender] = Date.now();
 
       const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
@@ -301,46 +251,24 @@ async function startBot() {
       if (command === ".lock") {
         await sock.groupSettingUpdate(jid, "announcement");
         await sock.sendMessage(jid, { text: "🔒 Group locked" });
-      }
-
-      else if (command === ".unlock") {
+      } else if (command === ".unlock") {
         await sock.groupSettingUpdate(jid, "not_announcement");
         await sock.sendMessage(jid, { text: "🔓 Group unlocked" });
-      }
-
-      else if (command === ".kick") {
-        const metadata = await sock.groupMetadata(jid);
+      } else if (command === ".kick") {
         let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
-
-        if (!targets.length) {
-          return sock.sendMessage(jid, { text: "Tag or reply to user" });
-        }
+        if (!targets.length) return sock.sendMessage(jid, { text: "Tag or reply to user" });
 
         for (const user of targets) {
           const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
-
-          if (isTargetAdmin) {
-            await sock.sendMessage(jid, { text: "❌ Cannot remove admin" });
-            continue;
-          }
+          if (isTargetAdmin) { await sock.sendMessage(jid, { text: "❌ Cannot remove admin" }); continue; }
 
           await sock.groupParticipantsUpdate(jid, [user], "remove");
           await sock.sendMessage(jid, { text: "✅ Removed user" });
           await delay(2000);
         }
-      }
-
-      else if (command === ".delete") {
+      } else if (command === ".delete") {
         if (!ctx?.stanzaId) return;
-
-        await sock.sendMessage(jid, {
-          delete: {
-            remoteJid: jid,
-            fromMe: false,
-            id: ctx.stanzaId,
-            participant: ctx.participant
-          }
-        });
+        await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant } });
       }
 
     } catch (err) {
