@@ -24,8 +24,8 @@ const normalize = str => str.replace(/\s+/g, "").toLowerCase();
 
 // -------- APP --------
 const app = express();
-let currentQR = null;       // Holds QR if session not valid
-let botStatus = "starting"; // "connected" or "waiting_qr"
+
+let currentQR = null;
 let waVersion = null;
 
 // -------- SPAM TRACKER --------
@@ -37,7 +37,6 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
-
 const WA_TABLE = "wa_sessions";
 
 // -------- SESSION VALIDATION --------
@@ -63,13 +62,11 @@ async function loadSession() {
     .maybeSingle();
 
   if (!data?.auth_data) return null;
-
   if (isValidSession(data.auth_data)) {
     console.log("✅ Session loaded from Supabase");
     return data.auth_data;
   }
-
-  console.log("⚠️ No valid session or corrupted, will generate QR");
+  console.log("⚠️ Corrupted session ignored, QR will be generated");
   return null;
 }
 
@@ -111,13 +108,11 @@ async function clearSession() {
 // -------- WEB QR & STATUS --------
 app.get("/", async (req, res) => {
   let content = "";
-  if (botStatus === "connected") {
-    content = `<h1>✅ Connected</h1><p>Session exists in Supabase</p>`;
-  } else if (currentQR) {
+  if (currentQR) {
     const dataUrl = await QRCode.toDataURL(currentQR);
-    content = `<img src="${dataUrl}" style="width:250px"/><p>Scan this QR to connect</p>`;
+    content = `<img src="${dataUrl}" style="width:250px"/>`;
   } else {
-    content = "<p>Waiting for QR...</p>";
+    content = `<h1>✅ Session exists in Supabase</h1>`;
   }
 
   res.send(`
@@ -142,7 +137,6 @@ async function startBot() {
     waVersion = version;
   }
 
-  // Load session from Supabase if exists
   const state = (await loadSession()) || { creds: {}, keys: {} };
 
   const sock = makeWASocket({
@@ -155,15 +149,12 @@ async function startBot() {
 
   sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
     if (qr) {
-      currentQR = qr; // Always set QR when emitted
-      botStatus = "waiting_qr";
+      currentQR = qr;
       qrcode.generate(qr, { small: true });
-      console.log("📌 QR generated, scan with WhatsApp");
     }
 
     if (connection === "open") {
       currentQR = null;
-      botStatus = "connected";
       console.log("✅ Connected to WhatsApp");
     }
 
@@ -177,10 +168,10 @@ async function startBot() {
     }
   });
 
-  // -------- WELCOME MESSAGES --------
+  // -------- WELCOME --------
   sock.ev.on("group-participants.update", async (update) => {
     try {
-      if (update.action === "add" && update.participants?.length) {
+      if (update.action === "add" && update.participants?.length > 0) {
         const groupJid = update.id;
         const mentions = update.participants;
         let groupName = "";
@@ -189,36 +180,33 @@ async function startBot() {
           groupName = meta.subject || "";
         } catch {}
         await sock.sendMessage(groupJid, {
-          text: `👋 Hi ${mentions.map(u => `@${u.split("@")[0]}`).join(", ")}, welcome to ${groupName}!\n\nPlease do not spam the group, send links, or use vulgar words. Thank you, we are happy to have you.`,
+          text: `👋 Hi ${mentions.map(u => `@${u.split("@")[0]}`).join(", ")}, welcome to ${groupName}!\n\nPlease do not spam the group, do not send links or use vulgar words. Thank you, we are happy to have you.`,
           mentions
         });
       }
     } catch (err) {
-      console.log("Welcome error:", err.message);
+      console.log("Welcome message error:", err.message);
     }
   });
 
-  // -------- MESSAGES & COMMANDS --------
+  // -------- MESSAGES --------
   sock.ev.on("messages.upsert", async ({ messages }) => {
     try {
       const msg = messages[0];
       if (!msg.message || msg.key.fromMe) return;
       const jid = msg.key.remoteJid;
       if (jid === "status@broadcast" || !jid.endsWith("@g.us")) return;
-
       const sender = msg.key.participant;
       const metadata = await sock.groupMetadata(jid);
       const isUserAdmin = isAdmin(sender, metadata.participants);
 
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        msg.message?.videoMessage?.caption ||
-        "";
+      const text = msg.message?.conversation ||
+                   msg.message?.extendedTextMessage?.text ||
+                   msg.message?.imageMessage?.caption ||
+                   msg.message?.videoMessage?.caption || "";
       if (!text) return;
 
-      // -------- ANTI-LINK --------
+      // ANTI-LINK
       const linkRegex = /(https?:\/\/\S+|wa\.me\/\S+|chat\.whatsapp\.com\/\S+)/i;
       if (!isUserAdmin && linkRegex.test(text)) {
         await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
@@ -226,7 +214,7 @@ async function startBot() {
         return;
       }
 
-      // -------- ANTI-SPAM --------
+      // ANTI-SPAM
       if (!isUserAdmin) {
         const now = Date.now();
         if (!spamTracker[sender]) spamTracker[sender] = { lastMsg: text, count: 1, time: now };
@@ -238,24 +226,25 @@ async function startBot() {
           if (user.count >= 4) {
             await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
             await sock.sendMessage(jid, { text: "🚫 No spamming allowed" });
-            user.count = 0;
-            return;
+            user.count = 0; return;
           }
         }
       }
 
-      // -------- VULGAR WORDS --------
-      const vulgarWords = ["fuck","nigga","bitch","asshole","shit"];
-      if (!isUserAdmin && vulgarWords.some(w => text.toLowerCase().includes(w))) {
+      // VULGAR WORD FILTER
+      const vulgarWords = ["fuck", "nigga", "bitch", "asshole", "shit"];
+      const msgLower = text.toLowerCase();
+      if (!isUserAdmin && vulgarWords.some(w => msgLower.includes(w))) {
         await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
         await sock.sendMessage(jid, { text: "🚫 Vulgar words are not allowed" });
         return;
       }
 
-      // -------- COMMANDS --------
+      // COMMANDS
       const command = text.trim().toLowerCase();
       if (!command.startsWith(".") || !isUserAdmin) return;
 
+      // Cooldown
       if (commandCooldown[sender] && Date.now() - commandCooldown[sender] < 3000) return;
       commandCooldown[sender] = Date.now();
 
@@ -266,26 +255,27 @@ async function startBot() {
       if (command === ".lock") {
         await sock.groupSettingUpdate(jid, "announcement");
         await sock.sendMessage(jid, { text: "🔒 Group locked" });
-      } else if (command === ".unlock") {
+      }
+      else if (command === ".unlock") {
         await sock.groupSettingUpdate(jid, "not_announcement");
         await sock.sendMessage(jid, { text: "🔓 Group unlocked" });
-      } else if (command === ".kick") {
-        let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
+      }
+      else if (command === ".kick") {
+        const targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
         if (!targets.length) return sock.sendMessage(jid, { text: "Tag or reply to user" });
         for (const user of targets) {
           const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
-          if (isTargetAdmin) {
-            await sock.sendMessage(jid, { text: "❌ Cannot remove admin" });
-            continue;
-          }
+          if (isTargetAdmin) { await sock.sendMessage(jid, { text: "❌ Cannot remove admin" }); continue; }
           await delay(500);
           await sock.groupParticipantsUpdate(jid, [user], "remove");
           await sock.sendMessage(jid, { text: `✅ Removed ${user.split("@")[0]}` });
         }
-      } else if (command === ".tagall") {
+      }
+      else if (command === ".tagall") {
         const allMembers = metadata.participants.map(p => p.id);
-        await sock.sendMessage(jid, { text: `@everyone`, mentions: allMembers });
-      } else if (command === ".delete") {
+        await sock.sendMessage(jid, { text: "@everyone", mentions: allMembers });
+      }
+      else if (command === ".delete") {
         if (!ctx?.stanzaId) return;
         await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant } });
       }
@@ -296,5 +286,4 @@ async function startBot() {
   });
 }
 
-// -------- START BOT --------
 startBot();
