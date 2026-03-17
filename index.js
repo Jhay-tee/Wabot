@@ -1,190 +1,222 @@
 import makeWASocket, {
-  useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion,
-  BufferJSON
+  fetchLatestBaileysVersion
 } from "@whiskeysockets/baileys";
 
 import qrcode from "qrcode-terminal";
 import QRCode from "qrcode";
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
-import { delay, isAdmin } from "./utils/helpers.js";
 import pino from "pino";
+import dotenv from "dotenv";
 
+dotenv.config();
+
+// -------- HELPERS --------
+const delay = ms => new Promise(res => setTimeout(res, ms));
+
+const isAdmin = (jid, participants) => {
+  const user = participants.find(p => p.id === jid);
+  return user && (user.admin === "admin" || user.admin === "superadmin");
+};
+
+const normalize = str => str.replace(/\s+/g, "").toLowerCase();
+
+// -------- APP --------
 const app = express();
 
 let currentQR = null;
 let botStatus = "starting";
-let botActive = true;
-let isActionRunning = false;
 let waVersion = null;
 
-// --------- Supabase Setup ----------
-const SUPABASE_URL = "https://utuncywcoapsqudpovdt.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0dW5jeXdjb2Fwc3F1ZHBvdmR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM2NjM2NzMsImV4cCI6MjA4OTIzOTY3M30._wk8kY0hlLlAot66LraBaamz4N7b7juVV1T_mJwYyAU";
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// -------- SPAM TRACKER --------
+const spamTracker = {};
+const commandCooldown = {};
+
+// -------- SUPABASE --------
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
 
 const WA_TABLE = "wa_sessions";
 
-// --------- Express UI for QR ----------
-app.get("/", async (req, res) => {
-  let qrImageTag = "";
-  if (currentQR) {
-    try {
-      const dataUrl = await QRCode.toDataURL(currentQR);
-      qrImageTag = `<img src="${dataUrl}" style="width:80%; max-width:300px; height:auto; border-radius:12px; border:8px solid white"/>`;
-    } catch (e) {
-      qrImageTag = `<p style="color:red">Failed to generate QR image</p>`;
-    }
+// -------- SESSION VALIDATION --------
+function isValidSession(session) {
+  return (
+    session &&
+    session.creds &&
+    session.creds.me &&
+    session.creds.noiseKey &&
+    session.creds.signedIdentityKey &&
+    session.creds.signedPreKey &&
+    session.creds.advSecretKey &&
+    session.keys
+  );
+}
+
+// -------- LOAD SESSION --------
+async function loadSession() {
+  const { data } = await supabase
+    .from(WA_TABLE)
+    .select("*")
+    .eq("id", "main")
+    .maybeSingle();
+
+  if (!data?.auth_data) return null;
+
+  if (isValidSession(data.auth_data)) {
+    console.log("✅ Session loaded from Supabase");
+    return data.auth_data;
   }
 
-  const statusText = {
-    starting: "Starting up...",
-    waiting_qr: "Waiting for QR scan",
-    connected: "✅ Connected to WhatsApp",
-    disconnected: "Disconnected — reconnecting..."
-  }[botStatus] || botStatus;
+  console.log("⚠️ Corrupted session ignored");
+  return null;
+}
+
+// -------- SAVE SESSION (SAFE) --------
+let saveTimer;
+let isSaving = false;
+
+function scheduleSave(state) {
+  clearTimeout(saveTimer);
+
+  saveTimer = setTimeout(async () => {
+    if (isSaving) return;
+    if (!isValidSession(state)) return;
+
+    isSaving = true;
+
+    try {
+      await supabase.from(WA_TABLE).upsert({
+        id: "main",
+        auth_data: JSON.parse(JSON.stringify({
+          creds: state.creds,
+          keys: state.keys
+        })),
+        updated_at: new Date().toISOString()
+      });
+
+      console.log("💾 Session saved");
+    } catch (err) {
+      console.log("❌ Save error:", err.message);
+    } finally {
+      isSaving = false;
+    }
+
+  }, 1000);
+}
+
+// -------- CLEAR SESSION --------
+async function clearSession() {
+  await supabase.from(WA_TABLE).upsert({
+    id: "main",
+    auth_data: {},
+    updated_at: new Date().toISOString()
+  });
+}
+
+// -------- WEB QR --------
+app.get("/", async (req, res) => {
+  let qr = "";
+
+  if (currentQR) {
+    const dataUrl = await QRCode.toDataURL(currentQR);
+    qr = `<img src="${dataUrl}" style="width:250px"/>`;
+  }
 
   res.send(`
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>WhatsApp Bot</title>
-<style>
-body {background:#0f172a;color:white;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.card {background:#1e293b;padding:40px;border-radius:20px;text-align:center;width:90%;max-width:420px}
-</style>
-</head>
-<body>
-<div class="card">
-<h2>WhatsApp Bot</h2>
-${statusText === "✅ Connected to WhatsApp" ? "<h1>✅ Connected</h1>" : currentQR ? qrImageTag : "<p>Starting...</p>"}
-</div>
-</body>
-</html>
+  <html>
+    <body style="background:#0f172a;color:white;text-align:center">
+      <h2>WhatsApp Bot</h2>
+      ${botStatus === "connected" ? "<h1>✅ Connected</h1>" : qr}
+    </body>
+  </html>
   `);
 });
 
-app.listen(5000, "0.0.0.0", () => {
-  console.log("Web UI running at http://0.0.0.0:5000");
-});
+app.get("/health", (req, res) => res.send("OK"));
 
-// --------- Helper: Load Session from Supabase ----------
-async function loadSession() {
-  const { data, error } = await supabase
-    .from(WA_TABLE)
-    .select("auth_data")
-    .limit(1)
-    .single();
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, "0.0.0.0");
 
-  if (error || !data?.auth_data) {
-    console.log("No existing session found in Supabase.");
-    return null;
-  }
-
-  try {
-    return JSON.parse(data.auth_data, BufferJSON.reviver);
-  } catch (e) {
-    console.error("Failed to parse session from Supabase:", e.message);
-    return null;
-  }
-}
-
-// --------- Helper: Save Session to Supabase ----------
-async function saveSession(state) {
-  const { error } = await supabase
-    .from(WA_TABLE)
-    .upsert({
-      id: 1,
-      auth_data: JSON.stringify(state, BufferJSON.replacer),
-      updated_at: new Date().toISOString()
-    });
-  if (error) console.error("Error saving session:", error.message);
-}
-
-// --------- Helper: Clear Session from Supabase ----------
-async function clearSession() {
-  const { error } = await supabase
-    .from(WA_TABLE)
-    .upsert({ id: 1, auth_data: "{}", updated_at: new Date().toISOString() });
-  if (error) console.error("Error clearing session:", error.message);
-  else console.log("🗑️ Corrupted session cleared from Supabase.");
-}
-
-// --------- WhatsApp Bot Logic ----------
+// -------- BOT --------
 async function startBot() {
   if (!waVersion) {
     const { version } = await fetchLatestBaileysVersion();
     waVersion = version;
-    console.log(`Using WA v${version.join('.')}`);
   }
 
-  let savedState = await loadSession();
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info");
-
-  if (savedState) {
-    state.creds = savedState.creds;
-    state.keys = savedState.keys;
-  }
+  const state = (await loadSession()) || {
+    creds: {},
+    keys: {}
+  };
 
   const sock = makeWASocket({
     version: waVersion,
     auth: state,
-    logger: pino({ level: "debug" })
+    logger: pino({ level: "silent" })
   });
 
-  let isConnected = false;
-
-  sock.ev.on("creds.update", async () => {
-    await saveCreds();
-    if (isConnected) await saveSession(state);
+  sock.ev.on("creds.update", () => {
+    scheduleSave(state);
   });
 
-  sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+  sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
+
     if (qr) {
       currentQR = qr;
       botStatus = "waiting_qr";
-      console.log("📱 QR code updated — scan at the web preview");
       qrcode.generate(qr, { small: true });
     }
-    if (connection === "open") {
-      isConnected = true;
-      botStatus = "connected";
-      currentQR = null;
-      console.log("✅ Bot connected!");
-      await saveSession(state);
-    }
-    if (connection === "close") {
-      currentQR = null;
-      botStatus = "disconnected";
-      const err = lastDisconnect?.error;
-      console.error("Disconnect error:", err?.stack || err);
-      const statusCode = err?.output?.statusCode;
-      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-      const isBadSession = err instanceof TypeError || (err && !statusCode);
 
-      if (isLoggedOut || isBadSession) {
-        console.log("🔒 Logged out or corrupted session. Clearing session.");
+    if (connection === "open") {
+      currentQR = null;
+      botStatus = "connected";
+      console.log("✅ Connected");
+    }
+
+    if (connection === "close") {
+      const code = lastDisconnect?.error?.output?.statusCode;
+
+      if (code === DisconnectReason.loggedOut) {
+        console.log("🚫 Logged out, clearing session");
         await clearSession();
-        setTimeout(startBot, 3000);
-      } else {
-        console.log("❌ Connection closed. Reconnecting...");
-        setTimeout(startBot, 3000);
+      }
+
+      setTimeout(() => startBot().catch(console.error), 5000);
+    }
+  });
+
+  // -------- WELCOME --------
+  sock.ev.on("group-participants.update", async (update) => {
+    if (update.action === "add") {
+      for (const user of update.participants) {
+        await sock.sendMessage(update.id, {
+          text: `👋 Hi @${user.split("@")[0]}, welcome!
+
+🚫 No links
+🚫 No spam`,
+          mentions: [user]
+        });
       }
     }
   });
 
-  // --------- Group Command Logic ----------
+  // -------- MESSAGES --------
   sock.ev.on("messages.upsert", async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
-
-    const groupId = msg.key.remoteJid;
-    if (!groupId.endsWith("@g.us")) return;
-
     try {
-      const sender = msg.key.participant || msg.key.remoteJid;
+      const msg = messages[0];
+      if (!msg.message || msg.key.fromMe) return;
+
+      const jid = msg.key.remoteJid;
+      if (jid === "status@broadcast" || !jid.endsWith("@g.us")) return;
+
+      const sender = msg.key.participant;
+
+      const metadata = await sock.groupMetadata(jid);
+      const isUserAdmin = isAdmin(sender, metadata.participants);
+
       const text =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
@@ -192,95 +224,129 @@ async function startBot() {
         msg.message?.videoMessage?.caption ||
         "";
 
-      const command = text.trim().toLowerCase();
-      const ext = msg.message?.extendedTextMessage || {};
-      const mentionedJid = ext.contextInfo?.mentionedJid || [];
+      if (!text) return;
 
-      const metadata = await sock.groupMetadata(groupId);
-      if (!isAdmin(sender, metadata.participants)) return;
-      if (!botActive && command !== ".activate") return;
+      // -------- ANTI-LINK --------
+      const linkRegex = /(https?:\/\/\S+|wa\.me\/\S+|chat\.whatsapp\.com\/\S+)/i;
 
-      const validCommands = [".kick", ".warn", ".tagall", ".delete", ".activate", ".deactivate"];
-      if (!validCommands.includes(command)) return;
-      if (isActionRunning) return;
-
-      isActionRunning = true;
-
-      switch (command) {
-        case ".tagall": {
-          const users = metadata.participants;
-          for (let i = 0; i < users.length; i += 20) {
-            const batch = users.slice(i, i + 20);
-            const mentions = batch.map(p => p.id);
-            const tagText = batch.map(p => "@" + p.id.split("@")[0]).join(" ");
-            await sock.sendMessage(groupId, { text: tagText, mentions });
-            await delay(4000);
+      if (!isUserAdmin && linkRegex.test(text)) {
+        await sock.sendMessage(jid, {
+          delete: {
+            remoteJid: jid,
+            fromMe: false,
+            id: msg.key.id,
+            participant: sender
           }
-          break;
-        }
+        });
 
-        case ".kick": {
-          const targets = mentionedJid.filter(j => j !== sock.user.id);
-          if (!targets.length) {
-            await sock.sendMessage(groupId, { text: "Tag a user to kick" });
-            break;
-          }
-          for (const user of targets) {
-            const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
-            if (isTargetAdmin) {
-              await sock.sendMessage(groupId, { text: "❌ Cannot remove admin" });
-              continue;
-            }
-            await sock.groupParticipantsUpdate(groupId, [user], "remove");
-            await sock.sendMessage(groupId, { text: "You have been removed from the group" });
-            await delay(4000);
-          }
-          break;
-        }
-
-        case ".warn": {
-          const targets = mentionedJid.filter(j => j !== sock.user.id);
-          if (!targets.length) {
-            await sock.sendMessage(groupId, { text: "Tag a user to warn" });
-            break;
-          }
-          await sock.sendMessage(groupId, { text: "⚠️ Warning issued", mentions: targets });
-          break;
-        }
-                case ".delete": {
-          const quoted = msg.message?.extendedTextMessage?.contextInfo;
-          if (!quoted) break;
-          await sock.sendMessage(groupId, {
-            delete: {
-              remoteJid: groupId,
-              fromMe: false,
-              id: quoted.stanzaId,
-              participant: quoted.participant
-            }
-          });
-          break;
-        }
-
-        case ".deactivate":
-          botActive = false;
-          await sock.sendMessage(groupId, { text: "Bot has been turned off" });
-          break;
-
-        case ".activate":
-          botActive = true;
-          await sock.sendMessage(groupId, { text: "Bot is now active and automation is on" });
-          break;
-
-        default:
-          break;
+        await sock.sendMessage(jid, { text: "🚫 No links allowed" });
+        return;
       }
+
+      // -------- ANTI-SPAM --------
+      if (!isUserAdmin) {
+        const now = Date.now();
+
+        if (!spamTracker[sender]) {
+          spamTracker[sender] = { lastMsg: text, count: 1, time: now };
+        } else {
+          const user = spamTracker[sender];
+
+          if (
+            normalize(user.lastMsg) === normalize(text) &&
+            now - user.time < 5000
+          ) {
+            user.count++;
+          } else {
+            user.count = 1;
+          }
+
+          user.lastMsg = text;
+          user.time = now;
+
+          if (user.count >= 4) {
+            await sock.sendMessage(jid, {
+              delete: {
+                remoteJid: jid,
+                fromMe: false,
+                id: msg.key.id,
+                participant: sender
+              }
+            });
+
+            await sock.sendMessage(jid, {
+              text: "🚫 No spamming allowed"
+            });
+
+            user.count = 0;
+            return;
+          }
+        }
+      }
+
+      // -------- COMMANDS --------
+      const command = text.trim().toLowerCase();
+      if (!command.startsWith(".")) return;
+      if (!isUserAdmin) return;
+
+      if (commandCooldown[sender] && Date.now() - commandCooldown[sender] < 3000) {
+        return;
+      }
+      commandCooldown[sender] = Date.now();
+
+      const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
+      const mentioned = ctx.mentionedJid || [];
+      const replyTarget = ctx.participant;
+
+      if (command === ".lock") {
+        await sock.groupSettingUpdate(jid, "announcement");
+        await sock.sendMessage(jid, { text: "🔒 Group locked" });
+      }
+
+      else if (command === ".unlock") {
+        await sock.groupSettingUpdate(jid, "not_announcement");
+        await sock.sendMessage(jid, { text: "🔓 Group unlocked" });
+      }
+
+      else if (command === ".kick") {
+        const metadata = await sock.groupMetadata(jid);
+        let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
+
+        if (!targets.length) {
+          return sock.sendMessage(jid, { text: "Tag or reply to user" });
+        }
+
+        for (const user of targets) {
+          const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
+
+          if (isTargetAdmin) {
+            await sock.sendMessage(jid, { text: "❌ Cannot remove admin" });
+            continue;
+          }
+
+          await sock.groupParticipantsUpdate(jid, [user], "remove");
+          await sock.sendMessage(jid, { text: "✅ Removed user" });
+          await delay(2000);
+        }
+      }
+
+      else if (command === ".delete") {
+        if (!ctx?.stanzaId) return;
+
+        await sock.sendMessage(jid, {
+          delete: {
+            remoteJid: jid,
+            fromMe: false,
+            id: ctx.stanzaId,
+            participant: ctx.participant
+          }
+        });
+      }
+
     } catch (err) {
-      console.error("Error handling command:", err);
-    } finally {
-      isActionRunning = false;
+      console.log("Handler error:", err.message);
     }
   });
 }
 
-// --------- Start the Bot ----------
 startBot();
