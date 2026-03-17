@@ -10,6 +10,7 @@ import QRCode from "qrcode";
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import { delay, isAdmin } from "./utils/helpers.js";
+import pino from "pino";
 
 const app = express();
 
@@ -83,8 +84,7 @@ async function loadSession() {
   }
 
   try {
-    const parsed = JSON.parse(data.auth_data, BufferJSON.reviver);
-    return parsed?.creds ?? parsed;
+    return JSON.parse(data.auth_data, BufferJSON.reviver);
   } catch (e) {
     console.error("Failed to parse session from Supabase:", e.message);
     return null;
@@ -92,10 +92,14 @@ async function loadSession() {
 }
 
 // --------- Helper: Save Session to Supabase ----------
-async function saveSession(creds) {
+async function saveSession(state) {
   const { error } = await supabase
     .from(WA_TABLE)
-    .upsert({ id: 1, auth_data: JSON.stringify(creds, BufferJSON.replacer), updated_at: new Date().toISOString() });
+    .upsert({
+      id: 1,
+      auth_data: JSON.stringify(state, BufferJSON.replacer),
+      updated_at: new Date().toISOString()
+    });
   if (error) console.error("Error saving session:", error.message);
 }
 
@@ -116,17 +120,25 @@ async function startBot() {
     console.log(`Using WA v${version.join('.')}`);
   }
 
-  let savedCreds = await loadSession();
+  let savedState = await loadSession();
   const { state, saveCreds } = await useMultiFileAuthState("auth_info");
 
-  if (savedCreds) state.creds = savedCreds;
+  if (savedState) {
+    state.creds = savedState.creds;
+    state.keys = savedState.keys;
+  }
 
-  const sock = makeWASocket({ version: waVersion, auth: state });
+  const sock = makeWASocket({
+    version: waVersion,
+    auth: state,
+    logger: pino({ level: "debug" })
+  });
+
   let isConnected = false;
 
   sock.ev.on("creds.update", async () => {
-    saveCreds();
-    if (isConnected) await saveSession(state.creds);
+    await saveCreds();
+    if (isConnected) await saveSession(state);
   });
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
@@ -141,12 +153,13 @@ async function startBot() {
       botStatus = "connected";
       currentQR = null;
       console.log("✅ Bot connected!");
-      await saveSession(state.creds);
+      await saveSession(state);
     }
     if (connection === "close") {
       currentQR = null;
       botStatus = "disconnected";
       const err = lastDisconnect?.error;
+      console.error("Disconnect error:", err?.stack || err);
       const statusCode = err?.output?.statusCode;
       const isLoggedOut = statusCode === DisconnectReason.loggedOut;
       const isBadSession = err instanceof TypeError || (err && !statusCode);
@@ -162,6 +175,7 @@ async function startBot() {
     }
   });
 
+  // --------- Group Command Logic ----------
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const msg = messages[0];
     if (!msg.message || msg.key.fromMe) return;
@@ -183,7 +197,7 @@ async function startBot() {
       const mentionedJid = ext.contextInfo?.mentionedJid || [];
 
       const metadata = await sock.groupMetadata(groupId);
-      if (!isAdmin(sender, metadata.participants)) return; // Only admin triggers commands
+      if (!isAdmin(sender, metadata.participants)) return;
       if (!botActive && command !== ".activate") return;
 
       const validCommands = [".kick", ".warn", ".tagall", ".delete", ".activate", ".deactivate"];
@@ -233,8 +247,7 @@ async function startBot() {
           await sock.sendMessage(groupId, { text: "⚠️ Warning issued", mentions: targets });
           break;
         }
-
-        case ".delete": {
+                case ".delete": {
           const quoted = msg.message?.extendedTextMessage?.contextInfo;
           if (!quoted) break;
           await sock.sendMessage(groupId, {
@@ -262,11 +275,12 @@ async function startBot() {
           break;
       }
     } catch (err) {
-      console.error(err);
+      console.error("Error handling command:", err);
     } finally {
       isActionRunning = false;
     }
   });
 }
 
+// --------- Start the Bot ----------
 startBot();
