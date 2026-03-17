@@ -24,9 +24,8 @@ const normalize = str => str.replace(/\s+/g, "").toLowerCase();
 
 // -------- APP --------
 const app = express();
-
-let currentQR = null;       // Will hold QR if session not valid
-let botStatus = "starting"; // "waiting_qr" | "connected"
+let currentQR = null;       // Holds QR if session not valid
+let botStatus = "starting"; // "connected" or "waiting_qr"
 let waVersion = null;
 
 // -------- SPAM TRACKER --------
@@ -63,13 +62,14 @@ async function loadSession() {
     .eq("id", "main")
     .maybeSingle();
 
-  if (!data?.auth_data) return null; // No session exists
+  if (!data?.auth_data) return null;
+
   if (isValidSession(data.auth_data)) {
     console.log("✅ Session loaded from Supabase");
     return data.auth_data;
   }
 
-  console.log("⚠️ Corrupted session ignored, will require new QR scan");
+  console.log("⚠️ No valid session or corrupted, will generate QR");
   return null;
 }
 
@@ -79,20 +79,15 @@ let isSaving = false;
 
 function scheduleSave(state) {
   clearTimeout(saveTimer);
-
   saveTimer = setTimeout(async () => {
     if (isSaving) return;
     if (!isValidSession(state)) return;
 
     isSaving = true;
-
     try {
       await supabase.from(WA_TABLE).upsert({
         id: "main",
-        auth_data: JSON.parse(JSON.stringify({
-          creds: state.creds,
-          keys: state.keys
-        })),
+        auth_data: JSON.parse(JSON.stringify({ creds: state.creds, keys: state.keys })),
         updated_at: new Date().toISOString()
       });
       console.log("💾 Session saved to Supabase");
@@ -101,7 +96,6 @@ function scheduleSave(state) {
     } finally {
       isSaving = false;
     }
-
   }, 1000);
 }
 
@@ -117,12 +111,11 @@ async function clearSession() {
 // -------- WEB QR & STATUS --------
 app.get("/", async (req, res) => {
   let content = "";
-
   if (botStatus === "connected") {
     content = `<h1>✅ Connected</h1><p>Session exists in Supabase</p>`;
   } else if (currentQR) {
     const dataUrl = await QRCode.toDataURL(currentQR);
-    content = `<img src="${dataUrl}" style="width:250px"/>`;
+    content = `<img src="${dataUrl}" style="width:250px"/><p>Scan this QR to connect</p>`;
   } else {
     content = "<p>Waiting for QR...</p>";
   }
@@ -149,7 +142,7 @@ async function startBot() {
     waVersion = version;
   }
 
-  // Load session from Supabase (if exists)
+  // Load session from Supabase if exists
   const state = (await loadSession()) || { creds: {}, keys: {} };
 
   const sock = makeWASocket({
@@ -161,12 +154,11 @@ async function startBot() {
   sock.ev.on("creds.update", () => scheduleSave(state));
 
   sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
-
     if (qr) {
-      currentQR = qr;              // store actual QR
-      botStatus = "waiting_qr";    // now web page can render it
+      currentQR = qr; // Always set QR when emitted
+      botStatus = "waiting_qr";
       qrcode.generate(qr, { small: true });
-      console.log("🟢 QR generated, scan to login");
+      console.log("📌 QR generated, scan with WhatsApp");
     }
 
     if (connection === "open") {
@@ -177,12 +169,10 @@ async function startBot() {
 
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
-
       if (code === DisconnectReason.loggedOut) {
         console.log("🚫 Logged out, clearing session");
         await clearSession();
       }
-
       setTimeout(() => startBot().catch(console.error), 5000);
     }
   });
@@ -190,23 +180,21 @@ async function startBot() {
   // -------- WELCOME MESSAGES --------
   sock.ev.on("group-participants.update", async (update) => {
     try {
-      if (update.action === "add" && update.participants?.length > 0) {
+      if (update.action === "add" && update.participants?.length) {
         const groupJid = update.id;
         const mentions = update.participants;
-
         let groupName = "";
         try { 
           const meta = await sock.groupMetadata(groupJid); 
           groupName = meta.subject || "";
         } catch {}
-
         await sock.sendMessage(groupJid, {
-          text: `👋 Hi ${mentions.map(u => `@${u.split("@")[0]}`).join(", ")}, welcome to ${groupName}!\n\nPlease do not spam the group, do not send links or use vulgar words. Thank you, we are happy to have you.`,
+          text: `👋 Hi ${mentions.map(u => `@${u.split("@")[0]}`).join(", ")}, welcome to ${groupName}!\n\nPlease do not spam the group, send links, or use vulgar words. Thank you, we are happy to have you.`,
           mentions
         });
       }
     } catch (err) {
-      console.log("Welcome message error:", err.message);
+      console.log("Welcome error:", err.message);
     }
   });
 
@@ -215,7 +203,6 @@ async function startBot() {
     try {
       const msg = messages[0];
       if (!msg.message || msg.key.fromMe) return;
-
       const jid = msg.key.remoteJid;
       if (jid === "status@broadcast" || !jid.endsWith("@g.us")) return;
 
@@ -229,7 +216,6 @@ async function startBot() {
         msg.message?.imageMessage?.caption ||
         msg.message?.videoMessage?.caption ||
         "";
-
       if (!text) return;
 
       // -------- ANTI-LINK --------
@@ -252,15 +238,15 @@ async function startBot() {
           if (user.count >= 4) {
             await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
             await sock.sendMessage(jid, { text: "🚫 No spamming allowed" });
-            user.count = 0; return;
+            user.count = 0;
+            return;
           }
         }
       }
 
-      // -------- VULGAR WORD FILTER --------
-      const vulgarWords = ["fuck", "nigga", "bitch", "asshole", "shit"];
-      const msgLower = text.toLowerCase();
-      if (!isUserAdmin && vulgarWords.some(w => msgLower.includes(w))) {
+      // -------- VULGAR WORDS --------
+      const vulgarWords = ["fuck","nigga","bitch","asshole","shit"];
+      if (!isUserAdmin && vulgarWords.some(w => text.toLowerCase().includes(w))) {
         await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
         await sock.sendMessage(jid, { text: "🚫 Vulgar words are not allowed" });
         return;
@@ -277,23 +263,15 @@ async function startBot() {
       const mentioned = ctx.mentionedJid || [];
       const replyTarget = ctx.participant;
 
-      // ---- LOCK ----
       if (command === ".lock") {
         await sock.groupSettingUpdate(jid, "announcement");
         await sock.sendMessage(jid, { text: "🔒 Group locked" });
-      }
-
-      // ---- UNLOCK ----
-      else if (command === ".unlock") {
+      } else if (command === ".unlock") {
         await sock.groupSettingUpdate(jid, "not_announcement");
         await sock.sendMessage(jid, { text: "🔓 Group unlocked" });
-      }
-
-      // ---- KICK ----
-      else if (command === ".kick") {
+      } else if (command === ".kick") {
         let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
         if (!targets.length) return sock.sendMessage(jid, { text: "Tag or reply to user" });
-
         for (const user of targets) {
           const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
           if (isTargetAdmin) {
@@ -304,19 +282,10 @@ async function startBot() {
           await sock.groupParticipantsUpdate(jid, [user], "remove");
           await sock.sendMessage(jid, { text: `✅ Removed ${user.split("@")[0]}` });
         }
-      }
-
-      // ---- TAGALL ----
-      else if (command === ".tagall") {
+      } else if (command === ".tagall") {
         const allMembers = metadata.participants.map(p => p.id);
-        await sock.sendMessage(jid, {
-          text: `@everyone`,
-          mentions: allMembers
-        });
-      }
-
-      // ---- DELETE ----
-      else if (command === ".delete") {
+        await sock.sendMessage(jid, { text: `@everyone`, mentions: allMembers });
+      } else if (command === ".delete") {
         if (!ctx?.stanzaId) return;
         await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant } });
       }
@@ -327,4 +296,5 @@ async function startBot() {
   });
 }
 
+// -------- START BOT --------
 startBot();
