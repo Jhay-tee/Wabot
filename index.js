@@ -24,9 +24,8 @@ const normalize = str => str.replace(/\s+/g, "").toLowerCase();
 
 // -------- APP --------
 const app = express();
-
-let currentQR = null;       // Holds QR if no valid session
-let botStatus = "starting"; // "connected"
+let currentQR = null;
+let botStatus = "starting";
 let waVersion = null;
 
 // -------- SPAM TRACKER --------
@@ -40,6 +39,7 @@ const supabase = createClient(
 );
 
 const WA_TABLE = "wa_sessions";
+const SESSION_ID = 1; // main session id
 
 // -------- SESSION VALIDATION --------
 function isValidSession(session) {
@@ -57,20 +57,24 @@ function isValidSession(session) {
 
 // -------- LOAD SESSION --------
 async function loadSession() {
-  const { data } = await supabase
-    .from(WA_TABLE)
-    .select("*")
-    .eq("id", "main")
-    .maybeSingle();
+  try {
+    const { data } = await supabase
+      .from(WA_TABLE)
+      .select("*")
+      .eq("id", SESSION_ID)
+      .maybeSingle();
 
-  if (!data?.auth_data) return null;
-  if (isValidSession(data.auth_data)) {
-    console.log("✅ Session loaded from Supabase");
-    return data.auth_data;
+    if (!data?.auth_data) return null;
+    if (isValidSession(data.auth_data)) {
+      console.log("✅ Session loaded from Supabase");
+      return data.auth_data;
+    }
+    console.log("⚠️ Corrupted session ignored, new QR required");
+    return null;
+  } catch (err) {
+    console.log("Supabase load error:", err.message);
+    return null;
   }
-
-  console.log("⚠️ Session empty or corrupted, need new QR");
-  return null;
 }
 
 // -------- SAVE SESSION --------
@@ -80,13 +84,12 @@ let isSaving = false;
 function scheduleSave(state) {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
-    if (isSaving) return;
-    if (!isValidSession(state)) return;
-
+    if (isSaving || !isValidSession(state)) return;
     isSaving = true;
+
     try {
       await supabase.from(WA_TABLE).upsert({
-        id: "main",
+        id: SESSION_ID,
         auth_data: JSON.parse(JSON.stringify({ creds: state.creds, keys: state.keys })),
         updated_at: new Date().toISOString()
       });
@@ -101,11 +104,16 @@ function scheduleSave(state) {
 
 // -------- CLEAR SESSION --------
 async function clearSession() {
-  await supabase.from(WA_TABLE).upsert({
-    id: "main",
-    auth_data: {},
-    updated_at: new Date().toISOString()
-  });
+  try {
+    await supabase.from(WA_TABLE).upsert({
+      id: SESSION_ID,
+      auth_data: null,
+      updated_at: new Date().toISOString()
+    });
+    console.log("🗑️ Session cleared from Supabase");
+  } catch (err) {
+    console.log("❌ Clear session error:", err.message);
+  }
 }
 
 // -------- WEB QR & STATUS --------
@@ -118,7 +126,7 @@ app.get("/", async (req, res) => {
     const dataUrl = await QRCode.toDataURL(currentQR);
     content = `<img src="${dataUrl}" style="width:250px"/>`;
   } else {
-    content = "<p>Generating QR…</p>";
+    content = "<p>Generating QR code...</p>";
   }
 
   res.send(`
@@ -156,7 +164,7 @@ async function startBot() {
   sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
     if (qr) {
       currentQR = qr;
-      qrcode.generate(qr, { small: true });
+      qrcode.generate(qr, { small: true }); // CLI QR
     }
 
     if (connection === "open") {
@@ -181,21 +189,14 @@ async function startBot() {
       if (update.action === "add" && update.participants?.length > 0) {
         const groupJid = update.id;
         const mentions = update.participants;
-
         let groupName = "";
-        try { 
-          const meta = await sock.groupMetadata(groupJid); 
-          groupName = meta.subject || "";
-        } catch {}
-
+        try { groupName = (await sock.groupMetadata(groupJid)).subject || ""; } catch {}
         await sock.sendMessage(groupJid, {
           text: `👋 Hi ${mentions.map(u => `@${u.split("@")[0]}`).join(", ")}, welcome to ${groupName}!\n\nPlease do not spam the group, do not send links or use vulgar words. Thank you, we are happy to have you.`,
           mentions
         });
       }
-    } catch (err) {
-      console.log("Welcome message error:", err.message);
-    }
+    } catch (err) { console.log("Welcome message error:", err.message); }
   });
 
   // -------- MESSAGES & COMMANDS --------
@@ -247,8 +248,7 @@ async function startBot() {
 
       // -------- VULGAR WORD FILTER --------
       const vulgarWords = ["fuck", "nigga", "bitch", "asshole", "shit"];
-      const msgLower = text.toLowerCase();
-      if (!isUserAdmin && vulgarWords.some(w => msgLower.includes(w))) {
+      if (!isUserAdmin && vulgarWords.some(w => text.toLowerCase().includes(w))) {
         await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } });
         await sock.sendMessage(jid, { text: "🚫 Vulgar words are not allowed" });
         return;
@@ -256,10 +256,7 @@ async function startBot() {
 
       // -------- COMMANDS --------
       const command = text.trim().toLowerCase();
-      if (!command.startsWith(".")) return;
-      if (!isUserAdmin) return;
-
-      // Cooldown
+      if (!command.startsWith(".") || !isUserAdmin) return;
       if (commandCooldown[sender] && Date.now() - commandCooldown[sender] < 3000) return;
       commandCooldown[sender] = Date.now();
 
@@ -267,20 +264,13 @@ async function startBot() {
       const mentioned = ctx.mentionedJid || [];
       const replyTarget = ctx.participant;
 
-      // ---- LOCK ----
       if (command === ".lock") {
         await sock.groupSettingUpdate(jid, "announcement");
         await sock.sendMessage(jid, { text: "🔒 Group locked" });
-      }
-
-      // ---- UNLOCK ----
-      else if (command === ".unlock") {
+      } else if (command === ".unlock") {
         await sock.groupSettingUpdate(jid, "not_announcement");
         await sock.sendMessage(jid, { text: "🔓 Group unlocked" });
-      }
-
-      // ---- KICK ----
-      else if (command === ".kick") {
+      } else if (command === ".kick") {
         let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
         if (!targets.length) return sock.sendMessage(jid, { text: "Tag or reply to user" });
 
@@ -294,16 +284,10 @@ async function startBot() {
           await sock.groupParticipantsUpdate(jid, [user], "remove");
           await sock.sendMessage(jid, { text: `✅ Removed ${user.split("@")[0]}` });
         }
-      }
-
-      // ---- TAGALL ----
-      else if (command === ".tagall") {
+      } else if (command === ".tagall") {
         const allMembers = metadata.participants.map(p => p.id);
         await sock.sendMessage(jid, { text: "@everyone", mentions: allMembers });
-      }
-
-      // ---- DELETE ----
-      else if (command === ".delete") {
+      } else if (command === ".delete") {
         if (!ctx?.stanzaId) return;
         await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant } });
       }
