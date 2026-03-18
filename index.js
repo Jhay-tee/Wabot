@@ -13,15 +13,11 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-// -------- PROCESS-LEVEL ERROR GUARDS (prevent crashes) --------
-process.on("uncaughtException", (err) => {
-  console.log("💥 Uncaught Exception:", err?.message || err);
-  process.exit(1); // Exit so Railway can restart
-});
-process.on("unhandledRejection", (reason) => {
-  console.log("💥 Unhandled Rejection:", reason?.message || reason);
+// -------- ENVIRONMENT VALIDATION --------
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
+  console.error("❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY");
   process.exit(1);
-});
+}
 
 // -------- CONFIG --------
 const PORT = process.env.PORT || 5000;
@@ -29,10 +25,32 @@ const SESSION_ID = 1;
 const WA_TABLE = "wa_sessions";
 const VULGAR_WORDS = ["fuck", "nigga", "nigger", "bitch", "asshole", "shit"];
 
-// Validate required environment variables
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
-  console.error("❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY in environment");
-  process.exit(1);
+// -------- SUPABASE WITH TIMEOUT & RETRY --------
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY,
+  {
+    auth: { persistSession: false },
+    global: {
+      fetch: (url, options) => {
+        // Increase timeout to 30 seconds
+        return fetch(url, { ...options, signal: AbortSignal.timeout(30000) });
+      }
+    }
+  }
+);
+
+// Helper to retry Supabase operations
+async function supabaseRetry(operation, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await operation();
+    } catch (err) {
+      console.log(`Supabase retry ${i + 1}/${maxRetries} failed:`, err?.message);
+      if (i === maxRetries - 1) throw err;
+      await new Promise(res => setTimeout(res, 1000 * (i + 1))); // exponential backoff
+    }
+  }
 }
 
 // -------- HELPERS --------
@@ -51,7 +69,6 @@ const normalize = str => {
   try { return str.replace(/\s+/g, "").toLowerCase(); } catch { return ""; }
 };
 
-// Parse time strings like "8:00PM", "7:30AM", "8PM" → "HH:MM" (24h)
 function parseTimeTo24h(timeStr) {
   try {
     const cleaned = String(timeStr).trim();
@@ -69,7 +86,6 @@ function parseTimeTo24h(timeStr) {
   }
 }
 
-// Format "HH:MM" → "8:00 PM" for display
 function formatTime24to12(hhmm) {
   try {
     const [hh, mm] = String(hhmm).split(":").map(Number);
@@ -88,21 +104,17 @@ let botStatus = "starting";
 let waVersion = null;
 let sock = null;
 
-// -------- SUPABASE --------
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
-
-// -------- DB HELPERS --------
+// -------- DB HELPERS (with retry) --------
 
 async function getGroupSettings(groupJid) {
   try {
-    const { data } = await supabase
-      .from("group_settings")
-      .select("*")
-      .eq("group_jid", groupJid)
-      .maybeSingle();
+    const { data } = await supabaseRetry(() =>
+      supabase
+        .from("group_settings")
+        .select("*")
+        .eq("group_jid", groupJid)
+        .maybeSingle()
+    );
     return data || { group_jid: groupJid, bot_active: true, anti_link: true, anti_vulgar: true };
   } catch (e) {
     console.log("getGroupSettings error:", e?.message);
@@ -112,7 +124,9 @@ async function getGroupSettings(groupJid) {
 
 async function updateGroupSettings(groupJid, updates) {
   try {
-    await supabase.from("group_settings").upsert({ group_jid: groupJid, ...updates });
+    await supabaseRetry(() =>
+      supabase.from("group_settings").upsert({ group_jid: groupJid, ...updates })
+    );
   } catch (e) {
     console.log("updateGroupSettings error:", e?.message);
   }
@@ -120,12 +134,14 @@ async function updateGroupSettings(groupJid, updates) {
 
 async function getStrikes(groupJid, userJid) {
   try {
-    const { data } = await supabase
-      .from("group_strikes")
-      .select("strikes")
-      .eq("group_jid", groupJid)
-      .eq("user_jid", userJid)
-      .maybeSingle();
+    const { data } = await supabaseRetry(() =>
+      supabase
+        .from("group_strikes")
+        .select("strikes")
+        .eq("group_jid", groupJid)
+        .eq("user_jid", userJid)
+        .maybeSingle()
+    );
     return data?.strikes || 0;
   } catch (e) {
     console.log("getStrikes error:", e?.message);
@@ -137,12 +153,14 @@ async function incrementStrike(groupJid, userJid) {
   try {
     const current = await getStrikes(groupJid, userJid);
     const newCount = current + 1;
-    await supabase.from("group_strikes").upsert({
-      group_jid: groupJid,
-      user_jid: userJid,
-      strikes: newCount,
-      last_strike: new Date().toISOString()
-    });
+    await supabaseRetry(() =>
+      supabase.from("group_strikes").upsert({
+        group_jid: groupJid,
+        user_jid: userJid,
+        strikes: newCount,
+        last_strike: new Date().toISOString()
+      })
+    );
     return newCount;
   } catch (e) {
     console.log("incrementStrike error:", e?.message);
@@ -152,10 +170,13 @@ async function incrementStrike(groupJid, userJid) {
 
 async function resetUserStrikes(groupJid, userJid) {
   try {
-    await supabase.from("group_strikes")
-      .delete()
-      .eq("group_jid", groupJid)
-      .eq("user_jid", userJid);
+    await supabaseRetry(() =>
+      supabase
+        .from("group_strikes")
+        .delete()
+        .eq("group_jid", groupJid)
+        .eq("user_jid", userJid)
+    );
   } catch (e) {
     console.log("resetUserStrikes error:", e?.message);
   }
@@ -163,11 +184,13 @@ async function resetUserStrikes(groupJid, userJid) {
 
 async function getScheduledLock(groupJid) {
   try {
-    const { data } = await supabase
-      .from("group_scheduled_locks")
-      .select("*")
-      .eq("group_jid", groupJid)
-      .maybeSingle();
+    const { data } = await supabaseRetry(() =>
+      supabase
+        .from("group_scheduled_locks")
+        .select("*")
+        .eq("group_jid", groupJid)
+        .maybeSingle()
+    );
     return data;
   } catch (e) {
     console.log("getScheduledLock error:", e?.message);
@@ -177,10 +200,12 @@ async function getScheduledLock(groupJid) {
 
 async function setScheduledLockTime(groupJid, lockTime) {
   try {
-    await supabase.from("group_scheduled_locks").upsert({
-      group_jid: groupJid,
-      lock_time: lockTime
-    });
+    await supabaseRetry(() =>
+      supabase.from("group_scheduled_locks").upsert({
+        group_jid: groupJid,
+        lock_time: lockTime
+      })
+    );
   } catch (e) {
     console.log("setScheduledLockTime error:", e?.message);
   }
@@ -188,10 +213,12 @@ async function setScheduledLockTime(groupJid, lockTime) {
 
 async function setScheduledUnlockTime(groupJid, unlockTime) {
   try {
-    await supabase.from("group_scheduled_locks").upsert({
-      group_jid: groupJid,
-      unlock_time: unlockTime
-    });
+    await supabaseRetry(() =>
+      supabase.from("group_scheduled_locks").upsert({
+        group_jid: groupJid,
+        unlock_time: unlockTime
+      })
+    );
   } catch (e) {
     console.log("setScheduledUnlockTime error:", e?.message);
   }
@@ -199,9 +226,12 @@ async function setScheduledUnlockTime(groupJid, unlockTime) {
 
 async function clearLockTime(groupJid) {
   try {
-    await supabase.from("group_scheduled_locks")
-      .update({ lock_time: null })
-      .eq("group_jid", groupJid);
+    await supabaseRetry(() =>
+      supabase
+        .from("group_scheduled_locks")
+        .update({ lock_time: null })
+        .eq("group_jid", groupJid)
+    );
   } catch (e) {
     console.log("clearLockTime error:", e?.message);
   }
@@ -209,9 +239,12 @@ async function clearLockTime(groupJid) {
 
 async function clearUnlockTime(groupJid) {
   try {
-    await supabase.from("group_scheduled_locks")
-      .update({ unlock_time: null })
-      .eq("group_jid", groupJid);
+    await supabaseRetry(() =>
+      supabase
+        .from("group_scheduled_locks")
+        .update({ unlock_time: null })
+        .eq("group_jid", groupJid)
+    );
   } catch (e) {
     console.log("clearUnlockTime error:", e?.message);
   }
@@ -254,10 +287,18 @@ const welcomeBuffers = {};
 
 function scheduleWelcome(groupJid, participants, groupName) {
   try {
+    // Ensure participants is an array of strings
+    if (!Array.isArray(participants)) {
+      console.log("scheduleWelcome: participants is not an array", participants);
+      return;
+    }
+    const validParticipants = participants.filter(p => typeof p === 'string');
+    if (validParticipants.length === 0) return;
+
     if (!welcomeBuffers[groupJid]) {
       welcomeBuffers[groupJid] = { participants: [] };
     }
-    welcomeBuffers[groupJid].participants.push(...participants);
+    welcomeBuffers[groupJid].participants.push(...validParticipants);
 
     clearTimeout(welcomeBuffers[groupJid].timer);
     welcomeBuffers[groupJid].timer = setTimeout(async () => {
@@ -281,7 +322,6 @@ function scheduleWelcome(groupJid, participants, groupName) {
 }
 
 // -------- SCHEDULED LOCK / UNLOCK CHECKER --------
-// Runs every 60 seconds. Fires once per minute, then nulls the column.
 const firedThisMinute = new Set();
 
 function startScheduledLockChecker() {
@@ -289,9 +329,11 @@ function startScheduledLockChecker() {
     try {
       if (!sock || botStatus !== "connected") return;
 
-      const { data: rows, error } = await supabase
-        .from("group_scheduled_locks")
-        .select("group_jid, lock_time, unlock_time");
+      const { data: rows, error } = await supabaseRetry(() =>
+        supabase
+          .from("group_scheduled_locks")
+          .select("group_jid, lock_time, unlock_time")
+      );
 
       if (error || !rows || rows.length === 0) return;
 
@@ -300,7 +342,6 @@ function startScheduledLockChecker() {
       const currentMM = now.getMinutes();
 
       for (const row of rows) {
-        // ---- Check lock_time ----
         if (row.lock_time) {
           const [lHH, lMM] = row.lock_time.split(":").map(Number);
           if (lHH === currentHH && lMM === currentMM) {
@@ -322,12 +363,11 @@ function startScheduledLockChecker() {
                 console.log("Scheduled lock execute error:", e?.message);
               }
 
-              await clearLockTime(row.group_jid); // lock_time becomes null after firing
+              await clearLockTime(row.group_jid);
             }
           }
         }
 
-        // ---- Check unlock_time ----
         if (row.unlock_time) {
           const [uHH, uMM] = row.unlock_time.split(":").map(Number);
           if (uHH === currentHH && uMM === currentMM) {
@@ -349,7 +389,7 @@ function startScheduledLockChecker() {
                 console.log("Scheduled unlock execute error:", e?.message);
               }
 
-              await clearUnlockTime(row.group_jid); // unlock_time becomes null after firing
+              await clearUnlockTime(row.group_jid);
             }
           }
         }
@@ -360,22 +400,16 @@ function startScheduledLockChecker() {
   }, 60000);
 }
 
-// -------- MEMORY CLEANUP (spamTracker & commandCooldown) --------
+// -------- MEMORY CLEANUP --------
 setInterval(() => {
   const now = Date.now();
-  // Clean spamTracker entries older than 24 hours
   for (const [key, value] of Object.entries(spamTracker)) {
-    if (now - value.time > 24 * 60 * 60 * 1000) {
-      delete spamTracker[key];
-    }
+    if (now - value.time > 24 * 60 * 60 * 1000) delete spamTracker[key];
   }
-  // Clean commandCooldown entries older than 1 hour
   for (const [key, time] of Object.entries(commandCooldown)) {
-    if (now - time > 60 * 60 * 1000) {
-      delete commandCooldown[key];
-    }
+    if (now - time > 60 * 60 * 1000) delete commandCooldown[key];
   }
-}, 60 * 60 * 1000); // once per hour
+}, 60 * 60 * 1000);
 
 // -------- SESSION VALIDATION --------
 function isValidSession(session) {
@@ -404,11 +438,13 @@ function isValidSession(session) {
 async function loadSession() {
   try {
     console.log("🔍 Checking Supabase for existing session...");
-    const { data, error } = await supabase
-      .from(WA_TABLE)
-      .select("auth_data")
-      .eq("id", SESSION_ID)
-      .maybeSingle();
+    const { data, error } = await supabaseRetry(() =>
+      supabase
+        .from(WA_TABLE)
+        .select("auth_data")
+        .eq("id", SESSION_ID)
+        .maybeSingle()
+    );
 
     if (error) { console.log("❌ Supabase error:", error.message); return null; }
     if (!data?.auth_data) { console.log("📱 No session found — QR will generate"); return null; }
@@ -432,12 +468,13 @@ async function scheduleSave(snapshot) {
     saveTimer = setTimeout(async () => {
       try {
         const serialized = JSON.parse(JSON.stringify(snapshot, BufferJSON.replacer));
-        const { error } = await supabase.from(WA_TABLE).upsert({
-          id: SESSION_ID,
-          auth_data: serialized,
-          updated_at: new Date().toISOString()
-        });
-        if (error) throw error;
+        await supabaseRetry(() =>
+          supabase.from(WA_TABLE).upsert({
+            id: SESSION_ID,
+            auth_data: serialized,
+            updated_at: new Date().toISOString()
+          })
+        );
         console.log("💾 Session saved — as:", snapshot.creds.me?.name || "Unknown");
       } catch (err) {
         console.log("❌ Save error:", err?.message);
@@ -451,12 +488,13 @@ async function scheduleSave(snapshot) {
 // -------- CLEAR SESSION --------
 async function clearSession() {
   try {
-    const { error } = await supabase.from(WA_TABLE).upsert({
-      id: SESSION_ID,
-      auth_data: null,
-      updated_at: new Date().toISOString()
-    });
-    if (error) throw error;
+    await supabaseRetry(() =>
+      supabase.from(WA_TABLE).upsert({
+        id: SESSION_ID,
+        auth_data: null,
+        updated_at: new Date().toISOString()
+      })
+    );
     console.log("🗑️ Session cleared");
   } catch (err) {
     console.log("❌ Clear session error:", err?.message);
@@ -477,6 +515,7 @@ app.get("/", async (req, res) => {
       <head>
         <title>WhatsApp Bot</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta http-equiv="refresh" content="5">
         <style>
           * { margin: 0; padding: 0; box-sizing: border-box; }
           body {
@@ -545,22 +584,6 @@ app.get("/", async (req, res) => {
 
           <a href="/force-qr" class="force-btn">🔄 Force New QR Code</a>
         </div>
-
-        <script>
-          const STATUS = '${botStatus}';
-          if (STATUS !== 'connected') {
-            let interval = setInterval(async () => {
-              try {
-                const res = await fetch('/status');
-                const data = await res.json();
-                if (data.botStatus !== STATUS) {
-                  clearInterval(interval);
-                  location.reload();
-                }
-              } catch (e) {}
-            }, 3000);
-          }
-        </script>
       </body>
       </html>
     `);
@@ -662,7 +685,7 @@ function buildAuthState(savedSession) {
 }
 
 // -------- START BOT --------
-let isStarting = false; // guard against concurrent starts
+let isStarting = false;
 
 async function startBot() {
   if (isStarting) {
@@ -701,17 +724,14 @@ async function startBot() {
       keepAliveIntervalMs: 30000
     });
 
-    // Listen for socket errors
     sock.ev.on("error", (err) => {
       console.log("💥 Socket error:", err?.message);
-      // Do not restart here; let connection.update handle it.
     });
 
     sock.ev.on("creds.update", () => {
       try { scheduleSave(authState.getSnapshot()); } catch {}
     });
 
-    // -------- CONNECTION UPDATES --------
     sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
       try {
         console.log("📡 Connection update:", { connection, hasQR: !!qr });
@@ -758,12 +778,10 @@ async function startBot() {
       }
     });
 
-    // -------- GROUP PARTICIPANTS UPDATE --------
     sock.ev.on("group-participants.update", async (update) => {
       try {
         const { action, participants, id: groupJid } = update;
 
-        // Welcome new members (batched, 5s window)
         const joinActions = ["add", "invite", "linked_group_join"];
         if (joinActions.includes(action) && participants?.length > 0) {
           try {
@@ -782,7 +800,6 @@ async function startBot() {
           }
         }
 
-        // Reset strikes when user leaves or is removed
         if (action === "remove" || action === "leave") {
           for (const user of (participants || [])) {
             try { await resetUserStrikes(groupJid, user); } catch {}
@@ -793,7 +810,6 @@ async function startBot() {
       }
     });
 
-    // -------- MESSAGES & COMMANDS --------
     sock.ev.on("messages.upsert", async ({ messages }) => {
       try {
         const msg = messages?.[0];
@@ -811,20 +827,26 @@ async function startBot() {
 
         const isUserAdmin = isAdmin(sender, metadata.participants);
 
-        const text = (
-          msg.message?.conversation ||
-          msg.message?.extendedTextMessage?.text ||
-          msg.message?.imageMessage?.caption ||
-          ""
-        ).trim();
-
+        // Safely extract text
+        let text = "";
+        try {
+          text = (
+            msg.message?.conversation ||
+            msg.message?.extendedTextMessage?.text ||
+            msg.message?.imageMessage?.caption ||
+            msg.message?.videoMessage?.caption ||
+            ""
+          ).trim();
+        } catch {
+          text = "";
+        }
         if (!text) return;
 
         const settings = await getGroupSettings(jid);
         const command = text.toLowerCase().trim();
         const isCommand = command.startsWith(".");
 
-        // ---- .bot on / .bot off — works even when bot is inactive ----
+        // .bot on / .bot off (even when inactive)
         if (isCommand && isUserAdmin) {
           if (command === ".bot on") {
             await updateGroupSettings(jid, { bot_active: true });
@@ -838,22 +860,18 @@ async function startBot() {
           }
         }
 
-        // ---- If bot is inactive and it's a command (but not .bot on), reject it ----
-        if (!settings.bot_active && isCommand && !isUserAdmin) {
-          // Non-admin commands should not even reach here because earlier check, but just in case.
-          return;
-        }
+        // If bot inactive and command (but not .bot on) → warn
         if (!settings.bot_active && isCommand && isUserAdmin && command !== ".bot on") {
           try {
             await sock.sendMessage(jid, { text: "⚠️ Bot is currently deactivated. Use `.bot on` to activate." });
           } catch {}
-          return; // Do not execute any other command
+          return;
         }
 
-        // ---- Skip non-commands when bot is off ----
+        // Skip non-commands when bot off
         if (!settings.bot_active && !isCommand) return;
 
-        // ---- ANTI-VULGAR (non-admins only, when enabled) ----
+        // Anti-vulgar
         if (!isUserAdmin && settings.bot_active && settings.anti_vulgar) {
           const normalizedText = normalize(text);
           const hasVulgar = VULGAR_WORDS.some(word => normalizedText.includes(normalize(word)));
@@ -868,7 +886,7 @@ async function startBot() {
           }
         }
 
-        // ---- ANTI-LINK (non-admins only, when enabled) ----
+        // Anti-link
         if (!isUserAdmin && settings.bot_active && settings.anti_link) {
           const linkRegex = /(https?:\/\/\S+|wa\.me\/\S+|chat\.whatsapp\.com\/\S+)/i;
           if (linkRegex.test(text)) {
@@ -882,21 +900,19 @@ async function startBot() {
           }
         }
 
-        // ---- All other commands: admins only ----
+        // Admin commands only beyond this point
         if (!isCommand || !isUserAdmin) return;
 
         const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
         const mentioned = ctx.mentionedJid || [];
         const replyTarget = ctx.participant;
 
-        // =========================================================
         // .lock
-        // =========================================================
         if (command === ".lock") {
           try {
             const meta = await sock.groupMetadata(jid);
             if (meta.announce) {
-              // Already locked – do nothing, no reply
+              // Already locked – do nothing
               return;
             }
             await sock.groupSettingUpdate(jid, "announcement");
@@ -906,7 +922,6 @@ async function startBot() {
             console.log(".lock error:", e?.message);
             try { await sock.sendMessage(jid, { text: "❌ Failed to lock the group. Please try again." }); } catch {}
           }
-
         } else if (command === ".lock clear") {
           try {
             await clearLockTime(jid);
@@ -914,7 +929,6 @@ async function startBot() {
           } catch (e) {
             console.log(".lock clear error:", e?.message);
           }
-
         } else if (command.startsWith(".lock ")) {
           try {
             const timeArg = text.slice(6).trim();
@@ -934,15 +948,12 @@ async function startBot() {
             try { await sock.sendMessage(jid, { text: "❌ Failed to set scheduled lock. Please try again." }); } catch {}
           }
 
-        // =========================================================
         // .unlock
-        // =========================================================
         } else if (command === ".unlock") {
           try {
             const meta = await sock.groupMetadata(jid);
             if (!meta.announce) {
-              // Already unlocked – do nothing, no reply
-              return;
+              return; // already unlocked, no reply
             }
             await sock.groupSettingUpdate(jid, "not_announcement");
             await clearUnlockTime(jid);
@@ -951,7 +962,6 @@ async function startBot() {
             console.log(".unlock error:", e?.message);
             try { await sock.sendMessage(jid, { text: "❌ Failed to unlock the group. Please try again." }); } catch {}
           }
-
         } else if (command === ".unlock clear") {
           try {
             await clearUnlockTime(jid);
@@ -959,7 +969,6 @@ async function startBot() {
           } catch (e) {
             console.log(".unlock clear error:", e?.message);
           }
-
         } else if (command.startsWith(".unlock ")) {
           try {
             const timeArg = text.slice(8).trim();
@@ -979,9 +988,7 @@ async function startBot() {
             try { await sock.sendMessage(jid, { text: "❌ Failed to set scheduled unlock. Please try again." }); } catch {}
           }
 
-        // =========================================================
         // .kick
-        // =========================================================
         } else if (command.startsWith(".kick")) {
           try {
             const targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
@@ -990,7 +997,6 @@ async function startBot() {
               return;
             }
             for (const user of targets) {
-              // Check if user exists in the group
               const userExists = metadata.participants.some(p => p.id === user);
               if (!userExists) {
                 await sock.sendMessage(jid, {
@@ -1025,9 +1031,7 @@ async function startBot() {
             console.log(".kick error:", e?.message);
           }
 
-        // =========================================================
-        // .strike reset @user
-        // =========================================================
+        // .strike reset
         } else if (command.startsWith(".strike reset")) {
           try {
             const targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
@@ -1050,9 +1054,7 @@ async function startBot() {
             console.log(".strike reset error:", e?.message);
           }
 
-        // =========================================================
         // .tagall
-        // =========================================================
         } else if (command === ".tagall") {
           try {
             const allMembers = metadata.participants.map(p => p.id);
@@ -1062,9 +1064,7 @@ async function startBot() {
             console.log(".tagall error:", e?.message);
           }
 
-        // =========================================================
         // .delete
-        // =========================================================
         } else if (command === ".delete") {
           try {
             if (!ctx?.stanzaId) {
@@ -1078,39 +1078,31 @@ async function startBot() {
             console.log(".delete error:", e?.message);
           }
 
-        // =========================================================
         // .antilink on/off
-        // =========================================================
         } else if (command === ".antilink on") {
           try {
             await updateGroupSettings(jid, { anti_link: true });
             await sock.sendMessage(jid, { text: "🔗 Anti-link is now *enabled*." });
           } catch (e) { console.log(".antilink on error:", e?.message); }
-
         } else if (command === ".antilink off") {
           try {
             await updateGroupSettings(jid, { anti_link: false });
             await sock.sendMessage(jid, { text: "🔗 Anti-link is now *disabled*." });
           } catch (e) { console.log(".antilink off error:", e?.message); }
 
-        // =========================================================
         // .antivulgar on/off
-        // =========================================================
         } else if (command === ".antivulgar on") {
           try {
             await updateGroupSettings(jid, { anti_vulgar: true });
             await sock.sendMessage(jid, { text: "🔞 Anti-vulgar is now *enabled*." });
           } catch (e) { console.log(".antivulgar on error:", e?.message); }
-
         } else if (command === ".antivulgar off") {
           try {
             await updateGroupSettings(jid, { anti_vulgar: false });
             await sock.sendMessage(jid, { text: "🔞 Anti-vulgar is now *disabled*." });
           } catch (e) { console.log(".antivulgar off error:", e?.message); }
 
-        // =========================================================
         // .help
-        // =========================================================
         } else if (command === ".help") {
           try {
             const sched = await getScheduledLock(jid);
@@ -1147,7 +1139,6 @@ async function startBot() {
             console.log(".help error:", e?.message);
           }
         }
-
       } catch (e) {
         console.log("messages.upsert error:", e?.message);
       }
@@ -1171,7 +1162,7 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
     console.log(`⚠️ Port ${PORT} is already in use. Exiting...`);
-    process.exit(1); // Let Railway restart
+    process.exit(1);
   } else {
     console.log("❌ Server error:", err?.message);
   }
