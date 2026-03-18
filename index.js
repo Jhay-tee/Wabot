@@ -29,7 +29,7 @@ const normalize = str => str.replace(/\s+/g, "").toLowerCase();
 
 // -------- APP --------
 const app = express();
-let currentQR = null;
+let currentQR = "Loading..."; // Default message
 let botStatus = "starting";
 let waVersion = null;
 let sock = null;
@@ -94,84 +94,145 @@ async function clearSession() {
   }
 }
 
-// -------- WEB SERVER - ALWAYS SHOW QR --------
+// -------- WEB SERVER - QR CODE ALWAYS SHOWS --------
 app.get("/", async (req, res) => {
-  // Always show QR code if available, regardless of session
-  let content = "";
+  let qrImage = "";
   
-  if (currentQR) {
-    const dataUrl = await QRCode.toDataURL(currentQR);
-    content = `
-      <div>
-        <h1 style="color:#fbbf24">📱 Scan QR Code</h1>
-        <img src="${dataUrl}" style="width:300px; border:4px solid #334155; border-radius:8px"/>
-        <p style="color:#94a3b8">Scan with WhatsApp to connect</p>
-      </div>
-    `;
-  } else if (botStatus === "connected") {
-    content = `<h1 style="color:#4ade80">✅ Bot Connected</h1>`;
-  } else {
-    content = `<h1 style="color:#60a5fa">🔄 Generating QR Code...</h1>
-               <p>Please wait a few seconds</p>`;
+  // If we have a real QR code, show it
+  if (currentQR && currentQR !== "Loading...") {
+    try {
+      qrImage = await QRCode.toDataURL(currentQR);
+    } catch {
+      qrImage = "";
+    }
   }
 
   res.send(`
+    <!DOCTYPE html>
     <html>
-      <head>
-        <style>
-          body { 
-            background: #0f172a; 
-            color: white; 
-            text-align: center; 
-            font-family: system-ui; 
-            padding: 2rem;
-            margin: 0;
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-          }
-          .container {
-            max-width: 600px;
-            background: #1e293b;
-            padding: 2rem;
-            border-radius: 1rem;
-            box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
-          }
-          h2 { color: #a78bfa; margin-top: 0; }
-          .info { 
-            background: #334155; 
-            padding: 0.5rem; 
-            border-radius: 0.5rem; 
-            font-size: 0.875rem;
-            color: #94a3b8;
-            margin-top: 1rem;
-          }
-          .btn {
-            background: #3b82f6;
-            color: white;
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 0.5rem;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-            margin-top: 1rem;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h2>🤖 WhatsApp Bot</h2>
-          ${content}
-          <div class="info">
-            Status: ${botStatus}<br>
-            QR Code: ${currentQR ? '✅ Available' : '⏳ Generating...'}<br>
-            <small>Refresh page to check for QR</small>
-          </div>
-          <a href="/" class="btn">Refresh Page</a>
+    <head>
+      <title>WhatsApp Bot</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+          min-height: 100vh;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          padding: 20px;
+        }
+        .card {
+          background: white;
+          border-radius: 20px;
+          padding: 40px;
+          box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+          max-width: 500px;
+          width: 100%;
+          text-align: center;
+        }
+        h1 {
+          color: #333;
+          margin-bottom: 10px;
+          font-size: 28px;
+        }
+        .subtitle {
+          color: #666;
+          margin-bottom: 30px;
+          font-size: 16px;
+        }
+        .qr-container {
+          background: #f5f5f5;
+          border-radius: 15px;
+          padding: 30px;
+          margin-bottom: 20px;
+          min-height: 350px;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+        }
+        .qr-image {
+          max-width: 300px;
+          width: 100%;
+          height: auto;
+          border-radius: 10px;
+        }
+        .loading {
+          color: #666;
+          font-size: 18px;
+        }
+        .steps {
+          text-align: left;
+          background: #f8f9fa;
+          border-radius: 10px;
+          padding: 20px;
+          margin-top: 20px;
+        }
+        .steps h3 {
+          color: #333;
+          margin-bottom: 10px;
+        }
+        .steps ol {
+          color: #555;
+          padding-left: 20px;
+        }
+        .steps li {
+          margin: 8px 0;
+        }
+        .refresh-btn {
+          background: #667eea;
+          color: white;
+          border: none;
+          padding: 12px 30px;
+          border-radius: 25px;
+          font-size: 16px;
+          cursor: pointer;
+          margin-top: 20px;
+          transition: background 0.3s;
+          border: none;
+          outline: none;
+        }
+        .refresh-btn:hover {
+          background: #5a67d8;
+        }
+        .status {
+          margin-top: 15px;
+          color: #28a745;
+          font-weight: 500;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>🤖 WhatsApp Bot</h1>
+        <p class="subtitle">Scan QR code to connect your WhatsApp</p>
+        
+        <div class="qr-container">
+          ${qrImage ? `<img src="${qrImage}" class="qr-image" alt="QR Code">` : '<div class="loading">⏳ Generating QR Code...</div>'}
         </div>
-      </body>
+
+        <div class="steps">
+          <h3>📱 How to connect:</h3>
+          <ol>
+            <li>Open WhatsApp on your phone</li>
+            <li>Tap Menu (3 dots) or Settings</li>
+            <li>Select "Linked Devices"</li>
+            <li>Tap "Link a Device"</li>
+            <li>Scan this QR code</li>
+          </ol>
+        </div>
+
+        <button class="refresh-btn" onclick="window.location.reload()">
+          🔄 Refresh QR Code
+        </button>
+
+        <div class="status">
+          ${botStatus === "connected" ? "✅ Bot is active and connected" : "⏳ Waiting for scan..."}
+        </div>
+      </div>
+    </body>
     </html>
   `);
 });
@@ -191,6 +252,7 @@ async function startBot() {
   const state = loadedSession || { creds: {}, keys: {} };
   
   console.log("🚀 Starting bot...");
+  currentQR = "Loading...";
 
   sock = makeWASocket({
     version: waVersion,
@@ -208,15 +270,13 @@ async function startBot() {
     console.log("Update:", { connection, hasQR: !!qr });
     
     if (qr) {
-      console.log("📱 QR Code generated - scan with WhatsApp");
+      console.log("📱 QR Code generated");
       currentQR = qr;
-      botStatus = "awaiting_scan";
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === "open") {
       console.log("✅ Connected to WhatsApp");
-      currentQR = null;
       botStatus = "connected";
     }
 
@@ -380,6 +440,6 @@ async function startBot() {
 // -------- START SERVER & BOT --------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🌐 Server running on http://localhost:${PORT}`);
-  console.log(`📱 Visit webpage to see QR code`);
+  console.log(`📱 QR code will appear on webpage`);
   startBot();
 });
