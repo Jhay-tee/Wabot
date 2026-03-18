@@ -75,9 +75,16 @@ async function testSupabase() {
 
 // -------- SESSION VALIDATION --------
 function isValidSession(session) {
-  if (!session || !session.creds) return false;
+  // If session is null or undefined, it's not valid
+  if (!session) return false;
   
-  // Check if session has required fields
+  // If session is empty object, not valid
+  if (Object.keys(session).length === 0) return false;
+  
+  // Check if it has the required creds structure
+  if (!session.creds) return false;
+  
+  // Check if creds has required fields for a valid session
   const hasRequired = (
     session.creds.me &&
     session.creds.noiseKey &&
@@ -92,17 +99,24 @@ function isValidSession(session) {
 // -------- LOAD SESSION --------
 async function loadSession() {
   try {
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from(WA_TABLE)
       .select("*")
       .eq("id", SESSION_ID)
       .maybeSingle();
 
-    if (!data?.auth_data) {
-      console.log("📱 No session found - QR code will be generated");
+    if (error) {
+      console.log("Supabase query error:", error.message);
+      return null;
+    }
+
+    // If no data or auth_data is null, return null (will generate QR)
+    if (!data || !data.auth_data) {
+      console.log("📱 No session data in Supabase - QR code will be generated");
       return null;
     }
     
+    // Check if the session is valid
     if (isValidSession(data.auth_data)) {
       console.log("✅ Valid session loaded from Supabase");
       return data.auth_data;
@@ -122,7 +136,8 @@ let isSaving = false;
 let pendingSave = null;
 
 async function scheduleSave(state) {
-  if (!state || !isValidSession(state)) return;
+  // Don't save invalid state
+  if (!state || !state.creds || !state.keys) return;
   
   if (isSaving) {
     pendingSave = state;
@@ -133,7 +148,7 @@ async function scheduleSave(state) {
   saveTimer = setTimeout(async () => {
     isSaving = true;
     try {
-      await supabase.from(WA_TABLE).upsert({
+      const { error } = await supabase.from(WA_TABLE).upsert({
         id: SESSION_ID,
         auth_data: JSON.parse(JSON.stringify({ 
           creds: state.creds, 
@@ -141,6 +156,8 @@ async function scheduleSave(state) {
         })),
         updated_at: new Date().toISOString()
       });
+      
+      if (error) throw error;
       console.log("💾 Session saved to Supabase");
       
       if (pendingSave) {
@@ -159,11 +176,13 @@ async function scheduleSave(state) {
 // -------- CLEAR SESSION --------
 async function clearSession() {
   try {
-    await supabase.from(WA_TABLE).upsert({
+    const { error } = await supabase.from(WA_TABLE).upsert({
       id: SESSION_ID,
       auth_data: null,
       updated_at: new Date().toISOString()
     });
+    
+    if (error) throw error;
     console.log("🗑️ Session cleared from Supabase");
     currentQR = null;
     botStatus = "logged_out";
@@ -178,6 +197,8 @@ app.get("/", async (req, res) => {
   const sessionData = await loadSession();
   const hasValidSession = sessionData && isValidSession(sessionData);
   
+  console.log("Web view - Status:", botStatus, "Has valid session:", hasValidSession, "Has QR:", !!currentQR);
+  
   if (botStatus === "connected") {
     content = `<h1 style="color:#4ade80">✅ Connected</h1>
                <p>Bot is active and connected to WhatsApp</p>`;
@@ -188,13 +209,18 @@ app.get("/", async (req, res) => {
       <div>
         <h1 style="color:#fbbf24">📱 Scan QR Code</h1>
         <img src="${dataUrl}" style="width:300px; border:4px solid #334155; border-radius:8px"/>
-        <p>Scan with WhatsApp to connect</p>
+        <p style="color:#94a3b8">Scan with WhatsApp to connect</p>
       </div>
     `;
   } 
+  else if (botStatus === "awaiting_scan") {
+    content = `<h1 style="color:#fbbf24">⏳ Waiting for QR Code...</h1>
+               <p>QR code should appear any second. Check terminal or refresh.</p>`;
+  }
   else if (!hasValidSession && botStatus !== "connected") {
-    content = `<h1 style="color:#f87171">⏳ Generating QR Code...</h1>
-               <p>No valid session found. Please wait for QR code to appear.</p>`;
+    content = `<h1 style="color:#f87171">📱 Generating QR Code...</h1>
+               <p>No valid session found. Please wait for QR code to appear.</p>
+               <p style="font-size: 0.9rem; color: #94a3b8">This may take a few seconds...</p>`;
   }
   else {
     content = `<h1 style="color:#60a5fa">🔄 Initializing...</h1>
@@ -204,7 +230,7 @@ app.get("/", async (req, res) => {
   res.send(`
     <html>
       <head>
-        <meta http-equiv="refresh" content="5">
+        <meta http-equiv="refresh" content="3">
         <style>
           body { 
             background: #0f172a; 
@@ -234,6 +260,17 @@ app.get("/", async (req, res) => {
             color: #94a3b8;
             margin-top: 1rem;
           }
+          .button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 1rem;
+          }
         </style>
       </head>
       <body>
@@ -243,12 +280,20 @@ app.get("/", async (req, res) => {
           <div class="info">
             Status: ${botStatus}<br>
             Session: ${hasValidSession ? '✅ Valid' : '❌ None/Invalid'}<br>
-            Auto-refreshes every 5s
+            Auto-refreshes every 3s
           </div>
+          <a href="/force-qr" class="button" style="background:#dc2626">Force New QR</a>
+          <a href="/debug" class="button" style="background:#4b5563">Debug</a>
         </div>
       </body>
     </html>
   `);
+});
+
+app.get("/force-qr", async (req, res) => {
+  await clearSession();
+  botStatus = "restarting";
+  res.redirect("/");
 });
 
 app.get("/health", (req, res) => res.send("OK"));
@@ -282,9 +327,11 @@ async function startBot() {
   }
 
   // Load session or start fresh
-  const state = (await loadSession()) || { creds: {}, keys: {} };
+  const loadedSession = await loadSession();
+  const state = loadedSession || { creds: {}, keys: {} };
   
-  console.log("🚀 Starting bot...");
+  console.log("🚀 Starting bot with session:", loadedSession ? "Existing session" : "Fresh start");
+  botStatus = "starting";
   
   const sock = makeWASocket({
     version: waVersion,
@@ -303,6 +350,7 @@ async function startBot() {
     
     if (qr) {
       console.log("📱 QR Code generated - scan with WhatsApp");
+      console.log("📱 QR Code appears below (scan with WhatsApp)");
       currentQR = qr;
       botStatus = "awaiting_scan";
       
@@ -312,6 +360,7 @@ async function startBot() {
 
     if (connection === "open") {
       console.log("✅ Connected to WhatsApp");
+      console.log("✅ Bot is ready!");
       currentQR = null;
       botStatus = "connected";
       reconnectAttempts = 0;
@@ -327,14 +376,16 @@ async function startBot() {
       if (code === DisconnectReason.loggedOut) {
         console.log("🚫 Logged out, clearing session");
         await clearSession();
+        botStatus = "logged_out";
       }
       
       // Exponential backoff for reconnection
-      const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), maxReconnectDelay);
+      const delayMs = Math.min(1000 * Math.pow(2, reconnectAttempts), maxReconnectDelay);
       reconnectAttempts++;
       
-      console.log(`🔄 Reconnecting in ${delay/1000}s (attempt ${reconnectAttempts})`);
-      setTimeout(() => startBot(), delay);
+      console.log(`🔄 Reconnecting in ${delayMs/1000}s (attempt ${reconnectAttempts})`);
+      botStatus = "reconnecting";
+      setTimeout(() => startBot(), delayMs);
     }
   });
 
