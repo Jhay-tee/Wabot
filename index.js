@@ -1,6 +1,8 @@
 import makeWASocket, {
   DisconnectReason,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  initAuthCreds,
+  BufferJSON
 } from "@whiskeysockets/baileys";
 
 import qrcode from "qrcode-terminal";
@@ -108,9 +110,9 @@ async function loadSession() {
 
 // -------- SAVE SESSION --------
 let saveTimer;
-async function scheduleSave(state) {
-  if (!state?.creds || !state?.keys) {
-    console.log("⚠️ Cannot save: invalid state");
+async function scheduleSave(snapshot) {
+  if (!snapshot?.creds) {
+    console.log("⚠️ Cannot save: invalid snapshot");
     return;
   }
   
@@ -119,16 +121,18 @@ async function scheduleSave(state) {
     try {
       console.log("💾 Saving session to Supabase...");
       
+      const serialized = JSON.parse(JSON.stringify(snapshot, BufferJSON.replacer));
+      
       const { error } = await supabase.from(WA_TABLE).upsert({
         id: SESSION_ID,
-        auth_data: { creds: state.creds, keys: state.keys },
+        auth_data: serialized,
         updated_at: new Date().toISOString()
       });
       
       if (error) throw error;
       
       console.log("✅ Session saved successfully to Supabase");
-      console.log("📱 Connected as:", state.creds.me?.name || state.creds.me?.jid || "Unknown");
+      console.log("📱 Connected as:", snapshot.creds.me?.name || snapshot.creds.me?.jid || "Unknown");
       
     } catch (err) {
       console.log("❌ Save error:", err.message);
@@ -327,6 +331,55 @@ app.get("/status", async (req, res) => {
   });
 });
 
+// -------- BUILD AUTH STATE --------
+function buildAuthState(savedSession) {
+  // Initialize credentials: use saved ones or create fresh
+  const creds = savedSession?.creds
+    ? JSON.parse(JSON.stringify(savedSession.creds), BufferJSON.reviver)
+    : initAuthCreds();
+
+  // In-memory key store, pre-populated from saved session
+  let keyStore = {};
+  if (savedSession?.keys) {
+    try {
+      keyStore = JSON.parse(JSON.stringify(savedSession.keys), BufferJSON.reviver);
+    } catch {
+      keyStore = {};
+    }
+  }
+
+  const keys = {
+    get: (type, ids) => {
+      const data = {};
+      for (const id of ids) {
+        const val = keyStore[type]?.[id];
+        if (val !== undefined) data[id] = val;
+      }
+      return data;
+    },
+    set: (data) => {
+      for (const category of Object.keys(data)) {
+        keyStore[category] = keyStore[category] || {};
+        for (const id of Object.keys(data[category])) {
+          const val = data[category][id];
+          if (val == null) {
+            delete keyStore[category][id];
+          } else {
+            keyStore[category][id] = val;
+          }
+        }
+      }
+    }
+  };
+
+  const getSnapshot = () => ({
+    creds,
+    keys: JSON.parse(JSON.stringify(keyStore, BufferJSON.replacer))
+  });
+
+  return { creds, keys, getSnapshot };
+}
+
 // -------- START BOT --------
 async function startBot() {
   try {
@@ -340,13 +393,14 @@ async function startBot() {
     }
 
     const loadedSession = await loadSession();
-    const state = loadedSession || { creds: {}, keys: {} };
     
     if (loadedSession) {
       console.log("✅ Using existing session from Supabase");
     } else {
       console.log("🆕 Starting with fresh session - QR will generate");
     }
+
+    const authState = buildAuthState(loadedSession);
     
     currentQR = "Loading...";
 
@@ -361,7 +415,7 @@ async function startBot() {
 
     sock = makeWASocket({
       version: waVersion,
-      auth: state,
+      auth: { creds: authState.creds, keys: authState.keys },
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
       browser: ["Ubuntu", "Chrome", "20.0.04"],
@@ -371,7 +425,7 @@ async function startBot() {
       keepAliveIntervalMs: 30000
     });
 
-    sock.ev.on("creds.update", () => scheduleSave(state));
+    sock.ev.on("creds.update", () => scheduleSave(authState.getSnapshot()));
 
     sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
       console.log("📡 Connection update:", { connection, hasQR: !!qr });
@@ -398,10 +452,11 @@ async function startBot() {
 
       if (connection === "close") {
         const code = lastDisconnect?.error?.output?.statusCode;
-        console.log("🔌 Connection closed with code:", code);
+        const errMsg = lastDisconnect?.error?.message || lastDisconnect?.error?.toString();
+        console.log("🔌 Connection closed with code:", code, "| error:", errMsg);
         
-        if (botStatus === "connected" || currentQR) {
-          console.log("ℹ️ Ignoring close - already connected or have QR");
+        if (botStatus === "connected") {
+          console.log("ℹ️ Ignoring close - already connected");
           return;
         }
         
