@@ -25,6 +25,10 @@ const SESSION_ID = 1;
 const WA_TABLE = "wa_sessions";
 const VULGAR_WORDS = ["fuck", "nigga", "nigger", "bitch", "asshole", "shit"];
 
+// -------- TRACKERS --------
+const spamTracker = {};
+const commandCooldown = {};
+
 // -------- SUPABASE WITH TIMEOUT & RETRY --------
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -435,6 +439,7 @@ function isValidSession(session) {
 }
 
 // -------- LOAD SESSION --------
+// Returns: { session: <data> } | { session: null, notFound: true } | { session: null, dbError: true }
 async function loadSession() {
   try {
     console.log("🔍 Checking Supabase for existing session...");
@@ -446,16 +451,22 @@ async function loadSession() {
         .maybeSingle()
     );
 
-    if (error) { console.log("❌ Supabase error:", error.message); return null; }
-    if (!data?.auth_data) { console.log("📱 No session found — QR will generate"); return null; }
+    if (error) {
+      console.log("❌ Supabase error:", error.message);
+      return { session: null, dbError: true };
+    }
+    if (!data?.auth_data) {
+      console.log("📱 No session found — QR will generate");
+      return { session: null, notFound: true };
+    }
 
     console.log("📦 Session found, validating...");
-    if (isValidSession(data.auth_data)) return data.auth_data;
+    if (isValidSession(data.auth_data)) return { session: data.auth_data };
     console.log("⚠️ Session corrupted — QR will generate");
-    return null;
+    return { session: null, notFound: true };
   } catch (err) {
     console.log("❌ Load session error:", err?.message);
-    return null;
+    return { session: null, dbError: true };
   }
 }
 
@@ -515,7 +526,6 @@ app.get("/", async (req, res) => {
       <head>
         <title>WhatsApp Bot</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <meta http-equiv="refresh" content="5">
         <style>
           * { margin: 0; padding: 0; box-sizing: border-box; }
           body {
@@ -557,7 +567,7 @@ app.get("/", async (req, res) => {
           <h1>🤖 WhatsApp Bot</h1>
           <p class="subtitle">${botStatus === "connected" ? "Bot is live and monitoring your groups" : "Scan QR code to connect your WhatsApp"}</p>
 
-          <div class="qr-container">
+          <div class="qr-container" id="qrContainer">
             ${botStatus === "connected"
               ? '<div class="connected-icon">✅</div>'
               : qrImage
@@ -567,7 +577,7 @@ app.get("/", async (req, res) => {
           </div>
 
           ${botStatus !== "connected" ? `
-          <div class="steps">
+          <div class="steps" id="steps">
             <h3>📱 How to connect:</h3>
             <ol>
               <li>Open WhatsApp on your phone</li>
@@ -578,13 +588,45 @@ app.get("/", async (req, res) => {
             </ol>
           </div>` : ""}
 
-          <div class="status ${botStatus === "connected" ? "ok" : "waiting"}">
+          <div class="status ${botStatus === "connected" ? "ok" : "waiting"}" id="statusText">
             ${botStatus === "connected" ? "✅ Bot is active and connected" : "⏳ Waiting for QR scan..."}
           </div>
 
           <a href="/force-qr" class="force-btn">🔄 Force New QR Code</a>
         </div>
       </body>
+      <script>
+        (function() {
+          var pollInterval = null;
+          function poll() {
+            fetch('/qr-status')
+              .then(function(r) { return r.json(); })
+              .then(function(d) {
+                var container = document.getElementById('qrContainer');
+                var statusEl = document.getElementById('statusText');
+                var steps = document.getElementById('steps');
+                if (d.connected) {
+                  container.innerHTML = '<div class="connected-icon">✅</div>';
+                  statusEl.textContent = '✅ Bot is active and connected';
+                  statusEl.className = 'status ok';
+                  if (steps) steps.style.display = 'none';
+                  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+                } else if (d.qrImage) {
+                  container.innerHTML = '<img src="' + d.qrImage + '" class="qr-image" alt="QR Code">';
+                  statusEl.textContent = '⏳ Waiting for QR scan...';
+                  statusEl.className = 'status waiting';
+                } else {
+                  container.innerHTML = '<div class="loading">⏳ Generating QR Code...</div>';
+                  statusEl.textContent = '⏳ Generating QR Code...';
+                  statusEl.className = 'status waiting';
+                }
+              })
+              .catch(function() {});
+          }
+          pollInterval = setInterval(poll, 3000);
+          poll();
+        })();
+      </script>
       </html>
     `);
   } catch (e) {
@@ -600,7 +642,7 @@ app.get("/force-qr", async (req, res) => {
     currentQR = null;
     botStatus = "starting";
     if (sock) { try { sock.end(); sock = null; } catch {} }
-    setTimeout(() => startBot(), 1000);
+    scheduleReconnect(1000);
     res.redirect("/");
   } catch (e) {
     console.log("/force-qr error:", e?.message);
@@ -628,6 +670,19 @@ app.get("/status", async (req, res) => {
       hasQR: !!currentQR,
       uptime: Math.floor(process.uptime())
     });
+  } catch (e) {
+    res.status(500).json({ error: e?.message });
+  }
+});
+
+app.get("/qr-status", async (req, res) => {
+  try {
+    const connected = botStatus === "connected";
+    let qrImage = null;
+    if (!connected && currentQR && currentQR !== "Loading...") {
+      try { qrImage = await QRCode.toDataURL(currentQR); } catch {}
+    }
+    res.json({ connected, qrImage });
   } catch (e) {
     res.status(500).json({ error: e?.message });
   }
@@ -686,6 +741,15 @@ function buildAuthState(savedSession) {
 
 // -------- START BOT --------
 let isStarting = false;
+let reconnectTimer = null;
+
+function scheduleReconnect(delayMs) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    startBot();
+  }, delayMs);
+}
 
 async function startBot() {
   if (isStarting) {
@@ -704,7 +768,15 @@ async function startBot() {
       console.log("✅ Using version:", waVersion);
     }
 
-    const loadedSession = await loadSession();
+    const result = await loadSession();
+
+    if (result.dbError) {
+      console.log("⚠️ Supabase unavailable — retrying in 10s...");
+      scheduleReconnect(10000);
+      return;
+    }
+
+    const loadedSession = result.session;
     console.log(loadedSession ? "✅ Using existing session" : "🆕 Fresh start — QR will generate");
 
     const authState = buildAuthState(loadedSession);
@@ -766,12 +838,12 @@ async function startBot() {
             await clearSession();
             currentQR = null;
             botStatus = "starting";
-            setTimeout(() => startBot(), 2000);
+            scheduleReconnect(2000);
             return;
           }
 
           console.log("🔄 Reconnecting in 5s...");
-          setTimeout(() => startBot(), 5000);
+          scheduleReconnect(5000);
         }
       } catch (e) {
         console.log("connection.update error:", e?.message);
@@ -1145,7 +1217,7 @@ async function startBot() {
     });
   } catch (err) {
     console.log("❌ startBot error:", err?.message);
-    setTimeout(startBot, 5000);
+    scheduleReconnect(5000);
   } finally {
     isStarting = false;
   }
