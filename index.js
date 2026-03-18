@@ -14,7 +14,7 @@ dotenv.config();
 
 // -------- CONFIG --------
 const PORT = process.env.PORT || 5000;
-const SESSION_ID = 1; // main session id
+const SESSION_ID = 1;
 const WA_TABLE = "wa_sessions";
 
 // -------- HELPERS --------
@@ -33,24 +33,20 @@ let currentQR = null;
 let botStatus = "starting";
 let waVersion = null;
 let reconnectAttempts = 0;
-const maxReconnectDelay = 30000;
+let sock = null; // Store socket globally
 
 // -------- SPAM TRACKER --------
 const spamTracker = {};
 const commandCooldown = {};
 
-// Clean up old tracker entries every hour
+// Clean up old tracker entries
 setInterval(() => {
   const now = Date.now();
   Object.keys(spamTracker).forEach(key => {
-    if (now - spamTracker[key].time > 3600000) {
-      delete spamTracker[key];
-    }
+    if (now - spamTracker[key].time > 3600000) delete spamTracker[key];
   });
   Object.keys(commandCooldown).forEach(key => {
-    if (now - commandCooldown[key] > 60000) {
-      delete commandCooldown[key];
-    }
+    if (now - commandCooldown[key] > 60000) delete commandCooldown[key];
   });
 }, 3600000);
 
@@ -60,7 +56,6 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY
 );
 
-// Test Supabase connection on startup
 async function testSupabase() {
   try {
     const { error } = await supabase.from(WA_TABLE).select("id").limit(1);
@@ -75,57 +70,39 @@ async function testSupabase() {
 
 // -------- SESSION VALIDATION --------
 function isValidSession(session) {
-  // If session is null or undefined, it's not valid
-  if (!session) return false;
-  
-  // If session is empty object, not valid
-  if (Object.keys(session).length === 0) return false;
-  
-  // Check if it has the required creds structure
-  if (!session.creds) return false;
-  
-  // Check if creds has required fields for a valid session
-  const hasRequired = (
+  if (!session || !session.creds) return false;
+  return !!(
     session.creds.me &&
     session.creds.noiseKey &&
     session.creds.signedIdentityKey &&
     session.creds.signedPreKey &&
     session.creds.advSecretKey
   );
-  
-  return !!hasRequired;
 }
 
 // -------- LOAD SESSION --------
 async function loadSession() {
   try {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from(WA_TABLE)
       .select("*")
       .eq("id", SESSION_ID)
       .maybeSingle();
 
-    if (error) {
-      console.log("Supabase query error:", error.message);
-      return null;
-    }
-
-    // If no data or auth_data is null, return null (will generate QR)
-    if (!data || !data.auth_data) {
-      console.log("📱 No session data in Supabase - QR code will be generated");
+    if (!data?.auth_data) {
+      console.log("📱 No session - QR will generate");
       return null;
     }
     
-    // Check if the session is valid
     if (isValidSession(data.auth_data)) {
-      console.log("✅ Valid session loaded from Supabase");
+      console.log("✅ Valid session loaded");
       return data.auth_data;
     }
     
-    console.log("⚠️ Corrupted session found - will generate new QR");
+    console.log("⚠️ Corrupted session - new QR");
     return null;
   } catch (err) {
-    console.log("Supabase load error:", err.message);
+    console.log("Load error:", err.message);
     return null;
   }
 }
@@ -133,40 +110,22 @@ async function loadSession() {
 // -------- SAVE SESSION --------
 let saveTimer;
 let isSaving = false;
-let pendingSave = null;
 
 async function scheduleSave(state) {
-  // Don't save invalid state
-  if (!state || !state.creds || !state.keys) return;
-  
-  if (isSaving) {
-    pendingSave = state;
-    return;
-  }
+  if (!state?.creds || !state?.keys || isSaving) return;
   
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     isSaving = true;
     try {
-      const { error } = await supabase.from(WA_TABLE).upsert({
+      await supabase.from(WA_TABLE).upsert({
         id: SESSION_ID,
-        auth_data: JSON.parse(JSON.stringify({ 
-          creds: state.creds, 
-          keys: state.keys 
-        })),
+        auth_data: { creds: state.creds, keys: state.keys },
         updated_at: new Date().toISOString()
       });
-      
-      if (error) throw error;
-      console.log("💾 Session saved to Supabase");
-      
-      if (pendingSave) {
-        const saveState = pendingSave;
-        pendingSave = null;
-        await scheduleSave(saveState);
-      }
+      console.log("💾 Session saved");
     } catch (err) {
-      console.log("❌ Save error:", err.message);
+      console.log("Save error:", err.message);
     } finally {
       isSaving = false;
     }
@@ -176,32 +135,28 @@ async function scheduleSave(state) {
 // -------- CLEAR SESSION --------
 async function clearSession() {
   try {
-    const { error } = await supabase.from(WA_TABLE).upsert({
+    await supabase.from(WA_TABLE).upsert({
       id: SESSION_ID,
       auth_data: null,
       updated_at: new Date().toISOString()
     });
-    
-    if (error) throw error;
-    console.log("🗑️ Session cleared from Supabase");
+    console.log("🗑️ Session cleared");
     currentQR = null;
-    botStatus = "logged_out";
+    botStatus = "starting";
   } catch (err) {
-    console.log("❌ Clear session error:", err.message);
+    console.log("Clear error:", err.message);
   }
 }
 
 // -------- WEB SERVER --------
 app.get("/", async (req, res) => {
-  let content = "";
   const sessionData = await loadSession();
   const hasValidSession = sessionData && isValidSession(sessionData);
   
-  console.log("Web view - Status:", botStatus, "Has valid session:", hasValidSession, "Has QR:", !!currentQR);
+  let content = "";
   
   if (botStatus === "connected") {
-    content = `<h1 style="color:#4ade80">✅ Connected</h1>
-               <p>Bot is active and connected to WhatsApp</p>`;
+    content = `<h1 style="color:#4ade80">✅ Connected</h1>`;
   } 
   else if (currentQR) {
     const dataUrl = await QRCode.toDataURL(currentQR);
@@ -209,22 +164,12 @@ app.get("/", async (req, res) => {
       <div>
         <h1 style="color:#fbbf24">📱 Scan QR Code</h1>
         <img src="${dataUrl}" style="width:300px; border:4px solid #334155; border-radius:8px"/>
-        <p style="color:#94a3b8">Scan with WhatsApp to connect</p>
       </div>
     `;
   } 
-  else if (botStatus === "awaiting_scan") {
-    content = `<h1 style="color:#fbbf24">⏳ Waiting for QR Code...</h1>
-               <p>QR code should appear any second. Check terminal or refresh.</p>`;
-  }
-  else if (!hasValidSession && botStatus !== "connected") {
-    content = `<h1 style="color:#f87171">📱 Generating QR Code...</h1>
-               <p>No valid session found. Please wait for QR code to appear.</p>
-               <p style="font-size: 0.9rem; color: #94a3b8">This may take a few seconds...</p>`;
-  }
   else {
-    content = `<h1 style="color:#60a5fa">🔄 Initializing...</h1>
-               <p>Bot is starting up. Please wait...</p>`;
+    content = `<h1 style="color:#60a5fa">🔄 Generating QR...</h1>
+               <p>Please wait 5-10 seconds</p>`;
   }
 
   res.send(`
@@ -232,45 +177,11 @@ app.get("/", async (req, res) => {
       <head>
         <meta http-equiv="refresh" content="3">
         <style>
-          body { 
-            background: #0f172a; 
-            color: white; 
-            text-align: center; 
-            font-family: system-ui; 
-            padding: 2rem;
-            margin: 0;
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-          }
-          .container {
-            max-width: 600px;
-            background: #1e293b;
-            padding: 2rem;
-            border-radius: 1rem;
-            box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
-          }
-          h2 { color: #a78bfa; margin-top: 0; }
-          .info { 
-            background: #334155; 
-            padding: 0.5rem; 
-            border-radius: 0.5rem; 
-            font-size: 0.875rem;
-            color: #94a3b8;
-            margin-top: 1rem;
-          }
-          .button {
-            background: #3b82f6;
-            color: white;
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 0.5rem;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-            margin-top: 1rem;
-          }
+          body { background: #0f172a; color: white; text-align: center; font-family: system-ui; padding: 2rem; }
+          .container { max-width: 600px; margin: 0 auto; background: #1e293b; padding: 2rem; border-radius: 1rem; }
+          .info { background: #334155; padding: 0.5rem; border-radius: 0.5rem; margin-top: 1rem; }
+          .btn { background: #3b82f6; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; text-decoration: none; display: inline-block; margin: 0.5rem; }
+          .btn.red { background: #dc2626; }
         </style>
       </head>
       <body>
@@ -279,11 +190,11 @@ app.get("/", async (req, res) => {
           ${content}
           <div class="info">
             Status: ${botStatus}<br>
-            Session: ${hasValidSession ? '✅ Valid' : '❌ None/Invalid'}<br>
-            Auto-refreshes every 3s
+            Session: ${hasValidSession ? '✅' : '❌'}<br>
+            Attempts: ${reconnectAttempts}
           </div>
-          <a href="/force-qr" class="button" style="background:#dc2626">Force New QR</a>
-          <a href="/debug" class="button" style="background:#4b5563">Debug</a>
+          <a href="/force-qr" class="btn red">Force New QR</a>
+          <a href="/debug" class="btn">Debug</a>
         </div>
       </body>
     </html>
@@ -291,12 +202,18 @@ app.get("/", async (req, res) => {
 });
 
 app.get("/force-qr", async (req, res) => {
+  console.log("🔄 Force new QR");
   await clearSession();
-  botStatus = "restarting";
+  if (sock) {
+    try { sock.end(); } catch {}
+    sock = null;
+  }
+  currentQR = null;
+  botStatus = "starting";
+  reconnectAttempts = 0;
+  setTimeout(() => startBot(), 1000);
   res.redirect("/");
 });
-
-app.get("/health", (req, res) => res.send("OK"));
 
 app.get("/debug", async (req, res) => {
   const sessionData = await loadSession();
@@ -306,338 +223,251 @@ app.get("/debug", async (req, res) => {
     sessionInSupabase: !!sessionData,
     sessionValid: sessionData ? isValidSession(sessionData) : false,
     reconnectAttempts,
-    uptime: process.uptime(),
-    memory: process.memoryUsage()
+    uptime: process.uptime()
   });
 });
 
+app.get("/health", (req, res) => res.send("OK"));
+
 // -------- START BOT --------
 async function startBot() {
-  // Test Supabase first
-  const supabaseOk = await testSupabase();
-  if (!supabaseOk) {
-    console.log("❌ Cannot start without Supabase");
-    process.exit(1);
+  // Don't start multiple instances
+  if (sock) {
+    console.log("Bot already running");
+    return;
   }
 
+  // Check Supabase
+  const supabaseOk = await testSupabase();
+  if (!supabaseOk) {
+    setTimeout(startBot, 5000);
+    return;
+  }
+
+  // Get version
   if (!waVersion) {
     const { version } = await fetchLatestBaileysVersion();
     waVersion = version;
-    console.log("📱 Using Baileys version:", waVersion);
   }
 
-  // Load session or start fresh
+  // Load session
   const loadedSession = await loadSession();
   const state = loadedSession || { creds: {}, keys: {} };
   
-  console.log("🚀 Starting bot with session:", loadedSession ? "Existing session" : "Fresh start");
+  console.log("🚀 Starting bot...");
   botStatus = "starting";
-  
-  const sock = makeWASocket({
-    version: waVersion,
-    auth: state,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: false, // We handle QR manually
-    browser: ["Ubuntu", "Chrome", "20.0.04"]
-  });
 
-  // Handle session updates
-  sock.ev.on("creds.update", () => scheduleSave(state));
+  try {
+    sock = makeWASocket({
+      version: waVersion,
+      auth: state,
+      logger: pino({ level: "silent" }),
+      printQRInTerminal: false,
+      browser: ["Ubuntu", "Chrome", "20.0.04"],
+      syncFullHistory: false
+    });
 
-  // Handle connection updates
-  sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
-    console.log("Connection update:", { connection, hasQR: !!qr });
-    
-    if (qr) {
-      console.log("📱 QR Code generated - scan with WhatsApp");
-      console.log("📱 QR Code appears below (scan with WhatsApp)");
-      currentQR = qr;
-      botStatus = "awaiting_scan";
+    // Session save
+    sock.ev.on("creds.update", () => scheduleSave(state));
+
+    // Connection updates
+    sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
+      console.log("Update:", { connection, hasQR: !!qr });
       
-      // Show in terminal
-      qrcode.generate(qr, { small: true });
-    }
-
-    if (connection === "open") {
-      console.log("✅ Connected to WhatsApp");
-      console.log("✅ Bot is ready!");
-      currentQR = null;
-      botStatus = "connected";
-      reconnectAttempts = 0;
-      
-      // Set presence online
-      await sock.sendPresenceUpdate("available");
-    }
-
-    if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.log("❌ Connection closed with code:", code);
-      
-      if (code === DisconnectReason.loggedOut) {
-        console.log("🚫 Logged out, clearing session");
-        await clearSession();
-        botStatus = "logged_out";
-      }
-      
-      // Exponential backoff for reconnection
-      const delayMs = Math.min(1000 * Math.pow(2, reconnectAttempts), maxReconnectDelay);
-      reconnectAttempts++;
-      
-      console.log(`🔄 Reconnecting in ${delayMs/1000}s (attempt ${reconnectAttempts})`);
-      botStatus = "reconnecting";
-      setTimeout(() => startBot(), delayMs);
-    }
-  });
-
-  // -------- GROUP PARTICIPANTS UPDATE (WELCOME MESSAGES) --------
-  sock.ev.on("group-participants.update", async (update) => {
-    try {
-      if (update.action === "add" && update.participants?.length > 0) {
-        const groupJid = update.id;
-        const mentions = update.participants;
-        
-        // Get group name safely
-        let groupName = "the group";
-        try {
-          const metadata = await sock.groupMetadata(groupJid);
-          groupName = metadata.subject || "the group";
-        } catch {}
-        
-        // Send welcome message
-        await sock.sendMessage(groupJid, {
-          text: `👋 Hi ${mentions.map(u => `@${u.split("@")[0]}`).join(", ")}, welcome to ${groupName}!\n\n📌 Please follow the rules:\n• No spamming\n• No links\n• No vulgar words\n• Be respectful\n\nEnjoy your stay! 🎉`,
-          mentions
-        });
-        
-        console.log(`👋 Welcome message sent to ${mentions.length} new member(s)`);
-      }
-    } catch (err) { 
-      console.log("Welcome message error:", err.message);
-    }
-  });
-
-  // -------- MESSAGES & COMMANDS --------
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    try {
-      const msg = messages[0];
-      if (!msg.message || msg.key.fromMe) return;
-
-      const jid = msg.key.remoteJid;
-      
-      // Ignore status broadcasts and non-group messages
-      if (jid === "status@broadcast" || !jid.endsWith("@g.us")) return;
-
-      const sender = msg.key.participant || msg.key.remoteJid;
-      
-      // Get group metadata
-      let metadata;
-      try {
-        metadata = await sock.groupMetadata(jid);
-      } catch {
-        return; // Can't process without metadata
-      }
-      
-      const isUserAdmin = isAdmin(sender, metadata.participants);
-
-      // Extract message text
-      const text = (
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        msg.message?.videoMessage?.caption ||
-        ""
-      ).trim();
-
-      if (!text) return;
-
-      // -------- ANTI-LINK --------
-      const linkRegex = /(https?:\/\/\S+|wa\.me\/\S+|chat\.whatsapp\.com\/\S+)/i;
-      if (!isUserAdmin && linkRegex.test(text)) {
-        try {
-          await sock.sendMessage(jid, { 
-            delete: { 
-              remoteJid: jid, 
-              fromMe: false, 
-              id: msg.key.id, 
-              participant: sender 
-            } 
-          });
-          await sock.sendMessage(jid, { text: "🚫 @" + sender.split("@")[0] + " links are not allowed", mentions: [sender] });
-        } catch {}
+      if (qr) {
+        console.log("📱 QR READY - SCAN NOW");
+        currentQR = qr;
+        botStatus = "qr_ready";
+        reconnectAttempts = 0;
+        qrcode.generate(qr, { small: true });
         return;
       }
 
-      // -------- ANTI-SPAM --------
-      if (!isUserAdmin) {
-        const now = Date.now();
-        if (!spamTracker[sender]) {
-          spamTracker[sender] = { 
-            lastMsg: text, 
-            count: 1, 
-            time: now,
-            lastWarning: 0
-          };
-        } else {
-          const user = spamTracker[sender];
+      if (connection === "open") {
+        console.log("✅ CONNECTED!");
+        currentQR = null;
+        botStatus = "connected";
+        reconnectAttempts = 0;
+        sock.sendPresenceUpdate("available");
+        return;
+      }
+
+      if (connection === "close") {
+        const code = lastDisconnect?.error?.output?.statusCode;
+        console.log("❌ Closed:", code);
+        
+        sock = null;
+        
+        if (code === DisconnectReason.loggedOut) {
+          await clearSession();
+          setTimeout(startBot, 2000);
+          return;
+        }
+        
+        reconnectAttempts++;
+        const delayMs = Math.min(1000 * reconnectAttempts, 15000);
+        console.log(`🔄 Reconnect in ${delayMs/1000}s`);
+        setTimeout(startBot, delayMs);
+      }
+    });
+
+    // Welcome messages
+    sock.ev.on("group-participants.update", async (update) => {
+      if (update.action === "add" && update.participants?.length > 0) {
+        try {
+          const groupJid = update.id;
+          const mentions = update.participants;
+          let groupName = "the group";
+          try {
+            const metadata = await sock.groupMetadata(groupJid);
+            groupName = metadata.subject || "the group";
+          } catch {}
           
-          // Reset if different message or too much time passed
-          if (normalize(user.lastMsg) !== normalize(text) || now - user.time > 5000) {
-            user.count = 1;
+          await sock.sendMessage(groupJid, {
+            text: `👋 Hi ${mentions.map(u => `@${u.split("@")[0]}`).join(", ")}, welcome to ${groupName}!`,
+            mentions
+          });
+        } catch (err) {
+          console.log("Welcome error:", err.message);
+        }
+      }
+    });
+
+    // Message handler
+    sock.ev.on("messages.upsert", async ({ messages }) => {
+      try {
+        const msg = messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+
+        const jid = msg.key.remoteJid;
+        if (jid === "status@broadcast" || !jid.endsWith("@g.us")) return;
+
+        const sender = msg.key.participant || msg.key.remoteJid;
+        
+        let metadata;
+        try {
+          metadata = await sock.groupMetadata(jid);
+        } catch {
+          return;
+        }
+        
+        const isUserAdmin = isAdmin(sender, metadata.participants);
+
+        const text = (
+          msg.message?.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          msg.message?.imageMessage?.caption ||
+          ""
+        ).trim();
+
+        if (!text) return;
+
+        // Anti-link
+        const linkRegex = /(https?:\/\/\S+|wa\.me\/\S+|chat\.whatsapp\.com\/\S+)/i;
+        if (!isUserAdmin && linkRegex.test(text)) {
+          try {
+            await sock.sendMessage(jid, { 
+              delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } 
+            });
+            await sock.sendMessage(jid, { text: "🚫 No links allowed" });
+          } catch {}
+          return;
+        }
+
+        // Anti-spam
+        if (!isUserAdmin) {
+          const now = Date.now();
+          if (!spamTracker[sender]) {
+            spamTracker[sender] = { lastMsg: text, count: 1, time: now };
           } else {
-            user.count++;
+            const user = spamTracker[sender];
+            if (normalize(user.lastMsg) === normalize(text) && now - user.time < 5000) {
+              user.count++;
+            } else {
+              user.count = 1;
+            }
+            user.lastMsg = text;
+            user.time = now;
+            
+            if (user.count >= 4) {
+              try {
+                await sock.sendMessage(jid, { 
+                  delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } 
+                });
+                await sock.sendMessage(jid, { text: "🚫 No spamming" });
+              } catch {}
+              return;
+            }
           }
-          
-          user.lastMsg = text;
-          user.time = now;
-          
-          // Check for spam (4+ identical messages in 5 seconds)
-          if (user.count >= 4 && now - user.lastWarning > 30000) {
-            try {
-              await sock.sendMessage(jid, { 
-                delete: { 
-                  remoteJid: jid, 
-                  fromMe: false, 
-                  id: msg.key.id, 
-                  participant: sender 
-                } 
-              });
-              await sock.sendMessage(jid, { 
-                text: "🚫 @" + sender.split("@")[0] + " no spamming allowed", 
-                mentions: [sender] 
-              });
-              user.lastWarning = now;
-              user.count = 0;
-            } catch {}
+        }
+
+        // Commands
+        const command = text.toLowerCase();
+        if (!command.startsWith(".") || !isUserAdmin) return;
+
+        if (commandCooldown[sender] && Date.now() - commandCooldown[sender] < 3000) return;
+        commandCooldown[sender] = Date.now();
+
+        const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
+        const mentioned = ctx.mentionedJid || [];
+        const replyTarget = ctx.participant;
+
+        if (command === ".lock") {
+          await sock.groupSettingUpdate(jid, "announcement");
+          await sock.sendMessage(jid, { text: "🔒 Locked" });
+        } else if (command === ".unlock") {
+          await sock.groupSettingUpdate(jid, "not_announcement");
+          await sock.sendMessage(jid, { text: "🔓 Unlocked" });
+        } else if (command === ".kick") {
+          let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
+          if (!targets.length) {
+            await sock.sendMessage(jid, { text: "❌ Tag or reply" });
             return;
           }
-          
-          spamTracker[sender] = user;
-        }
-      }
-
-      // -------- VULGAR WORD FILTER --------
-      const vulgarWords = ["fuck", "nigga", "bitch", "asshole", "shit", "pussy", "dick"];
-      const containsVulgar = vulgarWords.some(w => 
-        text.toLowerCase().includes(w) || 
-        text.toLowerCase().replace(/[^a-zA-Z]/g, "").includes(w)
-      );
-      
-      if (!isUserAdmin && containsVulgar) {
-        try {
-          await sock.sendMessage(jid, { 
-            delete: { 
-              remoteJid: jid, 
-              fromMe: false, 
-              id: msg.key.id, 
-              participant: sender 
-            } 
-          });
-          await sock.sendMessage(jid, { 
-            text: "🚫 @" + sender.split("@")[0] + " vulgar words are not allowed", 
-            mentions: [sender] 
-          });
-        } catch {}
-        return;
-      }
-
-      // -------- COMMANDS (ADMIN ONLY) --------
-      const command = text.toLowerCase();
-      if (!command.startsWith(".") || !isUserAdmin) return;
-      
-      // Cooldown for commands
-      if (commandCooldown[sender] && Date.now() - commandCooldown[sender] < 3000) return;
-      commandCooldown[sender] = Date.now();
-
-      const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
-      const mentioned = ctx.mentionedJid || [];
-      const replyTarget = ctx.participant;
-
-      // .lock - Lock group
-      if (command === ".lock") {
-        await sock.groupSettingUpdate(jid, "announcement");
-        await sock.sendMessage(jid, { text: "🔒 Group locked (only admins can message)" });
-      }
-      
-      // .unlock - Unlock group
-      else if (command === ".unlock") {
-        await sock.groupSettingUpdate(jid, "not_announcement");
-        await sock.sendMessage(jid, { text: "🔓 Group unlocked (everyone can message)" });
-      }
-      
-      // .kick - Remove user(s)
-      else if (command === ".kick") {
-        let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
-        
-        if (!targets.length) {
-          await sock.sendMessage(jid, { text: "❌ Tag or reply to user to kick" });
-          return;
-        }
-
-        for (const user of targets) {
-          // Check if target is admin
-          const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
-          if (isTargetAdmin) {
-            await sock.sendMessage(jid, { text: "❌ Cannot remove admin" });
-            continue;
+          for (const user of targets) {
+            const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
+            if (isTargetAdmin) {
+              await sock.sendMessage(jid, { text: "❌ Can't kick admin" });
+              continue;
+            }
+            await delay(500);
+            await sock.groupParticipantsUpdate(jid, [user], "remove");
           }
-          
-          await delay(500);
-          await sock.groupParticipantsUpdate(jid, [user], "remove");
-          await sock.sendMessage(jid, { text: `✅ Removed @${user.split("@")[0]}`, mentions: [user] });
+        } else if (command === ".tagall") {
+          const allMembers = metadata.participants.map(p => p.id);
+          await sock.sendMessage(jid, { text: "@everyone", mentions: allMembers });
+        } else if (command === ".delete") {
+          if (!ctx?.stanzaId) return;
+          await sock.sendMessage(jid, { 
+            delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant } 
+          });
+        } else if (command === ".help") {
+          await sock.sendMessage(jid, { 
+            text: `.lock\n.unlock\n.kick\n.tagall\n.delete\n.help`
+          });
         }
-      }
-      
-      // .tagall - Mention all members
-      else if (command === ".tagall") {
-        const allMembers = metadata.participants.map(p => p.id);
-        await sock.sendMessage(jid, { 
-          text: "📢 @everyone", 
-          mentions: allMembers 
-        });
-      }
-      
-      // .delete - Delete message
-      else if (command === ".delete") {
-        if (!ctx?.stanzaId) {
-          await sock.sendMessage(jid, { text: "❌ Reply to a message to delete it" });
-          return;
-        }
-        
-        await sock.sendMessage(jid, { 
-          delete: { 
-            remoteJid: jid, 
-            fromMe: false, 
-            id: ctx.stanzaId, 
-            participant: ctx.participant 
-          } 
-        });
-      }
-      
-      // .help - Show commands
-      else if (command === ".help") {
-        await sock.sendMessage(jid, { 
-          text: `📋 *Admin Commands*\n\n🔒 .lock - Lock group\n🔓 .unlock - Unlock group\n👢 .kick - Remove user (reply/tag)\n📢 .tagall - Mention everyone\n🗑️ .delete - Delete message\n❓ .help - Show this menu`
-        });
-      }
 
-    } catch (err) {
-      console.log("Message handler error:", err.message);
-    }
-  });
+      } catch (err) {
+        console.log("Msg error:", err.message);
+      }
+    });
+
+  } catch (err) {
+    console.log("Start error:", err.message);
+    sock = null;
+    setTimeout(startBot, 5000);
+  }
 }
 
-// -------- GRACEFUL SHUTDOWN --------
-process.on("SIGTERM", gracefulShutdown);
-process.on("SIGINT", gracefulShutdown);
-
-async function gracefulShutdown() {
-  console.log("\n🛑 Shutting down gracefully...");
-  process.exit(0);
-}
-
-// -------- START THE BOT --------
+// -------- START --------
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🌐 Web server running on port ${PORT}`);
-  console.log(`📱 Visit http://localhost:${PORT} to see QR code`);
+  console.log(`🌐 Server on port ${PORT}`);
   startBot();
+});
+
+// Graceful shutdown
+process.on("SIGINT", () => {
+  console.log("\n🛑 Shutting down");
+  if (sock) sock.end();
+  process.exit();
 });
