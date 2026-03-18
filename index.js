@@ -52,7 +52,7 @@ function isValidSession(session) {
     console.log("❌ Session invalid: missing creds");
     return false;
   }
-  
+
   const hasRequired = !!(
     session.creds.me &&
     session.creds.noiseKey &&
@@ -60,14 +60,14 @@ function isValidSession(session) {
     session.creds.signedPreKey &&
     session.creds.advSecretKey
   );
-  
+
   if (hasRequired) {
     console.log("✅ Session is valid");
     console.log("📱 Connected as:", session.creds.me?.name || session.creds.me?.jid || "Unknown");
   } else {
     console.log("❌ Session invalid: missing required fields");
   }
-  
+
   return hasRequired;
 }
 
@@ -75,7 +75,7 @@ function isValidSession(session) {
 async function loadSession() {
   try {
     console.log("🔍 Checking Supabase for existing session...");
-    
+
     const { data, error } = await supabase
       .from(WA_TABLE)
       .select("auth_data")
@@ -91,9 +91,9 @@ async function loadSession() {
       console.log("📱 No session found in Supabase - will generate new QR");
       return null;
     }
-    
+
     console.log("📦 Session data found in Supabase, validating...");
-    
+
     if (isValidSession(data.auth_data)) {
       console.log("✅ Valid session loaded from Supabase");
       return data.auth_data;
@@ -101,7 +101,7 @@ async function loadSession() {
       console.log("⚠️ Session in Supabase is corrupted - will generate new QR");
       return null;
     }
-    
+
   } catch (err) {
     console.log("❌ Load session error:", err.message);
     return null;
@@ -115,25 +115,25 @@ async function scheduleSave(snapshot) {
     console.log("⚠️ Cannot save: invalid snapshot");
     return;
   }
-  
+
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     try {
       console.log("💾 Saving session to Supabase...");
-      
+
       const serialized = JSON.parse(JSON.stringify(snapshot, BufferJSON.replacer));
-      
+
       const { error } = await supabase.from(WA_TABLE).upsert({
         id: SESSION_ID,
         auth_data: serialized,
         updated_at: new Date().toISOString()
       });
-      
+
       if (error) throw error;
-      
+
       console.log("✅ Session saved successfully to Supabase");
       console.log("📱 Connected as:", snapshot.creds.me?.name || snapshot.creds.me?.jid || "Unknown");
-      
+
     } catch (err) {
       console.log("❌ Save error:", err.message);
     }
@@ -144,15 +144,15 @@ async function scheduleSave(snapshot) {
 async function clearSession() {
   try {
     console.log("🗑️ Clearing session from Supabase...");
-    
+
     const { error } = await supabase.from(WA_TABLE).upsert({
       id: SESSION_ID,
       auth_data: null,
       updated_at: new Date().toISOString()
     });
-    
+
     if (error) throw error;
-    
+
     console.log("✅ Session cleared successfully");
   } catch (err) {
     console.log("❌ Clear session error:", err.message);
@@ -162,7 +162,7 @@ async function clearSession() {
 // -------- WEB SERVER --------
 app.get("/", async (req, res) => {
   let qrImage = "";
-  
+
   if (currentQR && currentQR !== "Loading...") {
     try {
       qrImage = await QRCode.toDataURL(currentQR);
@@ -180,7 +180,7 @@ app.get("/", async (req, res) => {
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
+        body {
           background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
           font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
           min-height: 100vh;
@@ -198,16 +198,8 @@ app.get("/", async (req, res) => {
           width: 100%;
           text-align: center;
         }
-        h1 {
-          color: #333;
-          margin-bottom: 10px;
-          font-size: 28px;
-        }
-        .subtitle {
-          color: #666;
-          margin-bottom: 30px;
-          font-size: 16px;
-        }
+        h1 { color: #333; margin-bottom: 10px; font-size: 28px; }
+        .subtitle { color: #666; margin-bottom: 30px; font-size: 16px; }
         .qr-container {
           background: #f5f5f5;
           border-radius: 15px;
@@ -218,16 +210,8 @@ app.get("/", async (req, res) => {
           justify-content: center;
           align-items: center;
         }
-        .qr-image {
-          max-width: 300px;
-          width: 100%;
-          height: auto;
-          border-radius: 10px;
-        }
-        .loading {
-          color: #666;
-          font-size: 18px;
-        }
+        .qr-image { max-width: 300px; width: 100%; height: auto; border-radius: 10px; }
+        .loading { color: #666; font-size: 18px; }
         .steps {
           text-align: left;
           background: #f8f9fa;
@@ -235,22 +219,10 @@ app.get("/", async (req, res) => {
           padding: 20px;
           margin-top: 20px;
         }
-        .steps h3 {
-          color: #333;
-          margin-bottom: 10px;
-        }
-        .steps ol {
-          color: #555;
-          padding-left: 20px;
-        }
-        .steps li {
-          margin: 8px 0;
-        }
-        .status {
-          margin-top: 15px;
-          color: #28a745;
-          font-weight: 500;
-        }
+        .steps h3 { color: #333; margin-bottom: 10px; }
+        .steps ol { color: #555; padding-left: 20px; }
+        .steps li { margin: 8px 0; }
+        .status { margin-top: 15px; color: #28a745; font-weight: 500; }
         .force-btn {
           display: inline-block;
           background: #dc2626;
@@ -263,16 +235,14 @@ app.get("/", async (req, res) => {
           border: none;
           cursor: pointer;
         }
-        .force-btn:hover {
-          background: #b91c1c;
-        }
+        .force-btn:hover { background: #b91c1c; }
       </style>
     </head>
     <body>
       <div class="card">
         <h1>🤖 WhatsApp Bot</h1>
         <p class="subtitle">Scan QR code to connect your WhatsApp</p>
-        
+
         <div class="qr-container">
           ${qrImage ? `<img src="${qrImage}" class="qr-image" alt="QR Code">` : '<div class="loading">⏳ Generating QR Code...</div>'}
         </div>
@@ -301,11 +271,11 @@ app.get("/", async (req, res) => {
 
 app.get("/force-qr", async (req, res) => {
   console.log("\n🔄🔄🔄 FORCING NEW QR CODE 🔄🔄🔄\n");
-  
+
   await clearSession();
   currentQR = null;
   botStatus = "starting";
-  
+
   if (sock) {
     try {
       sock.end();
@@ -314,7 +284,7 @@ app.get("/force-qr", async (req, res) => {
       console.log("Error closing socket:", err.message);
     }
   }
-  
+
   setTimeout(() => startBot(), 1000);
   res.redirect("/");
 });
@@ -333,12 +303,10 @@ app.get("/status", async (req, res) => {
 
 // -------- BUILD AUTH STATE --------
 function buildAuthState(savedSession) {
-  // Initialize credentials: use saved ones or create fresh
   const creds = savedSession?.creds
     ? JSON.parse(JSON.stringify(savedSession.creds), BufferJSON.reviver)
     : initAuthCreds();
 
-  // In-memory key store, pre-populated from saved session
   let keyStore = {};
   if (savedSession?.keys) {
     try {
@@ -384,7 +352,7 @@ function buildAuthState(savedSession) {
 async function startBot() {
   try {
     console.log("\n🚀🚀🚀 STARTING BOT 🚀🚀🚀\n");
-    
+
     if (!waVersion) {
       console.log("📱 Fetching latest Baileys version...");
       const { version } = await fetchLatestBaileysVersion();
@@ -393,7 +361,7 @@ async function startBot() {
     }
 
     const loadedSession = await loadSession();
-    
+
     if (loadedSession) {
       console.log("✅ Using existing session from Supabase");
     } else {
@@ -401,7 +369,7 @@ async function startBot() {
     }
 
     const authState = buildAuthState(loadedSession);
-    
+
     currentQR = "Loading...";
 
     if (sock) {
@@ -429,7 +397,7 @@ async function startBot() {
 
     sock.ev.on("connection.update", async ({ connection, qr, lastDisconnect }) => {
       console.log("📡 Connection update:", { connection, hasQR: !!qr });
-      
+
       if (qr) {
         console.log("\n✅✅✅ QR CODE GENERATED ✅✅✅");
         console.log("📱 Scan this QR code with WhatsApp\n");
@@ -454,12 +422,12 @@ async function startBot() {
         const code = lastDisconnect?.error?.output?.statusCode;
         const errMsg = lastDisconnect?.error?.message || lastDisconnect?.error?.toString();
         console.log("🔌 Connection closed with code:", code, "| error:", errMsg);
-        
+
         if (botStatus === "connected") {
           console.log("ℹ️ Ignoring close - already connected");
           return;
         }
-        
+
         if (code === DisconnectReason.loggedOut) {
           console.log("🚫 Logged out - clearing session");
           await clearSession();
@@ -467,7 +435,7 @@ async function startBot() {
           setTimeout(() => startBot(), 2000);
           return;
         }
-        
+
         console.log("🔄 Network issue - reconnecting in 5 seconds...");
         setTimeout(() => startBot(), 5000);
       }
@@ -476,22 +444,24 @@ async function startBot() {
     // -------- GROUP PARTICIPANTS UPDATE --------
     sock.ev.on("group-participants.update", async (update) => {
       try {
-        if (update.action === "add" && update.participants?.length > 0) {
+        const joinActions = ["add", "invite", "linked_group_join"];
+        if (joinActions.includes(update.action) && update.participants?.length > 0) {
           const groupJid = update.id;
           const mentions = update.participants;
           let groupName = "the group";
           try {
-            const metadata = await sock.groupMetadata(groupJid);
-            groupName = metadata.subject || "the group";
+            const meta = await sock.groupMetadata(groupJid);
+            groupName = meta.subject || "the group";
           } catch {}
-          
+
+          const mentionText = mentions.map(u => `@${u.split("@")[0]}`).join(", ");
           await sock.sendMessage(groupJid, {
-            text: `👋 Hi ${mentions.map(u => `@${u.split("@")[0]}`).join(", ")}, welcome to ${groupName}!`,
+            text: `👋 Welcome ${mentionText} to *${groupName}*! 🎉\nPlease read the group rules and enjoy your stay.`,
             mentions
           });
           console.log("👋 Welcome sent to", mentions.length, "new members");
         }
-      } catch (err) { 
+      } catch (err) {
         console.log("Welcome error:", err.message);
       }
     });
@@ -506,14 +476,14 @@ async function startBot() {
         if (jid === "status@broadcast" || !jid.endsWith("@g.us")) return;
 
         const sender = msg.key.participant || msg.key.remoteJid;
-        
+
         let metadata;
         try {
           metadata = await sock.groupMetadata(jid);
         } catch {
           return;
         }
-        
+
         const isUserAdmin = isAdmin(sender, metadata.participants);
 
         const text = (
@@ -525,19 +495,38 @@ async function startBot() {
 
         if (!text) return;
 
-        // -------- ANTI-LINK --------
+        // -------- VULGAR WORD FILTER (applies to everyone including admins) --------
+        const vulgarList = [
+          "fuck", "shit", "bitch", "asshole", "bastard", "damn", "cunt",
+          "dick", "pussy", "nigga", "nigger", "whore", "slut", "faggot",
+          "motherfucker", "fck", "fuk", "fuq", "sht", "btch", "a55",
+          "b1tch", "d1ck", "f**k", "s**t", "idiot", "stupid", "dumb"
+        ];
+        const normalizedText = normalize(text);
+        const hasVulgar = vulgarList.some(word => normalizedText.includes(normalize(word)));
+        if (hasVulgar) {
+          try {
+            await sock.sendMessage(jid, {
+              delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
+            });
+            await sock.sendMessage(jid, { text: "🚫 Inappropriate language is not allowed" });
+          } catch {}
+          return;
+        }
+
+        // -------- ANTI-LINK (non-admins only) --------
         const linkRegex = /(https?:\/\/\S+|wa\.me\/\S+|chat\.whatsapp\.com\/\S+)/i;
         if (!isUserAdmin && linkRegex.test(text)) {
           try {
-            await sock.sendMessage(jid, { 
-              delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } 
+            await sock.sendMessage(jid, {
+              delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
             });
             await sock.sendMessage(jid, { text: "🚫 No links allowed" });
           } catch {}
           return;
         }
 
-        // -------- ANTI-SPAM --------
+        // -------- ANTI-SPAM (non-admins only) --------
         if (!isUserAdmin) {
           const now = Date.now();
           if (!spamTracker[sender]) {
@@ -551,11 +540,11 @@ async function startBot() {
             }
             user.lastMsg = text;
             user.time = now;
-            
+
             if (user.count >= 4) {
               try {
-                await sock.sendMessage(jid, { 
-                  delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } 
+                await sock.sendMessage(jid, {
+                  delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
                 });
                 await sock.sendMessage(jid, { text: "🚫 No spamming" });
               } catch {}
@@ -564,8 +553,8 @@ async function startBot() {
           }
         }
 
-        // -------- COMMANDS (ADMIN ONLY) --------
-        const command = text.toLowerCase();
+        // -------- COMMANDS (admin only, non-admins silently ignored) --------
+        const command = text.toLowerCase().trim();
         if (!command.startsWith(".") || !isUserAdmin) return;
 
         if (commandCooldown[sender] && Date.now() - commandCooldown[sender] < 3000) return;
@@ -581,32 +570,38 @@ async function startBot() {
         } else if (command === ".unlock") {
           await sock.groupSettingUpdate(jid, "not_announcement");
           await sock.sendMessage(jid, { text: "🔓 Group unlocked" });
-        } else if (command === ".kick") {
+        } else if (command.startsWith(".kick")) {
           let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
           if (!targets.length) {
-            await sock.sendMessage(jid, { text: "❌ Tag or reply to user" });
+            await sock.sendMessage(jid, { text: "❌ Tag someone or reply to their message with .kick" });
             return;
           }
           for (const user of targets) {
             const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
             if (isTargetAdmin) {
-              await sock.sendMessage(jid, { text: "❌ Cannot remove admin" });
+              await sock.sendMessage(jid, { text: "❌ Cannot remove an admin" });
               continue;
             }
-            await delay(500);
-            await sock.groupParticipantsUpdate(jid, [user], "remove");
+            try {
+              await sock.groupParticipantsUpdate(jid, [user], "remove");
+              await sock.sendMessage(jid, { text: `✅ @${user.split("@")[0]} has been removed`, mentions: [user] });
+              await delay(500);
+            } catch {
+              await sock.sendMessage(jid, { text: `❌ Failed to remove @${user.split("@")[0]}`, mentions: [user] });
+            }
           }
         } else if (command === ".tagall") {
           const allMembers = metadata.participants.map(p => p.id);
-          await sock.sendMessage(jid, { text: "📢 @everyone", mentions: allMembers });
+          const mentionText = allMembers.map(m => `@${m.split("@")[0]}`).join(" ");
+          await sock.sendMessage(jid, { text: `📢 ${mentionText}`, mentions: allMembers });
         } else if (command === ".delete") {
           if (!ctx?.stanzaId) return;
-          await sock.sendMessage(jid, { 
-            delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant } 
+          await sock.sendMessage(jid, {
+            delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant }
           });
         } else if (command === ".help") {
-          await sock.sendMessage(jid, { 
-            text: `.lock - Lock group\n.unlock - Unlock group\n.kick - Remove user\n.tagall - Mention all\n.delete - Delete message\n.help - Show commands`
+          await sock.sendMessage(jid, {
+            text: `.lock - Lock group\n.unlock - Unlock group\n.kick @user/reply - Remove user\n.tagall - Mention everyone\n.delete - Delete replied message\n.help - Show commands`
           });
         }
 
