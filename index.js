@@ -136,6 +136,67 @@ async function updateGroupSettings(groupJid, updates) {
   }
 }
 
+// Insert default settings for a group only if no row exists yet (ignoreDuplicates = no overwrite)
+async function ensureGroupSettings(groupJid, botJid) {
+  try {
+    await supabaseRetry(() =>
+      supabase.from("group_settings").upsert(
+        {
+          group_jid: groupJid,
+          bot_jid: botJid || null,
+          bot_active: true,
+          anti_link: true,
+          anti_vulgar: true
+        },
+        { onConflict: "group_jid", ignoreDuplicates: true }
+      )
+    );
+    console.log("✅ group_settings ensured for:", groupJid);
+  } catch (e) {
+    console.log("ensureGroupSettings error:", e?.message);
+  }
+}
+
+// Ensure a row exists in group_scheduled_locks for the group (null times = nothing scheduled)
+async function ensureGroupScheduledLocks(groupJid) {
+  try {
+    await supabaseRetry(() =>
+      supabase.from("group_scheduled_locks").upsert(
+        { group_jid: groupJid, lock_time: null, unlock_time: null },
+        { onConflict: "group_jid", ignoreDuplicates: true }
+      )
+    );
+    console.log("✅ group_scheduled_locks ensured for:", groupJid);
+  } catch (e) {
+    console.log("ensureGroupScheduledLocks error:", e?.message);
+  }
+}
+
+// Provision default rows in all tables for every group the bot is currently admin in
+async function provisionAllGroups() {
+  try {
+    if (!sock) return;
+    const groups = await sock.groupFetchAllParticipating();
+    const botJid = sock.user?.id;
+    if (!botJid || !groups) return;
+    const botNumber = botJid.split(":")[0]?.split("@")[0];
+    let count = 0;
+    for (const [groupJid, meta] of Object.entries(groups)) {
+      const self = meta.participants?.find(p =>
+        p.id.split("@")[0] === botNumber || p.id === botJid
+      );
+      if (self && (self.admin === "admin" || self.admin === "superadmin")) {
+        await ensureGroupSettings(groupJid, botJid);
+        await ensureGroupScheduledLocks(groupJid);
+        count++;
+      }
+    }
+    console.log(`✅ Provisioned ${count} group(s) across all tables`);
+  } catch (e) {
+    console.log("provisionAllGroups error:", e?.message);
+  }
+}
+
 async function getStrikes(groupJid, userJid) {
   try {
     const { data } = await supabaseRetry(() =>
@@ -821,6 +882,8 @@ async function startBot() {
           currentQR = null;
           botStatus = "connected";
           try { await sock.sendPresenceUpdate("available"); } catch {}
+          // Provision default settings for all groups bot is admin in
+          setTimeout(() => provisionAllGroups(), 3000);
           return;
         }
 
@@ -853,9 +916,39 @@ async function startBot() {
     sock.ev.on("group-participants.update", async (update) => {
       try {
         const { action, participants, id: groupJid } = update;
+        const botJid = sock.user?.id;
+        const botNumber = botJid?.split(":")[0]?.split("@")[0];
 
-        const joinActions = ["add", "invite", "linked_group_join"];
-        if (joinActions.includes(action) && participants?.length > 0) {
+        const joinActions = ["add", "invite", "linked_group_join", "promote"];
+
+        // If the bot itself was added or promoted to admin in a group, provision settings
+        if (joinActions.includes(action) && participants?.some(p => {
+          const pNum = p.split ? p.split("@")[0] : p?.id?.split("@")[0];
+          return pNum === botNumber;
+        })) {
+          try {
+            // Small delay to let WhatsApp register the bot's role
+            await new Promise(res => setTimeout(res, 2000));
+            const meta = await sock.groupMetadata(groupJid);
+            const self = meta.participants?.find(p => p.id.split("@")[0] === botNumber);
+            if (self && (self.admin === "admin" || self.admin === "superadmin")) {
+              await ensureGroupSettings(groupJid, botJid);
+              await ensureGroupScheduledLocks(groupJid);
+              console.log("✅ Auto-provisioned all tables for new group:", groupJid);
+            }
+          } catch (e) {
+            console.log("Auto-provision error:", e?.message);
+          }
+        }
+
+        // Welcome new human members
+        const memberJoinActions = ["add", "invite", "linked_group_join"];
+        const humanParticipants = (participants || []).filter(p => {
+          const pNum = (p.split ? p.split("@")[0] : p?.id?.split("@")[0]) || "";
+          return pNum !== botNumber;
+        });
+
+        if (memberJoinActions.includes(action) && humanParticipants.length > 0) {
           try {
             const settings = await getGroupSettings(groupJid);
             if (settings.bot_active) {
@@ -864,8 +957,8 @@ async function startBot() {
                 const meta = await sock.groupMetadata(groupJid);
                 groupName = meta.subject || "the group";
               } catch {}
-              scheduleWelcome(groupJid, participants, groupName);
-              console.log("👋 Welcome queued for", participants.length, "member(s)");
+              scheduleWelcome(groupJid, humanParticipants, groupName);
+              console.log("👋 Welcome queued for", humanParticipants.length, "member(s)");
             }
           } catch (e) {
             console.log("Welcome queue error:", e?.message);
@@ -943,7 +1036,7 @@ async function startBot() {
         // Skip non-commands when bot off
         if (!settings.bot_active && !isCommand) return;
 
-        // Anti-vulgar
+        // Anti-vulgar (delete + warning only, no strike)
         if (!isUserAdmin && settings.bot_active && settings.anti_vulgar) {
           const normalizedText = normalize(text);
           const hasVulgar = VULGAR_WORDS.some(word => normalizedText.includes(normalize(word)));
@@ -953,7 +1046,12 @@ async function startBot() {
                 delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
               });
             } catch {}
-            await handleStrike(jid, sender, "using vulgar language");
+            try {
+              await sock.sendMessage(jid, {
+                text: `⚠️ @${sender.split("@")[0]}, vulgar language is not allowed in this group. Please be respectful.`,
+                mentions: [sender]
+              });
+            } catch {}
             return;
           }
         }
