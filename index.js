@@ -4,7 +4,6 @@ import makeWASocket, {
   initAuthCreds,
   BufferJSON
 } from "@whiskeysockets/baileys";
-
 import qrcode from "qrcode-terminal";
 import QRCode from "qrcode";
 import express from "express";
@@ -16,10 +15,12 @@ dotenv.config();
 
 // -------- PROCESS-LEVEL ERROR GUARDS (prevent crashes) --------
 process.on("uncaughtException", (err) => {
-  console.log("❌ Uncaught Exception:", err?.message || err);
+  console.log("💥 Uncaught Exception:", err?.message || err);
+  process.exit(1); // Exit so Railway can restart
 });
 process.on("unhandledRejection", (reason) => {
-  console.log("❌ Unhandled Rejection:", reason?.message || reason);
+  console.log("💥 Unhandled Rejection:", reason?.message || reason);
+  process.exit(1);
 });
 
 // -------- CONFIG --------
@@ -27,6 +28,12 @@ const PORT = process.env.PORT || 5000;
 const SESSION_ID = 1;
 const WA_TABLE = "wa_sessions";
 const VULGAR_WORDS = ["fuck", "nigga", "nigger", "bitch", "asshole", "shit"];
+
+// Validate required environment variables
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
+  console.error("❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY in environment");
+  process.exit(1);
+}
 
 // -------- HELPERS --------
 const delay = ms => new Promise(res => setTimeout(res, ms));
@@ -45,7 +52,6 @@ const normalize = str => {
 };
 
 // Parse time strings like "8:00PM", "7:30AM", "8PM" → "HH:MM" (24h)
-// Returns null for anything that doesn't match the strict pattern
 function parseTimeTo24h(timeStr) {
   try {
     const cleaned = String(timeStr).trim();
@@ -169,7 +175,6 @@ async function getScheduledLock(groupJid) {
   }
 }
 
-// Save lock_time — keeps unlock_time unchanged via upsert
 async function setScheduledLockTime(groupJid, lockTime) {
   try {
     await supabase.from("group_scheduled_locks").upsert({
@@ -181,7 +186,6 @@ async function setScheduledLockTime(groupJid, lockTime) {
   }
 }
 
-// Save unlock_time — keeps lock_time unchanged via upsert
 async function setScheduledUnlockTime(groupJid, unlockTime) {
   try {
     await supabase.from("group_scheduled_locks").upsert({
@@ -193,7 +197,6 @@ async function setScheduledUnlockTime(groupJid, unlockTime) {
   }
 }
 
-// Null out lock_time only (preserves unlock_time row)
 async function clearLockTime(groupJid) {
   try {
     await supabase.from("group_scheduled_locks")
@@ -204,7 +207,6 @@ async function clearLockTime(groupJid) {
   }
 }
 
-// Null out unlock_time only (preserves lock_time row)
 async function clearUnlockTime(groupJid) {
   try {
     await supabase.from("group_scheduled_locks")
@@ -224,7 +226,7 @@ async function handleStrike(jid, sender, reason) {
     if (strikes >= 3) {
       try {
         await sock.sendMessage(jid, {
-          text: `🚫 ${tag} has received *3/3 strikes* for ${reason} and has been *removed* from the group.`,
+          text: `⛔ ${tag} has received *3/3 strikes* for ${reason} and has been *removed* from the group.`,
           mentions: [sender]
         });
       } catch {}
@@ -266,7 +268,7 @@ function scheduleWelcome(groupJid, participants, groupName) {
 
         const mentionText = members.map(u => `@${u.split("@")[0]}`).join(", ");
         await sock.sendMessage(groupJid, {
-          text: `👋 Welcome ${mentionText} to *${groupName}*! 🎉\n\n📋 *Group Rules:*\n• No spam\n• No links (unless admin)\n• No vulgar language\n\nEnjoy your stay and be respectful! 😊`,
+          text: `👋 Welcome ${mentionText} to *${groupName}*! \n\n📜 *Group Rules:*\n• No spam\n• No links (unless admin)\n• No vulgar language\n\nEnjoy your stay and be respectful! ✨`,
           mentions: members
         });
       } catch (e) {
@@ -279,7 +281,7 @@ function scheduleWelcome(groupJid, participants, groupName) {
 }
 
 // -------- SCHEDULED LOCK / UNLOCK CHECKER --------
-// Runs every 60 seconds. When a time fires it nulls out that column (one-time trigger).
+// Runs every 60 seconds. Fires once per minute, then nulls the column.
 const firedThisMinute = new Set();
 
 function startScheduledLockChecker() {
@@ -320,8 +322,7 @@ function startScheduledLockChecker() {
                 console.log("Scheduled lock execute error:", e?.message);
               }
 
-              // Clear lock_time after firing (one-time)
-              await clearLockTime(row.group_jid);
+              await clearLockTime(row.group_jid); // lock_time becomes null after firing
             }
           }
         }
@@ -348,8 +349,7 @@ function startScheduledLockChecker() {
                 console.log("Scheduled unlock execute error:", e?.message);
               }
 
-              // Clear unlock_time after firing (one-time)
-              await clearUnlockTime(row.group_jid);
+              await clearUnlockTime(row.group_jid); // unlock_time becomes null after firing
             }
           }
         }
@@ -359,6 +359,23 @@ function startScheduledLockChecker() {
     }
   }, 60000);
 }
+
+// -------- MEMORY CLEANUP (spamTracker & commandCooldown) --------
+setInterval(() => {
+  const now = Date.now();
+  // Clean spamTracker entries older than 24 hours
+  for (const [key, value] of Object.entries(spamTracker)) {
+    if (now - value.time > 24 * 60 * 60 * 1000) {
+      delete spamTracker[key];
+    }
+  }
+  // Clean commandCooldown entries older than 1 hour
+  for (const [key, time] of Object.entries(commandCooldown)) {
+    if (now - time > 60 * 60 * 1000) {
+      delete commandCooldown[key];
+    }
+  }
+}, 60 * 60 * 1000); // once per hour
 
 // -------- SESSION VALIDATION --------
 function isValidSession(session) {
@@ -440,7 +457,7 @@ async function clearSession() {
       updated_at: new Date().toISOString()
     });
     if (error) throw error;
-    console.log("✅ Session cleared");
+    console.log("🗑️ Session cleared");
   } catch (err) {
     console.log("❌ Clear session error:", err?.message);
   }
@@ -530,21 +547,17 @@ app.get("/", async (req, res) => {
         </div>
 
         <script>
-          // Only poll when not yet connected — stops automatically once connected
           const STATUS = '${botStatus}';
           if (STATUS !== 'connected') {
             let interval = setInterval(async () => {
               try {
                 const res = await fetch('/status');
                 const data = await res.json();
-                // Reload only when something meaningful changes
                 if (data.botStatus !== STATUS) {
                   clearInterval(interval);
                   location.reload();
                 }
-              } catch (e) {
-                // Network hiccup — just wait for next tick
-              }
+              } catch (e) {}
             }, 3000);
           }
         </script>
@@ -587,11 +600,9 @@ app.get("/health", (req, res) => {
 
 app.get("/status", async (req, res) => {
   try {
-    const session = await loadSession();
     res.json({
       botStatus,
       hasQR: !!currentQR,
-      hasValidSession: !!session,
       uptime: Math.floor(process.uptime())
     });
   } catch (e) {
@@ -651,9 +662,17 @@ function buildAuthState(savedSession) {
 }
 
 // -------- START BOT --------
+let isStarting = false; // guard against concurrent starts
+
 async function startBot() {
+  if (isStarting) {
+    console.log("⏳ Bot already starting, skipping...");
+    return;
+  }
+  isStarting = true;
+
   try {
-    console.log("\n🚀🚀🚀 STARTING BOT 🚀🚀🚀\n");
+    console.log("\n🚀 STARTING BOT 🚀\n");
 
     if (!waVersion) {
       console.log("📱 Fetching latest Baileys version...");
@@ -682,6 +701,12 @@ async function startBot() {
       keepAliveIntervalMs: 30000
     });
 
+    // Listen for socket errors
+    sock.ev.on("error", (err) => {
+      console.log("💥 Socket error:", err?.message);
+      // Do not restart here; let connection.update handle it.
+    });
+
     sock.ev.on("creds.update", () => {
       try { scheduleSave(authState.getSnapshot()); } catch {}
     });
@@ -692,7 +717,7 @@ async function startBot() {
         console.log("📡 Connection update:", { connection, hasQR: !!qr });
 
         if (qr) {
-          console.log("\n✅ QR CODE GENERATED — scan with WhatsApp\n");
+          console.log("\n✅✅✅ QR CODE GENERATED — scan with WhatsApp\n");
           currentQR = qr;
           botStatus = "awaiting_scan";
           try { qrcode.generate(qr, { small: true }); } catch {}
@@ -712,12 +737,15 @@ async function startBot() {
           const errMsg = lastDisconnect?.error?.message;
           console.log("🔌 Connection closed:", code, errMsg);
 
-          if (botStatus === "connected") { console.log("ℹ️ Ignoring close — already connected"); return; }
+          if (botStatus === "connected") {
+            botStatus = "reconnecting";
+          }
 
           if (code === DisconnectReason.loggedOut) {
             console.log("🚫 Logged out — clearing session");
             await clearSession();
             currentQR = null;
+            botStatus = "starting";
             setTimeout(() => startBot(), 2000);
             return;
           }
@@ -796,21 +824,33 @@ async function startBot() {
         const command = text.toLowerCase().trim();
         const isCommand = command.startsWith(".");
 
-        // ---- .bot on / .bot off (admin-only, works even when bot is inactive) ----
+        // ---- .bot on / .bot off — works even when bot is inactive ----
         if (isCommand && isUserAdmin) {
           if (command === ".bot on") {
             await updateGroupSettings(jid, { bot_active: true });
-            try { await sock.sendMessage(jid, { text: "🤖 Bot is now *active*. Automations are enabled." }); } catch {}
+            try { await sock.sendMessage(jid, { text: "✅ Bot is now *active*. Automations are enabled." }); } catch {}
             return;
           }
           if (command === ".bot off") {
             await updateGroupSettings(jid, { bot_active: false });
-            try { await sock.sendMessage(jid, { text: "🤖 Bot is now *inactive*. Automations are disabled." }); } catch {}
+            try { await sock.sendMessage(jid, { text: "⏸️ Bot is now *inactive*. Automations are disabled." }); } catch {}
             return;
           }
         }
 
-        // ---- Skip everything if bot is off and it's not a command ----
+        // ---- If bot is inactive and it's a command (but not .bot on), reject it ----
+        if (!settings.bot_active && isCommand && !isUserAdmin) {
+          // Non-admin commands should not even reach here because earlier check, but just in case.
+          return;
+        }
+        if (!settings.bot_active && isCommand && isUserAdmin && command !== ".bot on") {
+          try {
+            await sock.sendMessage(jid, { text: "⚠️ Bot is currently deactivated. Use `.bot on` to activate." });
+          } catch {}
+          return; // Do not execute any other command
+        }
+
+        // ---- Skip non-commands when bot is off ----
         if (!settings.bot_active && !isCommand) return;
 
         // ---- ANTI-VULGAR (non-admins only, when enabled) ----
@@ -856,7 +896,7 @@ async function startBot() {
           try {
             const meta = await sock.groupMetadata(jid);
             if (meta.announce) {
-              await sock.sendMessage(jid, { text: "🔒 Group is already locked." });
+              // Already locked – do nothing, no reply
               return;
             }
             await sock.groupSettingUpdate(jid, "announcement");
@@ -870,7 +910,7 @@ async function startBot() {
         } else if (command === ".lock clear") {
           try {
             await clearLockTime(jid);
-            await sock.sendMessage(jid, { text: "🗑️ Scheduled lock time has been cleared. Group will not auto-lock." });
+            await sock.sendMessage(jid, { text: "🔓 Scheduled lock time has been cleared. Group will not auto-lock." });
           } catch (e) {
             console.log(".lock clear error:", e?.message);
           }
@@ -881,13 +921,13 @@ async function startBot() {
             const parsed = parseTimeTo24h(timeArg);
             if (!parsed) {
               await sock.sendMessage(jid, {
-                text: `❌ *"${timeArg}"* is not a valid time.\n\nPlease use the format: HH:MMAM/PM\nExamples: \`.lock 8:30PM\`, \`.lock 10AM\`, \`.lock 6:00AM\``
+                text: `❌ *"${timeArg}"* is not a valid time.\n\nUse format: HH:MMAM/PM\nExamples: \`.lock 8:30PM\`, \`.lock 10AM\`, \`.lock 6:00AM\``
               });
               return;
             }
             await setScheduledLockTime(jid, parsed);
             await sock.sendMessage(jid, {
-              text: `⏰ Group will automatically lock once at *${formatTime24to12(parsed)}*.\nUse \`.lock clear\` to cancel.`
+              text: `🔒 Group will automatically lock once at *${formatTime24to12(parsed)}*.\nUse \`.lock clear\` to cancel.`
             });
           } catch (e) {
             console.log(".lock [time] error:", e?.message);
@@ -901,7 +941,7 @@ async function startBot() {
           try {
             const meta = await sock.groupMetadata(jid);
             if (!meta.announce) {
-              await sock.sendMessage(jid, { text: "🔓 Group is already unlocked." });
+              // Already unlocked – do nothing, no reply
               return;
             }
             await sock.groupSettingUpdate(jid, "not_announcement");
@@ -915,7 +955,7 @@ async function startBot() {
         } else if (command === ".unlock clear") {
           try {
             await clearUnlockTime(jid);
-            await sock.sendMessage(jid, { text: "🗑️ Scheduled unlock time has been cleared. Group will not auto-unlock." });
+            await sock.sendMessage(jid, { text: "🔒 Scheduled unlock time has been cleared. Group will not auto-unlock." });
           } catch (e) {
             console.log(".unlock clear error:", e?.message);
           }
@@ -926,13 +966,13 @@ async function startBot() {
             const parsed = parseTimeTo24h(timeArg);
             if (!parsed) {
               await sock.sendMessage(jid, {
-                text: `❌ *"${timeArg}"* is not a valid time.\n\nPlease use the format: HH:MMAM/PM\nExamples: \`.unlock 6:00AM\`, \`.unlock 7AM\`, \`.unlock 8:30AM\``
+                text: `❌ *"${timeArg}"* is not a valid time.\n\nUse format: HH:MMAM/PM\nExamples: \`.unlock 6:00AM\`, \`.unlock 7AM\`, \`.unlock 8:30AM\``
               });
               return;
             }
             await setScheduledUnlockTime(jid, parsed);
             await sock.sendMessage(jid, {
-              text: `⏰ Group will automatically unlock once at *${formatTime24to12(parsed)}*.\nUse \`.unlock clear\` to cancel.`
+              text: `🔓 Group will automatically unlock once at *${formatTime24to12(parsed)}*.\nUse \`.unlock clear\` to cancel.`
             });
           } catch (e) {
             console.log(".unlock [time] error:", e?.message);
@@ -950,6 +990,15 @@ async function startBot() {
               return;
             }
             for (const user of targets) {
+              // Check if user exists in the group
+              const userExists = metadata.participants.some(p => p.id === user);
+              if (!userExists) {
+                await sock.sendMessage(jid, {
+                  text: `❌ User @${user.split("@")[0]} is not in this group.`,
+                  mentions: [user]
+                });
+                continue;
+              }
               try {
                 const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
                 if (isTargetAdmin) {
@@ -1035,13 +1084,13 @@ async function startBot() {
         } else if (command === ".antilink on") {
           try {
             await updateGroupSettings(jid, { anti_link: true });
-            await sock.sendMessage(jid, { text: "✅ Anti-link is now *enabled*." });
+            await sock.sendMessage(jid, { text: "🔗 Anti-link is now *enabled*." });
           } catch (e) { console.log(".antilink on error:", e?.message); }
 
         } else if (command === ".antilink off") {
           try {
             await updateGroupSettings(jid, { anti_link: false });
-            await sock.sendMessage(jid, { text: "✅ Anti-link is now *disabled*." });
+            await sock.sendMessage(jid, { text: "🔗 Anti-link is now *disabled*." });
           } catch (e) { console.log(".antilink off error:", e?.message); }
 
         // =========================================================
@@ -1050,13 +1099,13 @@ async function startBot() {
         } else if (command === ".antivulgar on") {
           try {
             await updateGroupSettings(jid, { anti_vulgar: true });
-            await sock.sendMessage(jid, { text: "✅ Anti-vulgar is now *enabled*." });
+            await sock.sendMessage(jid, { text: "🔞 Anti-vulgar is now *enabled*." });
           } catch (e) { console.log(".antivulgar on error:", e?.message); }
 
         } else if (command === ".antivulgar off") {
           try {
             await updateGroupSettings(jid, { anti_vulgar: false });
-            await sock.sendMessage(jid, { text: "✅ Anti-vulgar is now *disabled*." });
+            await sock.sendMessage(jid, { text: "🔞 Anti-vulgar is now *disabled*." });
           } catch (e) { console.log(".antivulgar off error:", e?.message); }
 
         // =========================================================
@@ -1065,31 +1114,31 @@ async function startBot() {
         } else if (command === ".help") {
           try {
             const sched = await getScheduledLock(jid);
-            const lockInfo = sched?.lock_time ? `\n⏰ Lock scheduled: ${formatTime24to12(sched.lock_time)}` : "";
-            const unlockInfo = sched?.unlock_time ? `\n⏰ Unlock scheduled: ${formatTime24to12(sched.unlock_time)}` : "";
+            const lockInfo = sched?.lock_time ? `\n🔒 Lock scheduled: ${formatTime24to12(sched.lock_time)}` : "";
+            const unlockInfo = sched?.unlock_time ? `\n🔓 Unlock scheduled: ${formatTime24to12(sched.unlock_time)}` : "";
 
             await sock.sendMessage(jid, {
               text:
-                `🤖 *Bot Commands (Admins Only)*\n\n` +
-                `*🔒 Group Lock*\n` +
+                `📋 *Bot Commands (Admins Only)*\n\n` +
+                `🔒 *Group Lock*\n` +
                 `.lock — Lock group now & clear lock schedule\n` +
                 `.lock 9:00PM — Schedule one-time auto-lock\n` +
                 `.lock clear — Cancel scheduled lock\n` +
                 `.unlock — Unlock group now & clear unlock schedule\n` +
                 `.unlock 6:00AM — Schedule one-time auto-unlock\n` +
                 `.unlock clear — Cancel scheduled unlock\n\n` +
-                `*👥 Members*\n` +
+                `👥 *Members*\n` +
                 `.tagall — Mention all members\n` +
                 `.kick @user — Remove user from group\n` +
                 `.delete — Delete replied message\n\n` +
-                `*⚠️ Strikes*\n` +
+                `⚡ *Strikes*\n` +
                 `.strike reset @user — Clear a user's strikes\n\n` +
-                `*⚙️ Automations*\n` +
+                `⚙️ *Automations*\n` +
                 `.bot on / .bot off — Enable or disable bot\n` +
                 `.antilink on / .antilink off — Toggle anti-link\n` +
                 `.antivulgar on / .antivulgar off — Toggle anti-vulgar\n\n` +
-                `*📊 Current Status*\n` +
-                `Bot: ${settings.bot_active ? "🟢 Active" : "🔴 Inactive"}\n` +
+                `📊 *Current Status*\n` +
+                `Bot: ${settings.bot_active ? "✅ Active" : "⏸️ Inactive"}\n` +
                 `Anti-Link: ${settings.anti_link ? "✅ On" : "❌ Off"}\n` +
                 `Anti-Vulgar: ${settings.anti_vulgar ? "✅ On" : "❌ Off"}` +
                 lockInfo + unlockInfo
@@ -1103,12 +1152,14 @@ async function startBot() {
         console.log("messages.upsert error:", e?.message);
       }
     });
-
   } catch (err) {
     console.log("❌ startBot error:", err?.message);
     setTimeout(startBot, 5000);
+  } finally {
+    isStarting = false;
   }
 }
+
 // -------- START SERVER --------
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🌐 Server running on http://localhost:${PORT}`);
@@ -1119,11 +1170,8 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
-    console.log(`❌ Port ${PORT} is already in use. Retrying in 3 seconds...`);
-    setTimeout(() => {
-      server.close();
-      server.listen(PORT, "0.0.0.0");
-    }, 3000);
+    console.log(`⚠️ Port ${PORT} is already in use. Exiting...`);
+    process.exit(1); // Let Railway restart
   } else {
     console.log("❌ Server error:", err?.message);
   }
@@ -1138,13 +1186,11 @@ async function shutdown(signal) {
 
   console.log(`\n🛑 ${signal} received — shutting down gracefully...`);
 
-  // 1. Stop accepting new HTTP connections
   server.close((err) => {
     if (err) console.log("Server close error:", err?.message);
     else console.log("✅ HTTP server closed");
   });
 
-  // 2. Close the WhatsApp socket
   if (sock) {
     try {
       sock.end();
@@ -1154,7 +1200,6 @@ async function shutdown(signal) {
     }
   }
 
-  // 3. Give everything up to 5 seconds to finish, then force exit
   setTimeout(() => {
     console.log("⏱️ Forcing exit after timeout");
     process.exit(0);
