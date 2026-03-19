@@ -1,9 +1,12 @@
-import makeWASocket, {
-  DisconnectReason,
+import Baileys from '@whiskeysockets/baileys';
+const { 
+  default: makeWASocket, 
+  DisconnectReason, 
   fetchLatestBaileysVersion,
   initAuthCreds,
-  BufferJSON
-} from "@whiskeysockets/baileys";
+  BufferJSON 
+} = Baileys;
+
 import qrcode from "qrcode-terminal";
 import QRCode from "qrcode";
 import express from "express";
@@ -12,7 +15,8 @@ import pino from "pino";
 import dotenv from "dotenv";
 
 dotenv.config();
-
+console.log('✅ makeWASocket type:', typeof makeWASocket);
+console.log('✅ Available exports:', Object.keys(Baileys));
 // -------- ENVIRONMENT VALIDATION --------
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
   console.error("❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY");
