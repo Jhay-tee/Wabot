@@ -216,39 +216,22 @@ async function getStrikes(groupJid, userJid) {
 
 async function incrementStrike(groupJid, userJid) {
   try {
-    // Get current strikes
-    const { data, error } = await supabase
-      .from("group_strikes")
-      .select("strikes")
-      .eq("group_jid", groupJid)
-      .eq("user_jid", userJid)
-      .single();
-
-    if (error && error.code !== "PGRST116") {
-      throw error; // ignore "no rows found" error
-    }
-
-    let current = data?.strikes || 0;
+    const current = await getStrikes(groupJid, userJid);
     const newCount = current + 1;
-
-    // Upsert with conflict target so it updates instead of inserting
     await supabaseRetry(() =>
       supabase.from("group_strikes").upsert({
         group_jid: groupJid,
         user_jid: userJid,
         strikes: newCount,
         last_strike: new Date().toISOString()
-      }, { onConflict: ["group_jid", "user_jid"] })   // <-- important
+      })
     );
-
-    console.log(`Strikes for ${userJid} in ${groupJid}: ${newCount}`);
     return newCount;
   } catch (e) {
-    console.error("incrementStrike error:", e);
+    console.log("incrementStrike error:", e?.message);
     return 1;
   }
 }
-
 
 async function resetUserStrikes(groupJid, userJid) {
   try {
@@ -335,81 +318,58 @@ async function clearUnlockTime(groupJid) {
 // -------- STRIKE HANDLER --------
 async function handleStrike(jid, sender, reason) {
   try {
-    // Increment strike count in Supabase (or your DB)
     const strikes = await incrementStrike(jid, sender);
     const tag = `@${sender.split("@")[0]}`;
 
     if (strikes >= 3) {
-      // Final strike: remove user
       try {
         await sock.sendMessage(jid, {
           text: `⛔ ${tag} has received *3/3 strikes* for ${reason} and has been *removed* from the group.`,
           mentions: [sender]
         });
-      } catch (e) {
-        console.error("Strike message error:", e);
-      }
-
+      } catch {}
       try {
         await sock.groupParticipantsUpdate(jid, [sender], "remove");
       } catch (e) {
-        console.error("Auto-kick error:", e?.message);
+        console.log("Auto-kick error:", e?.message);
       }
-
-      // Reset strikes after removal
       await resetUserStrikes(jid, sender);
-
     } else {
-      // Warning message for strike 1 or 2
       try {
         await sock.sendMessage(jid, {
           text: `⚠️ Warning ${tag}: ${reason}.\nStrike *${strikes}/3* — at 3 strikes you will be removed.`,
           mentions: [sender]
         });
-      } catch (e) {
-        console.error("Warning message error:", e);
-      }
+      } catch {}
     }
   } catch (e) {
-    console.error("handleStrike error:", e);
+    console.log("handleStrike error:", e?.message);
   }
 }
-
 
 // -------- WELCOME BATCH (5-second window) --------
 const welcomeBuffers = {};
 
 function scheduleWelcome(groupJid, participants, groupName) {
   try {
-    // Ensure participants is an array of valid JIDs
+    // Ensure participants is an array of strings
     if (!Array.isArray(participants)) {
       console.log("scheduleWelcome: participants is not an array", participants);
       return;
     }
-
-    const validParticipants = participants.filter(
-      p => typeof p === "string" && p.includes("@s.whatsapp.net")
-    );
+    const validParticipants = participants.filter(p => typeof p === 'string');
     if (validParticipants.length === 0) return;
 
-    // Initialize buffer if not present
     if (!welcomeBuffers[groupJid]) {
-      welcomeBuffers[groupJid] = { participants: [], timer: null };
+      welcomeBuffers[groupJid] = { participants: [] };
     }
-
-    // Add new participants to buffer
     welcomeBuffers[groupJid].participants.push(...validParticipants);
 
-    // Reset timer for batching
-    if (welcomeBuffers[groupJid].timer) {
-      clearTimeout(welcomeBuffers[groupJid].timer);
-    }
-
+    clearTimeout(welcomeBuffers[groupJid].timer);
     welcomeBuffers[groupJid].timer = setTimeout(async () => {
       try {
         const members = welcomeBuffers[groupJid]?.participants || [];
-        delete welcomeBuffers[groupJid]; // clear buffer
-
+        delete welcomeBuffers[groupJid];
         if (!members.length || !sock) return;
 
         const mentionText = members.map(u => `@${u.split("@")[0]}`).join(", ");
@@ -417,17 +377,14 @@ function scheduleWelcome(groupJid, participants, groupName) {
           text: `👋 Welcome ${mentionText} to *${groupName}*! \n\n📜 *Group Rules:*\n• No spam\n• No links (unless admin)\n• No vulgar language\n\nEnjoy your stay and be respectful! ✨`,
           mentions: members
         });
-
-        console.log("✅ Welcome message sent to:", members);
       } catch (e) {
-        console.error("Welcome send error:", e);
+        console.log("Welcome send error:", e?.message);
       }
     }, 5000);
   } catch (e) {
-    console.error("scheduleWelcome error:", e);
+    console.log("scheduleWelcome error:", e?.message);
   }
 }
-
 
 // -------- SCHEDULED LOCK / UNLOCK CHECKER --------
 const firedThisMinute = new Set();
@@ -1080,7 +1037,7 @@ async function startBot() {
         if (!settings.bot_active && !isCommand) return;
 
         // Anti-vulgar (delete + warning only, no strike)
-        if (settings.bot_active && settings.anti_vulgar) {
+        if (!isUserAdmin && settings.bot_active && settings.anti_vulgar) {
           const normalizedText = normalize(text);
           const hasVulgar = VULGAR_WORDS.some(word => normalizedText.includes(normalize(word)));
           if (hasVulgar) {
