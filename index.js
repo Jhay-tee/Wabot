@@ -1056,7 +1056,7 @@ if (memberJoinActions.includes(action) && humanParticipants.length > 0) {
         if (!settings.bot_active && !isCommand) return;
 
         // Anti-vulgar (delete + warning only, no strike)
-        if (!isUserAdmin && settings.bot_active && settings.anti_vulgar) {
+        if (settings.bot_active && settings.anti_vulgar) {
           const normalizedText = normalize(text);
           const hasVulgar = VULGAR_WORDS.some(word => normalizedText.includes(normalize(word)));
           if (hasVulgar) {
