@@ -1,17 +1,15 @@
-/**
+\/**
  * ======================================================
- * WhatsApp Bot - Production Grade (FULLY FIXED)
- * Version: 1.0.1
- * Baileys: 6.7.2
- * Database: Supabase (PostgreSQL)
- * Timezone: Africa/Lagos (Nigeria)
+ * WhatsApp Bot - Production Grade (v1.0.4 - FINAL FIXED)
+ * Baileys: 6.7.2 (protocol version locked)
+ * Database: Supabase
+ * Timezone: Africa/Lagos
  * ======================================================
  */
 
 import {
   makeWASocket,
   DisconnectReason,
-  fetchLatestBaileysVersion,
   initAuthCreds,
   BufferJSON
 } from '@whiskeysockets/baileys';
@@ -23,38 +21,32 @@ import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 import dotenv from "dotenv";
 
-// Load environment variables
 dotenv.config();
 
 // ======================================================
-// ENVIRONMENT VALIDATION
-// ======================================================
-const REQUIRED_ENV_VARS = ['SUPABASE_URL', 'SUPABASE_ANON_KEY'];
-const missingVars = REQUIRED_ENV_VARS.filter(varName => !process.env[varName]);
-
-if (missingVars.length > 0) {
-  console.error('❌ Missing required environment variables:', missingVars.join(', '));
-  process.exit(1);
-}
-
-// ======================================================
-// CONFIGURATION
+// CONFIG
 // ======================================================
 const PORT = process.env.PORT || 5000;
 const SESSION_ID = 1;
 const WA_TABLE = "wa_sessions";
 const BOT_TIMEZONE = "Africa/Lagos";
 
-// Vulgar words list
+// Locked for your exact Baileys 6.7.2 (prevents 440 forever)
+const BAILEYS_VERSION = [2, 3000, 1035194821];
+
 const VULGAR_WORDS = [
-  "fuck", "fucking", "fucker", "fucked",
-  "nigga", "nigger", "bitch", "bitching",
-  "asshole", "shit", "shitting", "pussy",
-  "dick", "cunt", "whore", "slut"
+  "fuck","fucking","fucker","fucked",
+  "nigga","nigger","bitch","asshole",
+  "shit","pussy","dick","cunt","whore","slut"
 ];
 
 // ======================================================
-// SUPABASE CLIENT SETUP
+// GLOBAL STATUS (used by routes + scheduler)
+// ======================================================
+let botStatus = 'starting';
+
+// ======================================================
+// SUPABASE
 // ======================================================
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -62,15 +54,8 @@ const supabase = createClient(
   {
     auth: { persistSession: false },
     global: {
-      fetch: (url, options) => {
-        return fetch(url, { 
-          ...options, 
-          signal: AbortSignal.timeout(10000)
-        }).catch(err => {
-          console.error('📡 Supabase fetch error:', err.message);
-          throw err;
-        });
-      }
+      fetch: (url, opts) =>
+        fetch(url, { ...opts, signal: AbortSignal.timeout(10000) })
     }
   }
 );
@@ -81,30 +66,23 @@ const supabase = createClient(
 const welcomeBuffers = new Map();
 const firedThisMinute = new Set();
 
-// Clean up old entries every hour
 setInterval(() => {
   const oneHourAgo = Date.now() - 3600000;
   for (const key of firedThisMinute) {
-    const timestamp = parseInt(key.split('_').pop() || '0');
-    if (timestamp < oneHourAgo) firedThisMinute.delete(key);
+    const ts = parseInt(key.split('_').pop() || '0');
+    if (ts < oneHourAgo) firedThisMinute.delete(key);
   }
 }, 3600000);
 
 // ======================================================
-// HELPER FUNCTIONS
+// HELPERS
 // ======================================================
-
-const delay = ms => new Promise(res => setTimeout(res, ms));
+const delay = ms => new Promise(r => setTimeout(r, ms));
 
 const isAdmin = (jid, participants) => {
-  try {
-    if (!jid || !participants || !Array.isArray(participants)) return false;
-    const user = participants.find(p => p && p.id === jid);
-    return user && (user.admin === "admin" || user.admin === "superadmin");
-  } catch (err) {
-    console.error('isAdmin error:', err.message);
-    return false;
-  }
+  if (!jid || !Array.isArray(participants)) return false;
+  const user = participants.find(p => p?.id === jid);
+  return user && (user.admin === 'admin' || user.admin === 'superadmin');
 };
 
 function getCurrentTimeInZone() {
@@ -116,15 +94,9 @@ function getCurrentTimeInZone() {
       hour12: false,
       hourCycle: 'h23'
     });
-    
-    const timeStr = formatter.format(new Date());
-    const [hh, mm] = timeStr.split(':').map(Number);
-    
-    if (isNaN(hh) || isNaN(mm)) throw new Error('Invalid time format');
-    
+    const [hh, mm] = formatter.format(new Date()).split(':').map(Number);
     return { hh, mm };
-  } catch (err) {
-    console.error('Timezone error:', err.message, '- using UTC fallback');
+  } catch {
     const now = new Date();
     return { hh: now.getHours(), mm: now.getMinutes() };
   }
@@ -135,432 +107,254 @@ function parseTimeTo24h(timeStr) {
     const cleaned = String(timeStr).trim().toUpperCase().replace(/\s+/g, '');
     const match = cleaned.match(/^(\d{1,2})(?::(\d{2}))?(AM|PM)$/);
     if (!match) return null;
-    
     let hours = parseInt(match[1], 10);
     const minutes = parseInt(match[2] || "0", 10);
     const period = match[3];
-    
-    if (hours < 1 || hours > 12) return null;
-    if (minutes < 0 || minutes > 59) return null;
-    
+    if (hours < 1 || hours > 12 || minutes > 59) return null;
     if (period === "PM" && hours !== 12) hours += 12;
     if (period === "AM" && hours === 12) hours = 0;
-    
-    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
-  } catch (err) {
-    console.error('parseTimeTo24h error:', err.message);
-    return null;
-  }
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+  } catch { return null; }
 }
 
 function formatTime24to12(hhmm) {
-  try {
-    if (!hhmm || typeof hhmm !== 'string') return hhmm;
-    
-    const [hh, mm] = hhmm.split(':').map(Number);
-    if (isNaN(hh) || isNaN(mm)) return hhmm;
-    
-    const period = hh >= 12 ? "PM" : "AM";
-    const h = hh % 12 || 12;
-    
-    return `${h}:${String(mm).padStart(2, "0")} ${period}`;
-  } catch (err) {
-    console.error('formatTime24to12 error:', err.message);
-    return hhmm;
-  }
+  if (!hhmm) return hhmm;
+  const [hh, mm] = hhmm.split(':').map(Number);
+  const period = hh >= 12 ? "PM" : "AM";
+  const h = hh % 12 || 12;
+  return `${h}:${mm.toString().padStart(2, '0')} ${period}`;
 }
 
 // ======================================================
-// DATABASE FUNCTIONS - GROUP SETTINGS
+// DATABASE FUNCTIONS
 // ======================================================
 
 async function getGroupSettings(groupJid) {
-  try {
-    if (!groupJid) return { bot_active: true, anti_link: true, anti_vulgar: true };
-    
-    const { data, error } = await supabase
+  if (!groupJid) return { bot_active: true, anti_link: true, anti_vulgar: true };
+  const { data } = await supabase
+    .from("group_settings")
+    .select("bot_active, anti_link, anti_vulgar")
+    .eq("group_jid", groupJid)
+    .maybeSingle();
+  if (!data) {
+    await supabase
       .from("group_settings")
-      .select("bot_active, anti_link, anti_vulgar")
-      .eq("group_jid", groupJid)
-      .maybeSingle();
-    
-    if (error || !data) {
-      await supabase
-        .from("group_settings")
-        .upsert({
-          group_jid: groupJid,
-          bot_active: true,
-          anti_link: true,
-          anti_vulgar: true
-        }, { onConflict: 'group_jid' });
-      return { bot_active: true, anti_link: true, anti_vulgar: true };
-    }
-    
-    return {
-      bot_active: data.bot_active ?? true,
-      anti_link: data.anti_link ?? true,
-      anti_vulgar: data.anti_vulgar ?? true
-    };
-  } catch (err) {
-    console.error(`getGroupSettings exception:`, err.message);
+      .upsert({ group_jid: groupJid, bot_active: true, anti_link: true, anti_vulgar: true }, { onConflict: 'group_jid' });
     return { bot_active: true, anti_link: true, anti_vulgar: true };
   }
+  return data;
 }
 
 async function updateGroupSettings(groupJid, updates) {
-  try {
-    if (!groupJid) return false;
-    
-    const { error } = await supabase
-      .from("group_settings")
-      .upsert({
-        group_jid: groupJid,
-        ...updates
-      }, { onConflict: 'group_jid' });
-    
-    if (error) {
-      console.error(`updateGroupSettings error:`, error.message);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    console.error(`updateGroupSettings exception:`, err.message);
-    return false;
-  }
+  if (!groupJid) return false;
+  const { error } = await supabase
+    .from("group_settings")
+    .upsert({ group_jid: groupJid, ...updates }, { onConflict: 'group_jid' });
+  return !error;
 }
 
 async function ensureGroupSettings(groupJid) {
-  try {
-    if (!groupJid) return false;
-    
-    const { error } = await supabase
-      .from("group_settings")
-      .upsert({
-        group_jid: groupJid,
-        bot_active: true,
-        anti_link: true,
-        anti_vulgar: true
-      }, { onConflict: 'group_jid' });
-    
-    return !error;
-  } catch (err) {
-    console.error(`ensureGroupSettings exception:`, err.message);
-    return false;
-  }
+  if (!groupJid) return false;
+  const { error } = await supabase
+    .from("group_settings")
+    .upsert({ group_jid: groupJid, bot_active: true, anti_link: true, anti_vulgar: true }, { onConflict: 'group_jid' });
+  return !error;
 }
 
-// ======================================================
-// DATABASE FUNCTIONS - STRIKES
-// ======================================================
-
 async function getStrikes(groupJid, userJid) {
-  try {
-    if (!groupJid || !userJid) return 0;
-    
-    const { data, error } = await supabase
-      .from("group_strikes")
-      .select("strikes")
-      .eq("group_jid", groupJid)
-      .eq("user_jid", userJid)
-      .maybeSingle();
-    
-    return data?.strikes || 0;
-  } catch (err) {
-    console.error(`getStrikes exception:`, err.message);
-    return 0;
-  }
+  if (!groupJid || !userJid) return 0;
+  const { data } = await supabase
+    .from("group_strikes")
+    .select("strikes")
+    .eq("group_jid", groupJid)
+    .eq("user_jid", userJid)
+    .maybeSingle();
+  return data?.strikes || 0;
 }
 
 async function incrementStrike(groupJid, userJid) {
-  try {
-    if (!groupJid || !userJid) return 0;
-    
-    const current = await getStrikes(groupJid, userJid);
-    const newCount = current + 1;
-    
-    const { error } = await supabase
+  if (!groupJid || !userJid) return 0;
+  const current = await getStrikes(groupJid, userJid);
+  const newCount = current + 1;
+  const { error } = await supabase
+    .from("group_strikes")
+    .upsert(
+      { group_jid: groupJid, user_jid: userJid, strikes: newCount, last_strike: new Date().toISOString() },
+      { onConflict: 'group_jid,user_jid' }
+    );
+  if (error && error.message.includes('last_strike')) {
+    await supabase
       .from("group_strikes")
-      .upsert({
-        group_jid: groupJid,
-        user_jid: userJid,
-        strikes: newCount,
-        last_strike: new Date().toISOString()
-      }, { onConflict: 'group_jid,user_jid' });
-    
-    if (error && error.message.includes('last_strike')) {
-      await supabase
-        .from("group_strikes")
-        .upsert({
-          group_jid: groupJid,
-          user_jid: userJid,
-          strikes: newCount
-        }, { onConflict: 'group_jid,user_jid' });
-    }
-    
-    return newCount;
-  } catch (err) {
-    console.error(`incrementStrike exception:`, err.message);
-    return 0;
+      .upsert(
+        { group_jid: groupJid, user_jid: userJid, strikes: newCount },
+        { onConflict: 'group_jid,user_jid' }
+      );
   }
+  return newCount;
 }
 
 async function resetUserStrikes(groupJid, userJid) {
-  try {
-    if (!groupJid || !userJid) return false;
-    
-    const { error } = await supabase
-      .from("group_strikes")
-      .delete()
-      .eq("group_jid", groupJid)
-      .eq("user_jid", userJid);
-    
-    return !error;
-  } catch (err) {
-    console.error(`resetUserStrikes exception:`, err.message);
-    return false;
-  }
+  if (!groupJid || !userJid) return false;
+  const { error } = await supabase
+    .from("group_strikes")
+    .delete()
+    .eq("group_jid", groupJid)
+    .eq("user_jid", userJid);
+  return !error;
 }
 
-// ======================================================
-// DATABASE FUNCTIONS - SCHEDULED LOCKS
-// ======================================================
-
 async function getScheduledLock(groupJid) {
-  try {
-    if (!groupJid) return null;
-    
-    const { data, error } = await supabase
-      .from("group_scheduled_locks")
-      .select("lock_time, unlock_time")
-      .eq("group_jid", groupJid)
-      .maybeSingle();
-    
-    return data || { lock_time: null, unlock_time: null };
-  } catch (err) {
-    console.error(`getScheduledLock exception:`, err.message);
-    return null;
-  }
+  if (!groupJid) return null;
+  const { data } = await supabase
+    .from("group_scheduled_locks")
+    .select("lock_time, unlock_time")
+    .eq("group_jid", groupJid)
+    .maybeSingle();
+  return data || { lock_time: null, unlock_time: null };
 }
 
 async function setScheduledLockTime(groupJid, lockTime) {
-  try {
-    if (!groupJid) return false;
-    
-    const current = await getScheduledLock(groupJid);
-    const { error } = await supabase
-      .from("group_scheduled_locks")
-      .upsert({
-        group_jid: groupJid,
-        lock_time: lockTime,
-        unlock_time: current?.unlock_time || null
-      }, { onConflict: 'group_jid' });
-    
-    return !error;
-  } catch (err) {
-    console.error(`setScheduledLockTime exception:`, err.message);
-    return false;
-  }
+  if (!groupJid) return false;
+  const current = await getScheduledLock(groupJid);
+  const { error } = await supabase
+    .from("group_scheduled_locks")
+    .upsert(
+      { group_jid: groupJid, lock_time: lockTime, unlock_time: current?.unlock_time || null },
+      { onConflict: 'group_jid' }
+    );
+  return !error;
 }
 
 async function setScheduledUnlockTime(groupJid, unlockTime) {
-  try {
-    if (!groupJid) return false;
-    
-    const current = await getScheduledLock(groupJid);
-    const { error } = await supabase
-      .from("group_scheduled_locks")
-      .upsert({
-        group_jid: groupJid,
-        lock_time: current?.lock_time || null,
-        unlock_time: unlockTime
-      }, { onConflict: 'group_jid' });
-    
-    return !error;
-  } catch (err) {
-    console.error(`setScheduledUnlockTime exception:`, err.message);
-    return false;
-  }
+  if (!groupJid) return false;
+  const current = await getScheduledLock(groupJid);
+  const { error } = await supabase
+    .from("group_scheduled_locks")
+    .upsert(
+      { group_jid: groupJid, lock_time: current?.lock_time || null, unlock_time: unlockTime },
+      { onConflict: 'group_jid' }
+    );
+  return !error;
 }
 
 async function clearLockTime(groupJid) {
-  try {
-    if (!groupJid) return false;
-    const current = await getScheduledLock(groupJid);
-    const { error } = await supabase
-      .from("group_scheduled_locks")
-      .upsert({
-        group_jid: groupJid,
-        lock_time: null,
-        unlock_time: current?.unlock_time || null
-      }, { onConflict: 'group_jid' });
-    return !error;
-  } catch (err) {
-    console.error(`clearLockTime exception:`, err.message);
-    return false;
-  }
+  if (!groupJid) return false;
+  const current = await getScheduledLock(groupJid);
+  const { error } = await supabase
+    .from("group_scheduled_locks")
+    .upsert(
+      { group_jid: groupJid, lock_time: null, unlock_time: current?.unlock_time || null },
+      { onConflict: 'group_jid' }
+    );
+  return !error;
 }
 
 async function clearUnlockTime(groupJid) {
-  try {
-    if (!groupJid) return false;
-    const current = await getScheduledLock(groupJid);
-    const { error } = await supabase
-      .from("group_scheduled_locks")
-      .upsert({
-        group_jid: groupJid,
-        lock_time: current?.lock_time || null,
-        unlock_time: null
-      }, { onConflict: 'group_jid' });
-    return !error;
-  } catch (err) {
-    console.error(`clearUnlockTime exception:`, err.message);
-    return false;
-  }
+  if (!groupJid) return false;
+  const current = await getScheduledLock(groupJid);
+  const { error } = await supabase
+    .from("group_scheduled_locks")
+    .upsert(
+      { group_jid: groupJid, lock_time: current?.lock_time || null, unlock_time: null },
+      { onConflict: 'group_jid' }
+    );
+  return !error;
 }
 
 async function ensureGroupScheduledLocks(groupJid) {
-  try {
-    if (!groupJid) return false;
-    const { error } = await supabase
-      .from("group_scheduled_locks")
-      .upsert({
-        group_jid: groupJid,
-        lock_time: null,
-        unlock_time: null
-      }, { onConflict: 'group_jid' });
-    return !error;
-  } catch (err) {
-    console.error(`ensureGroupScheduledLocks exception:`, err.message);
-    return false;
-  }
+  if (!groupJid) return false;
+  const { error } = await supabase
+    .from("group_scheduled_locks")
+    .upsert({ group_jid: groupJid, lock_time: null, unlock_time: null }, { onConflict: 'group_jid' });
+  return !error;
 }
-
-// ======================================================
-// PROVISION ALL GROUPS
-// ======================================================
 
 async function provisionAllGroups(sock) {
   try {
-    if (!sock) return;
-    
-    console.log('🔍 Checking all groups for provisioning...');
-    
     const groups = await sock.groupFetchAllParticipating();
     const botJid = sock.user?.id;
     if (!botJid) return;
-    
-    const botNumber = botJid.split(':')[0]?.split('@')[0];
-    if (!botNumber) return;
-    
-    let provisionedCount = 0;
-    
+    const botPhone = botJid.split('@')[0].split(':')[0].replace(/\.\d+$/, '');
+    let count = 0;
     for (const [groupJid, meta] of Object.entries(groups)) {
-      const self = meta.participants?.find(p => 
-        p.id.split('@')[0] === botNumber || p.id === botJid
-      );
-      
+      const self = meta.participants?.find(p => {
+        const pPhone = p.id.split('@')[0].split(':')[0].replace(/\.\d+$/, '');
+        return pPhone === botPhone;
+      });
       if (self && (self.admin === 'admin' || self.admin === 'superadmin')) {
         await ensureGroupSettings(groupJid);
         await ensureGroupScheduledLocks(groupJid);
-        provisionedCount++;
+        count++;
       }
     }
-    
-    console.log(`✅ Provisioning complete: ${provisionedCount} admin groups processed`);
+    console.log(`✅ Provisioning complete: ${count} groups`);
   } catch (err) {
-    console.error('provisionAllGroups error:', err.message);
+    console.error('Provision error:', err.message);
   }
 }
-
-// ======================================================
-// STRIKE HANDLER
-// ======================================================
 
 async function handleStrike(sock, jid, sender, reason) {
-  try {
-    if (!sock || !jid || !sender) return;
-    
-    const strikes = await incrementStrike(jid, sender);
-    const tag = `@${sender.split('@')[0]}`;
-    
-    if (strikes >= 3) {
-      await sock.sendMessage(jid, {
-        text: `⛔ 3/3 ${tag} will now be removed from the group for violating group rules (${reason})`,
-        mentions: [sender]
-      });
-      await sock.groupParticipantsUpdate(jid, [sender], 'remove');
-      await resetUserStrikes(jid, sender);
-    } else {
-      await sock.sendMessage(jid, {
-        text: `⚠️ ${reason} are not allowed in this group. Strike ${strikes}/3`,
-        mentions: [sender]
-      });
-    }
-  } catch (err) {
-    console.error('handleStrike error:', err.message);
+  const strikes = await incrementStrike(jid, sender);
+  const tag = `@${sender.split('@')[0]}`;
+  if (strikes >= 3) {
+    await sock.sendMessage(jid, { text: `⛔ 3/3 ${tag} removed for ${reason}`, mentions: [sender] });
+    await sock.groupParticipantsUpdate(jid, [sender], 'remove');
+    await resetUserStrikes(jid, sender);
+  } else {
+    await sock.sendMessage(jid, { text: `⚠️ ${reason} not allowed. Strike ${strikes}/3`, mentions: [sender] });
   }
 }
-
-// ======================================================
-// WELCOME MESSAGE HANDLER
-// ======================================================
 
 function scheduleWelcome(sock, groupJid, participants, groupName) {
-  try {
-    if (!sock || !groupJid || !participants || participants.length === 0) return;
-    
-    const validParticipants = participants
-      .map(p => typeof p === 'string' ? p : p?.id)
-      .filter(Boolean);
-    
-    if (validParticipants.length === 0) return;
-    
-    if (!welcomeBuffers.has(groupJid)) {
-      welcomeBuffers.set(groupJid, { participants: [] });
+  if (!sock || !groupJid || !participants?.length) return;
+  const valid = participants.map(p => typeof p === 'string' ? p : p?.id).filter(Boolean);
+  if (!valid.length) return;
+  if (!welcomeBuffers.has(groupJid)) welcomeBuffers.set(groupJid, { participants: [] });
+  const buffer = welcomeBuffers.get(groupJid);
+  buffer.participants.push(...valid);
+  if (buffer.timer) clearTimeout(buffer.timer);
+  buffer.timer = setTimeout(async () => {
+    const members = welcomeBuffers.get(groupJid)?.participants || [];
+    welcomeBuffers.delete(groupJid);
+    if (members.length && sock) {
+      await sock.sendMessage(groupJid, {
+        text: `👋 Welcome ${members.map(u => `@${u.split('@')[0]}`).join(', ')} to *${groupName}!*`,
+        mentions: members
+      });
     }
-    
-    const buffer = welcomeBuffers.get(groupJid);
-    buffer.participants.push(...validParticipants);
-    
-    if (buffer.timer) clearTimeout(buffer.timer);
-    
-    buffer.timer = setTimeout(async () => {
-      try {
-        const members = welcomeBuffers.get(groupJid)?.participants || [];
-        welcomeBuffers.delete(groupJid);
-        
-        if (members.length === 0) return;
-        
-        const mentionText = members.map(u => `@${u.split('@')[0]}`).join(', ');
-        
-        await sock.sendMessage(groupJid, {
-          text: `👋 Welcome ${mentionText} to *${groupName}!*`,
-          mentions: members
-        });
-      } catch (err) {
-        console.error('Welcome send error:', err.message);
-      }
-    }, 5000);
-  } catch (err) {
-    console.error('scheduleWelcome error:', err.message);
-  }
+  }, 5000);
 }
 
 // ======================================================
-// AUTH STATE MANAGEMENT (FIXED)
+// AUTH STATE MANAGEMENT
 // ======================================================
 
 async function loadSession() {
   try {
+    console.log('🔍 Loading session from Supabase...');
     const { data, error } = await supabase
       .from(WA_TABLE)
       .select('auth_data')
       .eq('id', SESSION_ID)
       .maybeSingle();
-    
-    if (error || !data?.auth_data) return null;
-    
-    return JSON.parse(data.auth_data, BufferJSON.reviver);
+    if (error) {
+      console.error('❌ Supabase query error:', error.message);
+      return null;
+    }
+    if (!data?.auth_data) {
+      console.log('📱 No session found');
+      return null;
+    }
+    let authData;
+    try {
+      authData = JSON.parse(data.auth_data, BufferJSON.reviver);
+    } catch (e) {
+      console.error('❌ Failed to parse session:', e.message);
+      return null;
+    }
+    if (!authData?.creds) return null;
+    console.log('✅ Session loaded');
+    return authData;
   } catch (err) {
     console.error('❌ loadSession error:', err.message);
     return null;
@@ -568,19 +362,17 @@ async function loadSession() {
 }
 
 async function saveSession(snapshot) {
+  if (!snapshot?.creds) return false;
   try {
-    if (!snapshot || !snapshot.creds) return false;
-    
     const serialized = JSON.stringify(snapshot, BufferJSON.replacer);
-    
-    await supabase
+    if (typeof serialized !== 'string') return false;
+    const { error } = await supabase
       .from(WA_TABLE)
-      .upsert({
-        id: SESSION_ID,
-        auth_data: serialized,
-        updated_at: new Date().toISOString()
-      });
-    
+      .upsert({ id: SESSION_ID, auth_data: serialized, updated_at: new Date().toISOString() });
+    if (error) {
+      console.error('❌ saveSession error:', error.message);
+      return false;
+    }
     console.log('✅ Session saved');
     return true;
   } catch (err) {
@@ -591,13 +383,14 @@ async function saveSession(snapshot) {
 
 async function clearSession() {
   try {
-    await supabase
+    const { error } = await supabase
       .from(WA_TABLE)
-      .update({ 
-        auth_data: null, 
-        updated_at: new Date().toISOString() 
-      })
+      .update({ auth_data: null, updated_at: new Date().toISOString() })
       .eq('id', SESSION_ID);
+    if (error) {
+      console.error('❌ clearSession error:', error.message);
+      return false;
+    }
     console.log('✅ Session cleared');
     return true;
   } catch (err) {
@@ -608,185 +401,166 @@ async function clearSession() {
 
 function buildAuthState(savedSession) {
   const creds = savedSession?.creds || initAuthCreds();
-  let keyStore = savedSession?.keys 
-    ? (typeof savedSession.keys === 'string' 
-       ? JSON.parse(savedSession.keys, BufferJSON.reviver) 
-       : savedSession.keys)
-    : {};
-
-  const saveState = async () => {
-    await saveSession({ creds, keys: keyStore });
-  };
-
+  let keyStore = {};
+  if (savedSession?.keys) {
+    try {
+      keyStore = typeof savedSession.keys === 'string'
+        ? JSON.parse(savedSession.keys, BufferJSON.reviver)
+        : savedSession.keys;
+    } catch (err) {
+      console.error('Error parsing keys:', err.message);
+    }
+  }
   const keys = {
     get: (type, ids) => {
       const data = {};
-      for (const id of ids || []) {
-        if (keyStore[type]?.[id] !== undefined) data[id] = keyStore[type][id];
-      }
+      for (const id of ids) if (keyStore[type]?.[id] !== undefined) data[id] = keyStore[type][id];
       return data;
     },
     set: (data) => {
       if (!data) return;
-      for (const category of Object.keys(data)) {
-        keyStore[category] = keyStore[category] || {};
-        for (const id of Object.keys(data[category])) {
-          if (data[category][id] == null) delete keyStore[category][id];
-          else keyStore[category][id] = data[category][id];
+      for (const cat of Object.keys(data)) {
+        keyStore[cat] = keyStore[cat] || {};
+        for (const id of Object.keys(data[cat])) {
+          const val = data[cat][id];
+          if (val == null) delete keyStore[cat][id];
+          else keyStore[cat][id] = val;
         }
       }
-      saveState().catch(e => console.error('Background save failed:', e.message));
+      saveSession({ creds, keys: keyStore }).catch(() => {});
     }
   };
-
-  return { creds, keys, saveState };
+  return { creds, keys };
 }
 
 // ======================================================
-// SCHEDULED LOCK CHECKER (FIXED)
+// SCHEDULED LOCK CHECKER
 // ======================================================
-
 function startScheduledLockChecker(sock) {
-  console.log(`⏰ Starting scheduled lock checker`);
-  
+  if (!sock) return;
+  console.log(`⏰ Starting scheduler (${BOT_TIMEZONE})`);
   return setInterval(async () => {
-    try {
-      if (!sock) return;
-      
-      const { hh, mm } = getCurrentTimeInZone();
-      const timeKey = `${hh.toString().padStart(2, '0')}:${mm.toString().padStart(2, '0')}`;
-      
-      const { data, error } = await supabase
-        .from('group_scheduled_locks')
-        .select('group_jid, lock_time, unlock_time');
-      
-      if (error || !data) return;
-      
-      for (const row of data) {
-        // LOCK
-        if (row.lock_time === timeKey) {
-          const lockKey = `lock_${row.group_jid}_${timeKey}`;
-          if (!firedThisMinute.has(lockKey)) {
-            firedThisMinute.add(lockKey);
-            
-            try {
-              const meta = await sock.groupMetadata(row.group_jid);
-              if (!meta.announce) {
-                await sock.groupSettingUpdate(row.group_jid, 'announcement');
-                await sock.sendMessage(row.group_jid, {
-                  text: `🔒 Group automatically locked at ${formatTime24to12(row.lock_time)}`
-                });
-                await clearLockTime(row.group_jid);
-              }
-            } catch (err) {}
-            
-            setTimeout(() => firedThisMinute.delete(lockKey), 61000);
-          }
-        }
-        
-        // UNLOCK
-        if (row.unlock_time === timeKey) {
-          const unlockKey = `unlock_${row.group_jid}_${timeKey}`;
-          if (!firedThisMinute.has(unlockKey)) {
-            firedThisMinute.add(unlockKey);
-            
-            try {
-              const meta = await sock.groupMetadata(row.group_jid);
-              if (meta.announce) {
-                await sock.groupSettingUpdate(row.group_jid, 'not_announcement');
-                await sock.sendMessage(row.group_jid, {
-                  text: `🔓 Group automatically unlocked at ${formatTime24to12(row.unlock_time)}`
-                });
-                await clearUnlockTime(row.group_jid);
-              }
-            } catch (err) {}
-            
-            setTimeout(() => firedThisMinute.delete(unlockKey), 61000);
-          }
+    if (!sock || botStatus !== 'connected') return;
+    const { hh, mm } = getCurrentTimeInZone();
+    const nowStr = `${hh}:${mm.toString().padStart(2,'0')}`;
+    const { data } = await supabase.from('group_scheduled_locks').select('group_jid, lock_time, unlock_time');
+    if (!data) return;
+    for (const row of data) {
+      if (row.lock_time === nowStr) {
+        const key = `lock_${row.group_jid}_${nowStr}`;
+        if (!firedThisMinute.has(key)) {
+          firedThisMinute.add(key);
+          try {
+            const meta = await sock.groupMetadata(row.group_jid);
+            if (!meta.announce) {
+              await sock.groupSettingUpdate(row.group_jid, 'announcement');
+              await sock.sendMessage(row.group_jid, { text: `🔒 Auto-locked at ${formatTime24to12(nowStr)}` });
+            }
+          } catch (e) { console.error('Lock exec error:', e.message); }
+          await clearLockTime(row.group_jid);
+          setTimeout(() => firedThisMinute.delete(key), 61000);
         }
       }
-    } catch (err) {
-      console.error('Scheduler error:', err.message);
+      if (row.unlock_time === nowStr) {
+        const key = `unlock_${row.group_jid}_${nowStr}`;
+        if (!firedThisMinute.has(key)) {
+          firedThisMinute.add(key);
+          try {
+            const meta = await sock.groupMetadata(row.group_jid);
+            if (meta.announce) {
+              await sock.groupSettingUpdate(row.group_jid, 'not_announcement');
+              await sock.sendMessage(row.group_jid, { text: `🔓 Auto-unlocked at ${formatTime24to12(nowStr)}` });
+            }
+          } catch (e) { console.error('Unlock exec error:', e.message); }
+          await clearUnlockTime(row.group_jid);
+          setTimeout(() => firedThisMinute.delete(key), 61000);
+        }
+      }
     }
   }, 60000);
 }
 
 // ======================================================
-// EXPRESS WEB SERVER SETUP
+// EXPRESS SETUP
 // ======================================================
-
 const app = express();
 let currentQR = null;
-let botStatus = 'starting';
 let sock = null;
 let schedulerInterval = null;
 let connectionFailures = 0;
 const MAX_FAILURES = 3;
 
-// ======================================================
-// WEB ROUTES
-// ======================================================
-
+// ---------- ROUTES ----------
 app.get('/', async (req, res) => {
-  try {
-    let qrImage = null;
-    if (botStatus === 'connected') {
-      qrImage = null;
-    } else if (currentQR && currentQR !== 'Loading...') {
-      qrImage = await QRCode.toDataURL(currentQR).catch(() => null);
-    }
-    
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>WhatsApp Bot</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-          * { margin: 0; padding: 0; box-sizing: border-box; }
-          body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; min-height: 100vh; display: flex; justify-content: center; align-items: center; padding: 20px; }
-          .card { background: white; border-radius: 20px; padding: 40px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); max-width: 500px; width: 100%; text-align: center; }
-          h1 { color: #333; margin-bottom: 10px; font-size: 28px; }
-          .subtitle { color: #666; margin-bottom: 30px; font-size: 16px; }
-          .qr-container { background: #f5f5f5; border-radius: 15px; padding: 30px; margin-bottom: 20px; min-height: 250px; display: flex; justify-content: center; align-items: center; }
-          .qr-image { max-width: 300px; width: 100%; height: auto; border-radius: 10px; }
-          .connected-icon { font-size: 64px; }
-          .status { margin-top: 15px; font-weight: 500; padding: 10px; border-radius: 5px; }
-          .status.connected { color: #28a745; background: #e8f5e9; }
-          .status.waiting { color: #f59e0b; background: #fff3e0; }
-          .force-btn { display: inline-block; background: #dc2626; color: white; text-decoration: none; padding: 10px 20px; border-radius: 5px; margin-top: 15px; font-size: 14px; cursor: pointer; transition: background 0.2s; }
-          .force-btn:hover { background: #b91c1c; }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h1>🤖 WhatsApp Bot</h1>
-          <p class="subtitle">${botStatus === 'connected' ? 'Bot is online' : 'Scan QR to connect'}</p>
-          <div class="qr-container">
-            ${botStatus === 'connected' ? '<div class="connected-icon">✅</div>' : qrImage ? `<img src="${qrImage}" class="qr-image">` : '<div class="connected-icon">⏳</div>'}
-          </div>
-          <div class="status ${botStatus === 'connected' ? 'connected' : 'waiting'}">
-            ${botStatus === 'connected' ? '✅ Connected' : '⏳ Scan QR Code'}
-          </div>
-          <a href="/force-qr" class="force-btn">🔄 Force New QR</a>
-        </div>
-      </body>
-      </html>
-    `);
-  } catch (err) {
-    res.status(500).send('Server error');
+  let qrImage = null;
+  if (botStatus === 'qr_ready' && currentQR && currentQR !== 'Loading...') {
+    try { qrImage = await QRCode.toDataURL(currentQR); } catch {}
   }
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head><title>WhatsApp Bot</title><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      body { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); font-family:system-ui; min-height:100vh; display:flex; justify-content:center; align-items:center; padding:20px; }
+      .card { background:white; border-radius:20px; padding:40px; max-width:500px; width:100%; text-align:center; box-shadow:0 20px 60px rgba(0,0,0,0.3); }
+      .qr-container { background:#f5f5f5; border-radius:15px; padding:30px; margin-bottom:20px; min-height:250px; display:flex; justify-content:center; align-items:center; }
+      .qr-image { max-width:300px; border-radius:10px; }
+      .connected-icon { font-size:64px; }
+      .status { margin-top:15px; font-weight:500; padding:10px; border-radius:5px; }
+      .status.connected { color:#28a745; background:#e8f5e9; }
+      .status.waiting { color:#f59e0b; background:#fff3e0; }
+      .force-btn { display:inline-block; background:#dc2626; color:white; text-decoration:none; padding:10px 20px; border-radius:5px; margin-top:15px; }
+    </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>🤖 WhatsApp Bot</h1>
+        <p>${botStatus === 'connected' ? 'Bot is online' : 'Scan QR to connect'}</p>
+        <div class="qr-container" id="qrContainer">
+          ${botStatus === 'connected' ? '<div class="connected-icon">✅</div>' :
+            qrImage ? `<img src="${qrImage}" class="qr-image">` : '<div class="connected-icon">⏳</div>'}
+        </div>
+        <div class="status ${botStatus === 'connected' ? 'connected' : 'waiting'}" id="statusText">
+          ${botStatus === 'connected' ? '✅ Connected' : botStatus === 'qr_ready' ? '⏳ Scan QR' : '🔄 Starting...'}
+        </div>
+        <a href="/force-qr" class="force-btn">🔄 New QR</a>
+        <a href="/debug-db" class="force-btn" style="background:#4b5563; margin-left:10px;">🔍 Debug DB</a>
+      </div>
+      <script>
+        async function checkStatus() {
+          try {
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            if (data.connected) {
+              document.getElementById('qrContainer').innerHTML = '<div class="connected-icon">✅</div>';
+              document.getElementById('statusText').innerHTML = '✅ Connected';
+            } else if (data.qr) {
+              document.getElementById('qrContainer').innerHTML = '<img src="'+data.qr+'" class="qr-image">';
+              document.getElementById('statusText').innerHTML = '⏳ Scan QR';
+            }
+          } catch {}
+        }
+        setInterval(checkStatus, 3000);
+        checkStatus();
+      </script>
+    </body>
+    </html>
+  `);
 });
 
 app.get('/force-qr', async (req, res) => {
-  console.log('\n🔄 FORCING NEW QR');
+  console.log('🔄 Forcing new QR');
   await clearSession();
   currentQR = null;
   botStatus = 'starting';
   connectionFailures = 0;
-  if (sock) { sock.ev.removeAllListeners(); sock.end(); sock = null; }
-  setTimeout(() => startBot(), 1000);
-  res.send(`<h1 style="text-align:center;padding:50px;background:#0f172a;color:white">Generating New QR...</h1>`);
+  if (sock) {
+    sock.ev.removeAllListeners();
+    sock.end();
+    sock = null;
+  }
+  setTimeout(startBot, 1000);
+  res.send('<html><head><meta http-equiv="refresh" content="2;url=/"></head><body style="background:#0f172a;color:white;text-align:center;padding:50px"><h1>🔄 Generating new QR...</h1></body></html>');
 });
 
 app.get('/api/status', async (req, res) => {
@@ -794,62 +568,75 @@ app.get('/api/status', async (req, res) => {
   if (botStatus === 'qr_ready' && currentQR) {
     qrImage = await QRCode.toDataURL(currentQR).catch(() => null);
   }
-  res.json({ connected: botStatus === 'connected', qr: qrImage, status: botStatus });
+  res.json({ connected: botStatus === 'connected', qr: qrImage });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', botStatus, uptime: Math.floor(process.uptime()) }));
+app.get('/debug-db', async (req, res) => {
+  const tables = ['group_settings','group_strikes','group_scheduled_locks','wa_sessions'];
+  const result = {};
+  for (const t of tables) {
+    try {
+      const { data, error } = await supabase.from(t).select('*').limit(1);
+      result[t] = { exists: !error, error: error?.message, hasData: data?.length > 0 };
+    } catch (err) {
+      result[t] = { exists: false, error: err.message };
+    }
+  }
+  res.json(result);
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok', botStatus, uptime: process.uptime() }));
 
 // ======================================================
-// GRACEFUL SHUTDOWN
+// BOT STARTUP
 // ======================================================
-
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
-
-// ======================================================
-// BOT STARTUP (FIXED + FULL COMMAND HANDLER)
-// ======================================================
-
 async function startBot() {
   if (sock) {
     sock.ev.removeAllListeners();
     sock.end();
+    sock = null;
   }
 
-  const { version } = await fetchLatestBaileysVersion();
-  console.log(`📱 Using Baileys v${version.join('.')}`);
+  console.log(`📱 Using locked Baileys version: ${BAILEYS_VERSION.join('.')}`);
 
   const savedSession = await loadSession();
-  const { creds, keys, saveState } = buildAuthState(savedSession);
+  const authState = buildAuthState(savedSession);
 
   sock = makeWASocket({
-    version,
-    auth: { creds, keys },
+    version: BAILEYS_VERSION,
+    auth: authState,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    browser: ['Ubuntu', 'Chrome', '20.0'],
+    browser: ['Ubuntu', 'Chrome', '126.0.0.0'],
     connectTimeoutMs: 60000,
     keepAliveIntervalMs: 30000,
-    qrTimeout: 60000
+    qrTimeout: 60000,
+    defaultQueryTimeoutMs: 60000,
+    retryRequestDelayMs: 1000,
+    maxRetries: 3,
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
+    shouldIgnoreJid: (jid) => jid === 'status@broadcast'
   });
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, qr, lastDisconnect } = update;
+  sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
+    console.log('📡 Connection update:', { connection, hasQR: !!qr });
 
     if (qr) {
+      console.log('\n✅✅✅ QR READY\n');
       currentQR = qr;
       botStatus = 'qr_ready';
-      console.log('\n✅ QR READY - Scan it now');
-      qrcode.generate(qr, { small: true });
+      connectionFailures = 0;
+      try { qrcode.generate(qr, { small: true }); } catch {}
       return;
     }
 
     if (connection === 'open') {
-      console.log('\n✅✅✅ BOT CONNECTED SUCCESSFULLY');
+      console.log('\n✅✅✅ CONNECTED\n');
       currentQR = null;
       botStatus = 'connected';
       connectionFailures = 0;
-      await sock.sendPresenceUpdate('available');
+      try { await sock.sendPresenceUpdate('available'); } catch {}
       setTimeout(() => provisionAllGroups(sock), 3000);
       if (schedulerInterval) clearInterval(schedulerInterval);
       schedulerInterval = startScheduledLockChecker(sock);
@@ -857,93 +644,107 @@ async function startBot() {
     }
 
     if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      if (statusCode === DisconnectReason.loggedOut) {
+      const code = lastDisconnect?.error?.output?.statusCode;
+      console.log('❌ Closed:', code);
+
+      if (code === DisconnectReason.loggedOut) {
+        console.log('🚫 Logged out');
         await clearSession();
+        connectionFailures = 0;
         setTimeout(startBot, 2000);
         return;
       }
+
       connectionFailures++;
-      if (connectionFailures >= MAX_FAILURES) await clearSession();
-      setTimeout(startBot, Math.min(5000 * connectionFailures, 15000));
+      if (connectionFailures >= MAX_FAILURES) {
+        console.log('🔄 Too many failures, clearing session');
+        await clearSession();
+        connectionFailures = 0;
+        setTimeout(startBot, 2000);
+      } else {
+        const delay = Math.min(5000 * connectionFailures, 15000);
+        console.log(`🔄 Reconnecting in ${delay/1000}s`);
+        setTimeout(startBot, delay);
+      }
     }
   });
 
-  sock.ev.on('creds.update', () => saveState().catch(e => console.error('Save failed:', e.message)));
+  sock.ev.on('creds.update', () => {
+    saveSession({ creds: authState.creds, keys: authState.keys }).catch(() => {});
+  });
 
-  // ====================== FULL MESSAGE HANDLER ======================
   sock.ev.on('messages.upsert', async ({ messages }) => {
     try {
       const msg = messages?.[0];
       if (!msg?.message || msg.key.fromMe) return;
 
       const jid = msg.key.remoteJid;
-      if (!jid?.endsWith('@g.us')) return;
-
+      if (!jid || jid === 'status@broadcast' || !jid.endsWith('@g.us')) return;
       const sender = msg.key.participant || msg.key.remoteJid;
-      let text = (
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
-        ''
-      ).trim();
-
-      if (!text) return;
-
-      console.log(`📨 [${jid}] ${sender.split('@')[0]}: ${text}`);
+      if (!sender) return;
 
       const metadata = await sock.groupMetadata(jid).catch(() => null);
       if (!metadata) return;
-
       const isUserAdmin = isAdmin(sender, metadata.participants);
+
+      let text = '';
+      try {
+        text = (msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '').trim();
+      } catch { return; }
+      if (!text) return;
+
       const settings = await getGroupSettings(jid);
       const command = text.toLowerCase().trim();
+      const isCommand = command.startsWith('.');
 
-      // Bot on/off
-      if (isUserAdmin) {
+      // .bot on/off (even when off)
+      if (isCommand && isUserAdmin) {
         if (command === '.bot on') {
-          const success = await updateGroupSettings(jid, { bot_active: true });
-          await sock.sendMessage(jid, { text: success ? '✅ Bot is now active' : '❌ Failed' });
+          await updateGroupSettings(jid, { bot_active: true });
+          await sock.sendMessage(jid, { text: '✅ Bot active' });
           return;
         }
         if (command === '.bot off') {
-          const success = await updateGroupSettings(jid, { bot_active: false });
-          await sock.sendMessage(jid, { text: success ? '⏸️ Bot is now inactive' : '❌ Failed' });
+          await updateGroupSettings(jid, { bot_active: false });
+          await sock.sendMessage(jid, { text: '⏸️ Bot inactive' });
           return;
         }
       }
 
-      if (!settings.bot_active) return;
+      if (!settings.bot_active) {
+        if (isCommand && isUserAdmin && command !== '.bot on' && command !== '.bot off') {
+          await sock.sendMessage(jid, { text: '⚠️ Bot is off. Use `.bot on` to activate.' });
+        }
+        return;
+      }
 
-      // Anti-vulgar
+      // Anti-vulgar (non-admins)
       if (!isUserAdmin && settings.anti_vulgar) {
-        const hasVulgar = VULGAR_WORDS.some(word => text.toLowerCase().includes(word));
+        const hasVulgar = VULGAR_WORDS.some(w => text.toLowerCase().includes(w));
         if (hasVulgar) {
-          await sock.sendMessage(jid, { delete: { remoteJid: jid, id: msg.key.id, participant: sender } });
-          await sock.sendMessage(jid, { text: `⚠️ @${sender.split('@')[0]}, vulgar words are not allowed.`, mentions: [sender] });
+          await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } }).catch(() => {});
+          await sock.sendMessage(jid, { text: `⚠️ @${sender.split('@')[0]}, vulgar words not allowed.`, mentions: [sender] }).catch(() => {});
           return;
         }
       }
 
-      // Anti-link
+      // Anti-link (non-admins)
       if (!isUserAdmin && settings.anti_link) {
-        const linkRegex = /(https?:\/\/|wa\.me|chat\.whatsapp\.com)/i;
+        const linkRegex = /(https?:\/\/[^\s]+|wa\.me\/[^\s]+|chat\.whatsapp\.com\/[^\s]+)/i;
         if (linkRegex.test(text)) {
-          await sock.sendMessage(jid, { delete: { remoteJid: jid, id: msg.key.id, participant: sender } });
+          await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender } }).catch(() => {});
           await handleStrike(sock, jid, sender, 'Links');
           return;
         }
       }
 
-      if (!command.startsWith('.') || !isUserAdmin) return;
-
-      console.log(`🔧 COMMAND EXECUTED: ${command}`);
+      if (!isCommand || !isUserAdmin) return;
 
       const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
       const mentioned = ctx.mentionedJid || [];
       const replyTarget = ctx.participant;
 
-      // .lock commands
+      // ---------- COMMANDS ----------
       if (command === '.lock') {
         const meta = await sock.groupMetadata(jid);
         if (!meta.announce) {
@@ -953,17 +754,17 @@ async function startBot() {
         }
       } else if (command === '.lock clear') {
         await clearLockTime(jid);
-        await sock.sendMessage(jid, { text: '🔓 Lock cleared' });
+        await sock.sendMessage(jid, { text: '🔓 Lock schedule cleared' });
       } else if (command.startsWith('.lock ')) {
-        const timeArg = text.slice(6).trim();
-        const parsed = parseTimeTo24h(timeArg);
-        if (!parsed) return await sock.sendMessage(jid, { text: '❌ Invalid time. Use .lock 9:00PM' });
-        await setScheduledLockTime(jid, parsed);
-        await sock.sendMessage(jid, { text: `🔒 Auto-lock at ${formatTime24to12(parsed)}` });
-      }
-
-      // .unlock commands
-      else if (command === '.unlock') {
+        const time = parseTimeTo24h(text.slice(6));
+        if (!time) {
+          await sock.sendMessage(jid, { text: '❌ Invalid time. Use .lock 9:00PM' });
+          return;
+        }
+        if (await setScheduledLockTime(jid, time)) {
+          await sock.sendMessage(jid, { text: `🔒 Auto-lock at ${formatTime24to12(time)}` });
+        }
+      } else if (command === '.unlock') {
         const meta = await sock.groupMetadata(jid);
         if (meta.announce) {
           await sock.groupSettingUpdate(jid, 'not_announcement');
@@ -972,135 +773,98 @@ async function startBot() {
         }
       } else if (command === '.unlock clear') {
         await clearUnlockTime(jid);
-        await sock.sendMessage(jid, { text: '🔒 Unlock cleared' });
+        await sock.sendMessage(jid, { text: '🔒 Unlock schedule cleared' });
       } else if (command.startsWith('.unlock ')) {
-        const timeArg = text.slice(8).trim();
-        const parsed = parseTimeTo24h(timeArg);
-        if (!parsed) return await sock.sendMessage(jid, { text: '❌ Invalid time. Use .unlock 6:00AM' });
-        await setScheduledUnlockTime(jid, parsed);
-        await sock.sendMessage(jid, { text: `🔓 Auto-unlock at ${formatTime24to12(parsed)}` });
-      }
-
-      // .kick
-      else if (command.startsWith('.kick')) {
-        let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : null;
-        if (!targets) return await sock.sendMessage(jid, { text: '❌ Tag or reply to kick' });
-        
+        const time = parseTimeTo24h(text.slice(8));
+        if (!time) {
+          await sock.sendMessage(jid, { text: '❌ Invalid time. Use .unlock 6:00AM' });
+          return;
+        }
+        if (await setScheduledUnlockTime(jid, time)) {
+          await sock.sendMessage(jid, { text: `🔓 Auto-unlock at ${formatTime24to12(time)}` });
+        }
+      } else if (command === '.kick' || command.startsWith('.kick ')) {
+        const targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
+        if (!targets.length) {
+          await sock.sendMessage(jid, { text: '❌ Tag or reply to kick' });
+          return;
+        }
         for (const user of targets) {
-          const userExists = metadata.participants.some(p => p.id === user);
-          if (!userExists) continue;
-          const isTargetAdmin = metadata.participants.find(p => p.id === user)?.admin;
-          if (isTargetAdmin) continue;
-          
+          const exists = metadata.participants.some(p => p.id === user);
+          if (!exists) {
+            await sock.sendMessage(jid, { text: `❌ @${user.split('@')[0]} not in group`, mentions: [user] });
+            continue;
+          }
+          const isAdminTarget = metadata.participants.find(p => p.id === user)?.admin;
+          if (isAdminTarget) {
+            await sock.sendMessage(jid, { text: '❌ Cannot remove admin' });
+            continue;
+          }
           await sock.groupParticipantsUpdate(jid, [user], 'remove');
           await sock.sendMessage(jid, { text: `✅ @${user.split('@')[0]} removed`, mentions: [user] });
           await delay(500);
         }
-      }
-
-      // .strike reset
-      else if (command.startsWith('.strike reset')) {
-        let targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : null;
-        if (!targets) return await sock.sendMessage(jid, { text: '❌ Tag user to reset strikes' });
-        
-        for (const user of targets) {
-          await resetUserStrikes(jid, user);
-          await sock.sendMessage(jid, { text: `✅ Strikes cleared`, mentions: [user] });
+      } else if (command === '.strike reset' || command.startsWith('.strike reset ')) {
+        const targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
+        if (!targets.length) {
+          await sock.sendMessage(jid, { text: '❌ Tag user to reset strikes' });
+          return;
         }
-      }
-
-      // .tagall
-      else if (command === '.tagall') {
-        const allMembers = metadata.participants.map(p => p.id);
+        for (const user of targets) {
+          if (await resetUserStrikes(jid, user)) {
+            await sock.sendMessage(jid, { text: `✅ Strikes cleared`, mentions: [user] });
+          }
+        }
+      } else if (command === '.tagall') {
+        const all = metadata.participants.map(p => p.id);
+        await sock.sendMessage(jid, { text: `📢 ${all.map(m => `@${m.split('@')[0]}`).join(' ')}`, mentions: all });
+      } else if (command === '.delete') {
+        if (!ctx?.stanzaId) {
+          await sock.sendMessage(jid, { text: '❌ Reply to message to delete' });
+          return;
+        }
+        await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: ctx.stanzaId, participant: ctx.participant } });
+      } else if (command === '.antilink on') {
+        if (await updateGroupSettings(jid, { anti_link: true })) await sock.sendMessage(jid, { text: '🔗 Anti-link on' });
+      } else if (command === '.antilink off') {
+        if (await updateGroupSettings(jid, { anti_link: false })) await sock.sendMessage(jid, { text: '🔗 Anti-link off' });
+      } else if (command === '.vulgar on') {
+        if (await updateGroupSettings(jid, { anti_vulgar: true })) await sock.sendMessage(jid, { text: '🔞 Vulgar filter on' });
+      } else if (command === '.vulgar off') {
+        if (await updateGroupSettings(jid, { anti_vulgar: false })) await sock.sendMessage(jid, { text: '🔞 Vulgar filter off' });
+      } else if (command === '.help') {
+        const sched = await getScheduledLock(jid);
+        const lockInfo = sched?.lock_time ? `\n🔒 Lock: ${formatTime24to12(sched.lock_time)}` : '';
+        const unlockInfo = sched?.unlock_time ? `\n🔓 Unlock: ${formatTime24to12(sched.unlock_time)}` : '';
         await sock.sendMessage(jid, {
-          text: `📢 ${allMembers.map(m => `@${m.split('@')[0]}`).join(' ')}`,
-          mentions: allMembers
+          text: `📋 *COMMANDS*\n\n` +
+                `.lock\n.lock 9:00PM\n.lock clear\n` +
+                `.unlock\n.unlock 6:00AM\n.unlock clear\n` +
+                `.kick @user\n.tagall\n.delete\n` +
+                `.strike reset @user\n` +
+                `.antilink on/off\n.vulgar on/off\n.bot on/off\n\n` +
+                `Bot: ${settings.bot_active ? '✅' : '⏸️'}\n` +
+                `Anti-link: ${settings.anti_link ? '✅' : '❌'}\n` +
+                `Anti-vulgar: ${settings.anti_vulgar ? '✅' : '❌'}` +
+                lockInfo + unlockInfo
         });
       }
-
-      // .delete
-      else if (command === '.delete') {
-        if (!ctx?.stanzaId || !ctx?.participant) return await sock.sendMessage(jid, { text: '❌ Reply to message to delete' });
-        await sock.sendMessage(jid, { delete: { remoteJid: jid, id: ctx.stanzaId, participant: ctx.participant } });
-      }
-
-      // .antilink
-      else if (command === '.antilink on') {
-        await updateGroupSettings(jid, { anti_link: true });
-        await sock.sendMessage(jid, { text: '🔗 Anti-link enabled' });
-      } else if (command === '.antilink off') {
-        await updateGroupSettings(jid, { anti_link: false });
-        await sock.sendMessage(jid, { text: '🔗 Anti-link disabled' });
-      }
-
-      // .vulgar
-      else if (command === '.vulgar on') {
-        await updateGroupSettings(jid, { anti_vulgar: true });
-        await sock.sendMessage(jid, { text: '🔞 Vulgar filter enabled' });
-      } else if (command === '.vulgar off') {
-        await updateGroupSettings(jid, { anti_vulgar: false });
-        await sock.sendMessage(jid, { text: '🔞 Vulgar filter disabled' });
-      }
-
-      // .help
-      else if (command === '.help') {
-        const sched = await getScheduledLock(jid);
-        const helpText = [
-          '📋 *COMMANDS*',
-          '',
-          '`.lock` - Lock now',
-          '`.lock 9:00PM` - Schedule lock',
-          '`.lock clear` - Cancel lock',
-          '`.unlock` - Unlock now',
-          '`.unlock 6:00AM` - Schedule unlock',
-          '`.unlock clear` - Cancel unlock',
-          '`.kick @user` - Kick user',
-          '`.tagall` - Mention all',
-          '`.delete` - Delete replied message',
-          '`.strike reset @user` - Clear strikes',
-          '`.antilink on/off`',
-          '`.vulgar on/off`',
-          '`.bot on/off`',
-          '',
-          `Bot: ${settings.bot_active ? '✅' : '⏸️'}`,
-          `Anti-link: ${settings.anti_link ? '✅' : '❌'}`,
-          `Anti-vulgar: ${settings.anti_vulgar ? '✅' : '❌'}`,
-          sched?.lock_time ? `🔒 Lock: ${formatTime24to12(sched.lock_time)}` : '',
-          sched?.unlock_time ? `🔓 Unlock: ${formatTime24to12(sched.unlock_time)}` : ''
-        ].filter(Boolean).join('\n');
-        
-        await sock.sendMessage(jid, { text: helpText });
-      }
     } catch (err) {
-      console.error('Message handler error:', err.message);
+      console.error('Msg error:', err.message);
     }
   });
 
-  // Group participants update
-  sock.ev.on('group-participants.update', async (update) => {
-    try {
-      const { action, participants, id: groupJid } = update;
-      if (!groupJid || !participants.length) return;
-
-      if (['add', 'invite', 'linked_group_join'].includes(action)) {
-        const settings = await getGroupSettings(groupJid);
-        if (settings.bot_active) {
-          let groupName = 'the group';
-          try {
-            const meta = await sock.groupMetadata(groupJid);
-            groupName = meta.subject || 'the group';
-          } catch {}
-          scheduleWelcome(sock, groupJid, participants, groupName);
-        }
+  sock.ev.on('group-participants.update', async ({ action, participants, id }) => {
+    if (!id || !participants?.length) return;
+    if (['add','invite','linked_group_join'].includes(action)) {
+      const settings = await getGroupSettings(id);
+      if (settings.bot_active) {
+        let name = 'the group';
+        try { name = (await sock.groupMetadata(id)).subject; } catch {}
+        scheduleWelcome(sock, id, participants, name);
       }
-
-      if (['remove', 'leave'].includes(action)) {
-        for (const user of participants) {
-          await resetUserStrikes(groupJid, user);
-        }
-      }
-    } catch (err) {
-      console.error('Group update error:', err.message);
+    } else if (action === 'remove' || action === 'leave') {
+      for (const u of participants) await resetUserStrikes(id, u).catch(() => {});
     }
   });
 }
@@ -1108,16 +872,24 @@ async function startBot() {
 // ======================================================
 // START SERVER
 // ======================================================
-
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🌐 Server running on http://localhost:${PORT}`);
-  console.log(`📱 Open the URL above to scan QR\n`);
   startBot();
 });
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
-    console.error(`❌ Port ${PORT} already in use`);
+    console.error(`❌ Port ${PORT} in use`);
     process.exit(1);
   }
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\n🛑 Shutting down...');
+  if (sock) {
+    sock.ev.removeAllListeners();
+    sock.end();
+  }
+  process.exit(0);
 });
