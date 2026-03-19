@@ -34,7 +34,7 @@ const WA_TABLE = "wa_sessions";
 const BOT_TIMEZONE = "Africa/Lagos";
 
 // Working version for Baileys 6.7.2
-const BAILEYS_VERSION = undefined;
+// const BAILEYS_VERSION = undefined;
 
 const VULGAR_WORDS = [
   "fuck","fucking","fucker","fucked",
@@ -1021,7 +1021,7 @@ async function startBot() {
 
   // CRITICAL: Version hardcoded for Baileys 6.7.2
   sock = makeWASocket({
-    version: BAILEYS_VERSION,
+    version: undefined,
     auth: authState,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
