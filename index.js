@@ -35,8 +35,6 @@ import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
 import dotenv from "dotenv";
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
 
 // Load environment variables
 dotenv.config();
@@ -767,7 +765,7 @@ function scheduleWelcome(sock, groupJid, participants, groupName) {
 }
 
 // ======================================================
-// AUTH STATE MANAGEMENT
+// AUTH STATE MANAGEMENT - FIXED VERSION
 // ======================================================
 
 /**
@@ -781,11 +779,16 @@ function scheduleWelcome(sock, groupJid, participants, groupName) {
  * 
  * These must be stored together and handled with BufferJSON
  * to preserve binary data.
+ * 
+ * CORRECT USAGE:
+ * - Saving: JSON.stringify(obj, BufferJSON.replacer) → STRING
+ * - Loading: JSON.parse(string, BufferJSON.reviver) → OBJECT
+ * - NEVER double-parse (JSON.parse(JSON.stringify(...))) - this corrupts data
  */
 
 /**
  * Load session from Supabase
- * Returns auth state or null if not found/corrupted
+ * Returns auth state object or null if not found/corrupted
  */
 async function loadSession() {
   try {
@@ -809,13 +812,10 @@ async function loadSession() {
     
     console.log('📦 Session data retrieved from Supabase');
     
-    // Parse the auth data (handles BufferJSON conversion)
+    // CORRECT: auth_data is a string, parse it with BufferJSON.reviver
     let authData;
     try {
-      // If it's a string, parse it; if it's already an object, use as-is
-      authData = typeof data.auth_data === 'string' 
-        ? JSON.parse(data.auth_data, BufferJSON.reviver)
-        : data.auth_data;
+      authData = JSON.parse(data.auth_data, BufferJSON.reviver);
     } catch (parseErr) {
       console.error('❌ Failed to parse session data:', parseErr.message);
       return null;
@@ -852,8 +852,8 @@ async function loadSession() {
 }
 
 /**
- * Save session to Supabase
- * Uses BufferJSON to handle binary data
+ * Save session to Supabase - FIXED VERSION
+ * Uses BufferJSON to handle binary data correctly
  */
 async function saveSession(snapshot) {
   try {
@@ -864,14 +864,21 @@ async function saveSession(snapshot) {
     
     console.log('💾 Saving session to Supabase...');
     
-    // Use BufferJSON to properly serialize binary data
-    const serialized = JSON.parse(JSON.stringify(snapshot, BufferJSON.replacer));
+    // CORRECT: Use BufferJSON.replacer directly in JSON.stringify
+    // This produces a STRING that Supabase can store in JSONB column
+    const serialized = JSON.stringify(snapshot, BufferJSON.replacer);
+    
+    // Verify serialized is a string
+    if (typeof serialized !== 'string') {
+      console.error('❌ saveSession: serialized data is not a string');
+      return false;
+    }
     
     const { error } = await supabase
       .from(WA_TABLE)
       .upsert({
         id: SESSION_ID,
-        auth_data: serialized,
+        auth_data: serialized,  // This is now a string, exactly what Supabase expects
         updated_at: new Date().toISOString()
       });
     
