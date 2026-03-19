@@ -1,0 +1,46 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs
+*.log
+logs/*.log
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build output
+dist/
+build/
+out/
+
+# Supabase session/auth snapshots
+*.supabase
+auth_data.json
+session.json
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+
+# Coverage reports
+coverage/
+*.lcov
+
+# Temporary files
+tmp/
+*.tmp
