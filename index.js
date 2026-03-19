@@ -216,22 +216,39 @@ async function getStrikes(groupJid, userJid) {
 
 async function incrementStrike(groupJid, userJid) {
   try {
-    const current = await getStrikes(groupJid, userJid);
+    // Get current strikes
+    const { data, error } = await supabase
+      .from("group_strikes")
+      .select("strikes")
+      .eq("group_jid", groupJid)
+      .eq("user_jid", userJid)
+      .single();
+
+    if (error && error.code !== "PGRST116") {
+      throw error; // ignore "no rows found" error
+    }
+
+    let current = data?.strikes || 0;
     const newCount = current + 1;
+
+    // Upsert with conflict target so it updates instead of inserting
     await supabaseRetry(() =>
       supabase.from("group_strikes").upsert({
         group_jid: groupJid,
         user_jid: userJid,
         strikes: newCount,
         last_strike: new Date().toISOString()
-      })
+      }, { onConflict: ["group_jid", "user_jid"] })   // <-- important
     );
+
+    console.log(`Strikes for ${userJid} in ${groupJid}: ${newCount}`);
     return newCount;
   } catch (e) {
-    console.log("incrementStrike error:", e?.message);
+    console.error("incrementStrike error:", e);
     return 1;
   }
 }
+
 
 async function resetUserStrikes(groupJid, userJid) {
   try {
