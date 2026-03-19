@@ -34,7 +34,7 @@ const WA_TABLE = "wa_sessions";
 const BOT_TIMEZONE = "Africa/Lagos";
 
 // Working version for Baileys 6.7.2
-const BAILEYS_VERSION = [2, 2413, 1];
+const BAILEYS_VERSION = undefined;
 
 const VULGAR_WORDS = [
   "fuck","fucking","fucker","fucked",
