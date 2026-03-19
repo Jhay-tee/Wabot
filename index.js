@@ -24,6 +24,26 @@ const PORT = process.env.PORT || 5000;
 const SESSION_ID = 1;
 const WA_TABLE = "wa_sessions";
 const VULGAR_WORDS = ["fuck", "nigga", "nigger", "bitch", "asshole", "shit"];
+// Set TIMEZONE env var to your local timezone (e.g. "America/New_York", "Africa/Lagos", "Asia/Kolkata")
+// Defaults to UTC if not set. This ensures .lock and .unlock schedules fire at your local time.
+const BOT_TIMEZONE = process.env.TIMEZONE || "UTC";
+
+function getCurrentTimeInZone() {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: BOT_TIMEZONE,
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    }).formatToParts(new Date());
+    const hh = parseInt(parts.find(p => p.type === "hour")?.value || "0", 10);
+    const mm = parseInt(parts.find(p => p.type === "minute")?.value || "0", 10);
+    return { hh, mm };
+  } catch {
+    const now = new Date();
+    return { hh: now.getHours(), mm: now.getMinutes() };
+  }
+}
 
 // -------- TRACKERS --------
 const spamTracker = {};
@@ -356,7 +376,7 @@ async function handleStrike(jid, sender, reason) {
 // -------- WELCOME BATCH (5-second window) --------
 const welcomeBuffers = {};
 
-function scheduleWelcome(sock, groupJid, participants, groupName) {
+function scheduleWelcome(groupJid, participants, groupName) {
   try {
     // Normalize participants into an array of JID strings
     const validParticipants = (participants || [])
@@ -503,9 +523,7 @@ function startScheduledLockChecker() {
 
       if (error || !rows || rows.length === 0) return;
 
-      const now = new Date();
-      const currentHH = now.getHours();
-      const currentMM = now.getMinutes();
+      const { hh: currentHH, mm: currentMM } = getCurrentTimeInZone();
 
       for (const row of rows) {
         // LOCK
@@ -520,7 +538,7 @@ function startScheduledLockChecker() {
               try {
                 const meta = await sock.groupMetadata(row.group_jid);
                 if (!meta.announce) {
-                  await sock.groupSettingUpdate(row.group_jid, { announce: true }); // ✅ correct
+                  await sock.groupSettingUpdate(row.group_jid, "announcement");
                   await sock.sendMessage(row.group_jid, {
                     text: `🔒 Group has been automatically locked at ${formatTime24to12(row.lock_time)}.`
                   });
@@ -547,7 +565,7 @@ function startScheduledLockChecker() {
               try {
                 const meta = await sock.groupMetadata(row.group_jid);
                 if (meta.announce) {
-                  await sock.groupSettingUpdate(row.group_jid, { announce: false }); // ✅ correct
+                  await sock.groupSettingUpdate(row.group_jid, "not_announcement");
                   await sock.sendMessage(row.group_jid, {
                     text: `🔓 Group has been automatically unlocked at ${formatTime24to12(row.unlock_time)}.`
                   });
@@ -855,6 +873,16 @@ async function startBot() {
     const authState = buildAuthState(loadedSession);
     currentQR = "Loading...";
 
+    // Also save whenever Signal keys are updated (not just on creds.update)
+    // This prevents "invalid key" errors after restart caused by lost key updates
+    const originalKeysSet = authState.keys.set.bind(authState.keys);
+    authState.keys.set = (data) => {
+      try {
+        originalKeysSet(data);
+        scheduleSave(authState.getSnapshot());
+      } catch {}
+    };
+
     if (sock) { try { sock.end(); sock = null; } catch {} }
 
     sock = makeWASocket({
@@ -970,7 +998,7 @@ async function startBot() {
                 groupName = meta.subject || "the group";
               } catch {}
               scheduleWelcome(groupJid, humanParticipants, groupName);
-              console.log("👋 Welcome queued for", humanParticipants.length, "member(s)");
+              console.log("👋 Welcome queued for", humanParticipants.length, "member(s) in", groupName);
             }
           } catch (e) {
             console.log("Welcome queue error:", e?.message);
