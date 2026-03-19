@@ -328,22 +328,12 @@ async function handleStrike(jid, sender, reason) {
           mentions: [sender]
         });
       } catch {}
-
       try {
         await sock.groupParticipantsUpdate(jid, [sender], "remove");
-        console.log("🚫 User removed:", sender);
       } catch (e) {
         console.log("Auto-kick error:", e?.message);
       }
-
-      // Delete the row completely after removal
-      await supabaseRetry(() =>
-        supabase.from("group_strikes")
-          .delete()
-          .eq("group_jid", jid)
-          .eq("user_jid", sender)
-      );
-
+      await resetUserStrikes(jid, sender);
     } else {
       try {
         await sock.sendMessage(jid, {
@@ -356,7 +346,6 @@ async function handleStrike(jid, sender, reason) {
     console.log("handleStrike error:", e?.message);
   }
 }
-
 
 // -------- WELCOME BATCH (5-second window) --------
 const welcomeBuffers = {};
@@ -550,7 +539,7 @@ async function scheduleSave(snapshot) {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(async () => {
       try {
-        const serialized = snapshot
+        const serialized = JSON.parse(JSON.stringify(snapshot, BufferJSON.replacer));
         await supabaseRetry(() =>
           supabase.from(WA_TABLE).upsert({
             id: SESSION_ID,
@@ -953,36 +942,28 @@ async function startBot() {
         }
 
         // Welcome new human members
-const memberJoinActions = ["add", "invite", "join", "linked_group_join"];
+        const memberJoinActions = ["add", "invite", "linked_group_join"];
+        const humanParticipants = (participants || []).filter(p => {
+          const pNum = (p.split ? p.split("@")[0] : p?.id?.split("@")[0]) || "";
+          return pNum !== botNumber;
+        });
 
-const humanParticipants = (participants || [])
-  .map(p => typeof p === "string" ? p : p?.id) // always get the ID string
-  .filter(id => {
-    const pNum = id?.split("@")[0] || "";
-    return pNum && pNum !== botNumber;
-  });
-
-if (memberJoinActions.includes(action) && humanParticipants.length > 0) {
-  try {
-    const settings = await getGroupSettings(groupJid);
-    if (settings?.bot_active) {
-      let groupName = "the group";
-      try {
-        const meta = await sock.groupMetadata(groupJid);
-        groupName = meta?.subject || "the group";
-      } catch (err) {
-        console.log("Metadata fetch failed:", err?.message);
-      }
-
-      // Now participants are guaranteed strings
-      scheduleWelcome(groupJid, humanParticipants, groupName);
-      console.log("👋 Welcome queued for", humanParticipants.length, "member(s)");
-    }
-  } catch (e) {
-    console.log("Welcome queue error:", e?.message);
-  }
-}
-
+        if (memberJoinActions.includes(action) && humanParticipants.length > 0) {
+          try {
+            const settings = await getGroupSettings(groupJid);
+            if (settings.bot_active) {
+              let groupName = "the group";
+              try {
+                const meta = await sock.groupMetadata(groupJid);
+                groupName = meta.subject || "the group";
+              } catch {}
+              scheduleWelcome(groupJid, humanParticipants, groupName);
+              console.log("👋 Welcome queued for", humanParticipants.length, "member(s)");
+            }
+          } catch (e) {
+            console.log("Welcome queue error:", e?.message);
+          }
+        }
 
         if (action === "remove" || action === "leave") {
           for (const user of (participants || [])) {
@@ -1056,7 +1037,7 @@ if (memberJoinActions.includes(action) && humanParticipants.length > 0) {
         if (!settings.bot_active && !isCommand) return;
 
         // Anti-vulgar (delete + warning only, no strike)
-        if (settings.bot_active && settings.anti_vulgar) {
+        if (!isUserAdmin && settings.bot_active && settings.anti_vulgar) {
           const normalizedText = normalize(text);
           const hasVulgar = VULGAR_WORDS.some(word => normalizedText.includes(normalize(word)));
           if (hasVulgar) {
