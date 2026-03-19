@@ -197,6 +197,7 @@ async function provisionAllGroups() {
   }
 }
 
+
 async function getStrikes(groupJid, userJid) {
   try {
     const { data } = await supabaseRetry(() =>
@@ -352,18 +353,16 @@ async function handleStrike(jid, sender, reason) {
     console.log("handleStrike error:", e?.message);
   }
 }
-
 // -------- WELCOME BATCH (5-second window) --------
 const welcomeBuffers = {};
 
-function scheduleWelcome(groupJid, participants, groupName) {
+function scheduleWelcome(sock, groupJid, participants, groupName) {
   try {
-    // Ensure participants is an array of strings
-    if (!Array.isArray(participants)) {
-      console.log("scheduleWelcome: participants is not an array", participants);
-      return;
-    }
-    const validParticipants = participants.filter(p => typeof p === 'string');
+    // Normalize participants into an array of JID strings
+    const validParticipants = (participants || [])
+      .map(p => typeof p === "string" ? p : p.id)
+      .filter(Boolean);
+
     if (validParticipants.length === 0) return;
 
     if (!welcomeBuffers[groupJid]) {
@@ -371,6 +370,7 @@ function scheduleWelcome(groupJid, participants, groupName) {
     }
     welcomeBuffers[groupJid].participants.push(...validParticipants);
 
+    // Reset timer if new participants arrive within 5s
     clearTimeout(welcomeBuffers[groupJid].timer);
     welcomeBuffers[groupJid].timer = setTimeout(async () => {
       try {
@@ -379,6 +379,8 @@ function scheduleWelcome(groupJid, participants, groupName) {
         if (!members.length || !sock) return;
 
         const mentionText = members.map(u => `@${u.split("@")[0]}`).join(", ");
+        console.log("Sending welcome to:", members);
+
         await sock.sendMessage(groupJid, {
           text: `👋 Welcome ${mentionText} to *${groupName}*! \n\n📜 *Group Rules:*\n• No spam\n• No links (unless admin)\n• No vulgar language\n\nEnjoy your stay and be respectful! ✨`,
           mentions: members
@@ -392,84 +394,6 @@ function scheduleWelcome(groupJid, participants, groupName) {
   }
 }
 
-// -------- SCHEDULED LOCK / UNLOCK CHECKER --------
-const firedThisMinute = new Set();
-
-function startScheduledLockChecker() {
-  setInterval(async () => {
-    try {
-      if (!sock || botStatus !== "connected") return;
-
-      const { data: rows, error } = await supabaseRetry(() =>
-        supabase
-          .from("group_scheduled_locks")
-          .select("group_jid, lock_time, unlock_time")
-      );
-
-      if (error || !rows || rows.length === 0) return;
-
-      const now = new Date();
-      const currentHH = now.getHours();
-      const currentMM = now.getMinutes();
-
-      for (const row of rows) {
-        if (row.lock_time) {
-          const [lHH, lMM] = row.lock_time.split(":").map(Number);
-          if (lHH === currentHH && lMM === currentMM) {
-            const key = `lock_${row.group_jid}_${currentHH}_${currentMM}`;
-            if (!firedThisMinute.has(key)) {
-              firedThisMinute.add(key);
-              setTimeout(() => firedThisMinute.delete(key), 65000);
-
-              try {
-                const meta = await sock.groupMetadata(row.group_jid);
-                if (!meta.announce) {
-                  await sock.groupSettingUpdate(row.group_jid, "announcement");
-                  await sock.sendMessage(row.group_jid, {
-                    text: `🔒 Group has been automatically locked at ${formatTime24to12(row.lock_time)}.`
-                  });
-                  console.log("✅ Scheduled lock fired for", row.group_jid);
-                }
-              } catch (e) {
-                console.log("Scheduled lock execute error:", e?.message);
-              }
-
-              await clearLockTime(row.group_jid);
-            }
-          }
-        }
-
-        if (row.unlock_time) {
-          const [uHH, uMM] = row.unlock_time.split(":").map(Number);
-          if (uHH === currentHH && uMM === currentMM) {
-            const key = `unlock_${row.group_jid}_${currentHH}_${currentMM}`;
-            if (!firedThisMinute.has(key)) {
-              firedThisMinute.add(key);
-              setTimeout(() => firedThisMinute.delete(key), 65000);
-
-              try {
-                const meta = await sock.groupMetadata(row.group_jid);
-                if (meta.announce) {
-                  await sock.groupSettingUpdate(row.group_jid, "not_announcement");
-                  await sock.sendMessage(row.group_jid, {
-                    text: `🔓 Group has been automatically unlocked at ${formatTime24to12(row.unlock_time)}.`
-                  });
-                  console.log("✅ Scheduled unlock fired for", row.group_jid);
-                }
-              } catch (e) {
-                console.log("Scheduled unlock execute error:", e?.message);
-              }
-
-              await clearUnlockTime(row.group_jid);
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.log("Scheduler error:", e?.message);
-    }
-  }, 60000);
-}
 
 // -------- MEMORY CLEANUP --------
 setInterval(() => {
@@ -562,6 +486,88 @@ async function scheduleSave(snapshot) {
     console.log("scheduleSave error:", e?.message);
   }
 }
+
+// -------- SCHEDULED LOCK / UNLOCK CHECKER --------
+const firedThisMinute = new Set();
+
+function startScheduledLockChecker() {
+  setInterval(async () => {
+    try {
+      if (!sock || botStatus !== "connected") return;
+
+      const { data: rows, error } = await supabaseRetry(() =>
+        supabase
+          .from("group_scheduled_locks")
+          .select("group_jid, lock_time, unlock_time")
+      );
+
+      if (error || !rows || rows.length === 0) return;
+
+      const now = new Date();
+      const currentHH = now.getHours();
+      const currentMM = now.getMinutes();
+
+      for (const row of rows) {
+        // LOCK
+        if (row.lock_time) {
+          const [lHH, lMM] = row.lock_time.split(":").map(Number);
+          if (lHH === currentHH && lMM === currentMM) {
+            const key = `lock_${row.group_jid}_${currentHH}_${currentMM}`;
+            if (!firedThisMinute.has(key)) {
+              firedThisMinute.add(key);
+              setTimeout(() => firedThisMinute.delete(key), 65000);
+
+              try {
+                const meta = await sock.groupMetadata(row.group_jid);
+                if (!meta.announce) {
+                  await sock.groupSettingUpdate(row.group_jid, { announce: true }); // ✅ correct
+                  await sock.sendMessage(row.group_jid, {
+                    text: `🔒 Group has been automatically locked at ${formatTime24to12(row.lock_time)}.`
+                  });
+                  console.log("✅ Scheduled lock fired for", row.group_jid);
+                }
+              } catch (e) {
+                console.log("Scheduled lock execute error:", e?.message);
+              }
+
+              await clearLockTime(row.group_jid); // remove if you want recurring
+            }
+          }
+        }
+
+        // UNLOCK
+        if (row.unlock_time) {
+          const [uHH, uMM] = row.unlock_time.split(":").map(Number);
+          if (uHH === currentHH && uMM === currentMM) {
+            const key = `unlock_${row.group_jid}_${currentHH}_${currentMM}`;
+            if (!firedThisMinute.has(key)) {
+              firedThisMinute.add(key);
+              setTimeout(() => firedThisMinute.delete(key), 65000);
+
+              try {
+                const meta = await sock.groupMetadata(row.group_jid);
+                if (meta.announce) {
+                  await sock.groupSettingUpdate(row.group_jid, { announce: false }); // ✅ correct
+                  await sock.sendMessage(row.group_jid, {
+                    text: `🔓 Group has been automatically unlocked at ${formatTime24to12(row.unlock_time)}.`
+                  });
+                  console.log("✅ Scheduled unlock fired for", row.group_jid);
+                }
+              } catch (e) {
+                console.log("Scheduled unlock execute error:", e?.message);
+              }
+
+              await clearUnlockTime(row.group_jid); // remove if you want recurring
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.log("Scheduler error:", e?.message);
+    }
+  }, 60000); // check every minute
+}
+
 
 // -------- CLEAR SESSION --------
 async function clearSession() {
