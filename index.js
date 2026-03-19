@@ -1,7 +1,7 @@
 /**
  * ======================================================
  * WhatsApp Bot - Production Grade (v2.0.0 - FINAL)
- * Baileys: 6.7.2 (auto version)
+ * Baileys: 6.7.2 (locked version)
  * Database: Supabase (group_settings, group_strikes, group_scheduled_locks, wa_sessions)
  * Timezone: Africa/Lagos
  * Features: .lock, .unlock, .kick, .tagall, .delete, .strike reset, 
@@ -32,6 +32,9 @@ const PORT = process.env.PORT || 5000;
 const SESSION_ID = 1;
 const WA_TABLE = "wa_sessions";
 const BOT_TIMEZONE = "Africa/Lagos";
+
+// Working version for Baileys 6.7.2
+const BAILEYS_VERSION = [2, 2413, 1];
 
 const VULGAR_WORDS = [
   "fuck","fucking","fucker","fucked",
@@ -196,7 +199,6 @@ async function saveSession(force = false) {
     keys: {
       'pre-key': keyStore['pre-key'],
       'sender-key': keyStore['sender-key'],
-      // Session keys are NOT saved - they can be regenerated
     }
   };
   
@@ -278,7 +280,6 @@ function buildAuthState(savedSession) {
       // Only schedule save if:
       // 1. We're logged in
       // 2. Critical keys changed (pre-key or sender-key)
-      // 3. Not already scheduled
       if (!isLoggedIn) return;
       
       const hasCriticalChanges = Object.keys(data).some(cat => 
@@ -652,8 +653,8 @@ async function provisionAllGroups(sock) {
     }
     
     // Extract bot number in multiple formats
-    const botJidClean = botJid.split('@')[0]; // Remove domain
-    const botNumber = botJidClean.split(':')[0].replace(/\.\d+$/, ''); // Pure number
+    const botJidClean = botJid.split('@')[0];
+    const botNumber = botJidClean.split(':')[0].replace(/\.\d+$/, '');
     
     console.log(`🤖 Bot JID: ${botJid}`);
     console.log(`🤖 Bot number: ${botNumber}`);
@@ -667,30 +668,23 @@ async function provisionAllGroups(sock) {
     for (const [groupJid, meta] of Object.entries(groups)) {
       console.log(`\n🔎 Checking group: ${meta.subject || groupJid}`);
       
-      // Try multiple matching strategies
       const self = meta.participants?.find(p => {
         const participantJid = p.id;
         const participantClean = participantJid.split('@')[0];
         const participantNumber = participantClean.split(':')[0].replace(/\.\d+$/, '');
         
-        // Match by pure number (most reliable)
         if (participantNumber === botNumber) {
           console.log(`   ✅ Matched by phone number: ${participantNumber}`);
           return true;
         }
-        
-        // Match by full JID
         if (participantJid === botJid) {
           console.log(`   ✅ Matched by full JID`);
           return true;
         }
-        
-        // Match by JID without device suffix
         if (participantClean === botJidClean) {
           console.log(`   ✅ Matched by clean JID`);
           return true;
         }
-        
         return false;
       });
       
@@ -874,6 +868,7 @@ app.get('/', async (req, res) => {
       <head>
         <title>WhatsApp Bot</title>
         <meta name="viewport" content="width=device-width,initial-scale=1">
+        <meta http-equiv="refresh" content="5">
         <style>
           body { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); font-family:system-ui; min-height:100vh; display:flex; justify-content:center; align-items:center; padding:20px; }
           .card { background:white; border-radius:20px; padding:40px; max-width:500px; width:100%; text-align:center; box-shadow:0 20px 60px rgba(0,0,0,0.3); }
@@ -1008,7 +1003,7 @@ app.get('/health', (req, res) => {
 });
 
 // ======================================================
-// BOT STARTUP
+// BOT STARTUP - FIXED FOR BAILEYS 6.7.2
 // ======================================================
 async function startBot() {
   if (sock) {
@@ -1024,15 +1019,16 @@ async function startBot() {
   const savedSession = await loadSession();
   const authState = buildAuthState(savedSession);
 
+  // CRITICAL: Version hardcoded for Baileys 6.7.2
   sock = makeWASocket({
-    version: undefined,
+    version: BAILEYS_VERSION,
     auth: authState,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
     browser: ['Ubuntu', 'Chrome', '126.0.0.0'],
     connectTimeoutMs: 60000,
     keepAliveIntervalMs: 30000,
-    qrTimeout: 60000,
+    qrTimeout: 60000, // CRITICAL: 60 seconds to scan QR
     defaultQueryTimeoutMs: 60000,
     retryRequestDelayMs: 1000,
     maxRetries: 3,
@@ -1041,87 +1037,112 @@ async function startBot() {
     shouldIgnoreJid: (jid) => jid === 'status@broadcast'
   });
 
-  sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
-    console.log('📡 Connection update:', { connection, hasQR: !!qr });
-
-    if (qr) {
-      console.log('\n' + '✅'.repeat(10));
-      console.log('✅✅✅ QR READY');
-      console.log('✅'.repeat(10) + '\n');
-      currentQR = qr;
-      botStatus = 'qr_ready';
-      connectionFailures = 0;
-      try { qrcode.generate(qr, { small: true }); } catch (err) {
-        console.error('QR generation error:', err.message);
-      }
-      return;
-    }
-
-    if (connection === 'open') {
-      console.log('\n' + '✅'.repeat(10));
-      console.log('✅✅✅ CONNECTED');
-      console.log('✅'.repeat(10) + '\n');
-      currentQR = null;
-      botStatus = 'connected';
-      connectionFailures = 0;
-      isLoggedIn = true;
+  sock.ev.on('connection.update', async (update) => {
+    try {
+      const { connection, qr, lastDisconnect } = update;
       
-      // Save session immediately after login
-      await saveSession(true);
-      
-      try { await sock.sendPresenceUpdate('available'); } catch (err) {
-        console.error('Presence error:', err.message);
-      }
-      
-      setTimeout(() => provisionAllGroups(sock), 3000);
-      
-      if (schedulerInterval) clearInterval(schedulerInterval);
-      schedulerInterval = startScheduledLockChecker(sock);
-      return;
-    }
+      console.log('📡 Connection update:', { 
+        connection: connection || 'none', 
+        hasQR: !!qr 
+      });
 
-    if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.log('❌ Closed with code:', code);
-
-      if (code === 440 || code === DisconnectReason.loggedOut) {
-        console.log('🔄 Session invalid - clearing and showing new QR');
-        await clearSession();
-        currentQR = null;
-        botStatus = 'starting';
-        connectionFailures = 0;
-        isLoggedIn = false;
+      // QR CODE GENERATION - MUST BE FIRST
+      if (qr) {
+        console.log('\n' + '✅'.repeat(10));
+        console.log('✅✅✅ QR CODE READY - SCAN NOW (60 seconds)');
+        console.log('✅'.repeat(10) + '\n');
         
-        if (sock) {
-          sock.ev.removeAllListeners();
-          sock.end();
-          sock = null;
+        currentQR = qr;
+        botStatus = 'qr_ready';
+        connectionFailures = 0;
+        
+        try {
+          qrcode.generate(qr, { small: true });
+          console.log('\n📱 QR code displayed above - scan now\n');
+        } catch (qrErr) {
+          console.error('Terminal QR error:', qrErr.message);
         }
         
-        setTimeout(startBot, 2000);
+        return; // CRITICAL: STOP HERE
+      }
+
+      if (connection === 'connecting') {
+        console.log('🔄 Connecting to WhatsApp...');
         return;
       }
 
-      connectionFailures++;
-      console.log(`⚠️ Connection failure #${connectionFailures} of ${MAX_FAILURES}`);
-      
-      if (connectionFailures >= MAX_FAILURES) {
-        console.log('🔄 Too many failures, clearing session');
-        await clearSession();
+      if (connection === 'open') {
+        console.log('\n' + '✅'.repeat(10));
+        console.log('✅✅✅ CONNECTED TO WHATSAPP');
+        console.log('✅'.repeat(10) + '\n');
+        
+        currentQR = null;
+        botStatus = 'connected';
         connectionFailures = 0;
-        isLoggedIn = false;
-        setTimeout(startBot, 2000);
-      } else {
-        const delay = Math.min(5000 * connectionFailures, 15000);
-        console.log(`🔄 Reconnecting in ${delay/1000}s`);
-        setTimeout(startBot, delay);
+        isLoggedIn = true;
+        
+        await saveSession(true);
+        
+        try { 
+          await sock.sendPresenceUpdate('available'); 
+        } catch (err) {
+          console.error('Presence error:', err.message);
+        }
+        
+        setTimeout(() => provisionAllGroups(sock), 3000);
+        
+        if (schedulerInterval) clearInterval(schedulerInterval);
+        schedulerInterval = startScheduledLockChecker(sock);
+        
+        return;
       }
+
+      if (connection === 'close') {
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const errorMessage = lastDisconnect?.error?.message;
+        
+        console.log('❌ Connection closed');
+        console.log('   Code:', code || 'undefined');
+        console.log('   Error:', errorMessage || 'No error message');
+
+        if (code === 440 || code === DisconnectReason.loggedOut) {
+          console.log('🔄 Session invalid - clearing');
+          await clearSession();
+          currentQR = null;
+          botStatus = 'starting';
+          isLoggedIn = false;
+          
+          if (sock) {
+            sock.ev.removeAllListeners();
+            sock.end();
+            sock = null;
+          }
+          
+          setTimeout(startBot, 2000);
+          return;
+        }
+
+        connectionFailures++;
+        console.log(`⚠️ Connection failure #${connectionFailures} of ${MAX_FAILURES}`);
+        
+        if (connectionFailures >= MAX_FAILURES) {
+          console.log('🔄 Too many failures, clearing session');
+          await clearSession();
+          connectionFailures = 0;
+          isLoggedIn = false;
+          setTimeout(startBot, 2000);
+        } else {
+          const delay = Math.min(5000 * connectionFailures, 15000);
+          console.log(`🔄 Reconnecting in ${delay/1000}s`);
+          setTimeout(startBot, delay);
+        }
+      }
+    } catch (err) {
+      console.error('❌ Connection handler error:', err.message);
     }
   });
 
-  sock.ev.on('creds.update', () => {
-    // Handled by keys.set
-  });
+  sock.ev.on('creds.update', () => {});
 
   // ======================================================
   // MESSAGE HANDLER
