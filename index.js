@@ -218,20 +218,26 @@ async function incrementStrike(groupJid, userJid) {
   try {
     const current = await getStrikes(groupJid, userJid);
     const newCount = current + 1;
+
     await supabaseRetry(() =>
-      supabase.from("group_strikes").upsert({
-        group_jid: groupJid,
-        user_jid: userJid,
-        strikes: newCount,
-        last_strike: new Date().toISOString()
-      })
+      supabase.from("group_strikes").upsert(
+        {
+          group_jid: groupJid,
+          user_jid: userJid,
+          strikes: newCount,
+          last_strike: new Date().toISOString()
+        },
+        { onConflict: ["group_jid", "user_jid"] } // 👈 important
+      )
     );
+
     return newCount;
   } catch (e) {
     console.log("incrementStrike error:", e?.message);
     return 1;
   }
 }
+
 
 async function resetUserStrikes(groupJid, userJid) {
   try {
