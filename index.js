@@ -1,4 +1,4 @@
-\/**
+/**
  * ======================================================
  * WhatsApp Bot - Production Grade (v1.0.4 - FINAL FIXED)
  * Baileys: 6.7.2 (protocol version locked)
