@@ -318,58 +318,81 @@ async function clearUnlockTime(groupJid) {
 // -------- STRIKE HANDLER --------
 async function handleStrike(jid, sender, reason) {
   try {
+    // Increment strike count in Supabase (or your DB)
     const strikes = await incrementStrike(jid, sender);
     const tag = `@${sender.split("@")[0]}`;
 
     if (strikes >= 3) {
+      // Final strike: remove user
       try {
         await sock.sendMessage(jid, {
           text: `⛔ ${tag} has received *3/3 strikes* for ${reason} and has been *removed* from the group.`,
           mentions: [sender]
         });
-      } catch {}
+      } catch (e) {
+        console.error("Strike message error:", e);
+      }
+
       try {
         await sock.groupParticipantsUpdate(jid, [sender], "remove");
       } catch (e) {
-        console.log("Auto-kick error:", e?.message);
+        console.error("Auto-kick error:", e?.message);
       }
+
+      // Reset strikes after removal
       await resetUserStrikes(jid, sender);
+
     } else {
+      // Warning message for strike 1 or 2
       try {
         await sock.sendMessage(jid, {
           text: `⚠️ Warning ${tag}: ${reason}.\nStrike *${strikes}/3* — at 3 strikes you will be removed.`,
           mentions: [sender]
         });
-      } catch {}
+      } catch (e) {
+        console.error("Warning message error:", e);
+      }
     }
   } catch (e) {
-    console.log("handleStrike error:", e?.message);
+    console.error("handleStrike error:", e);
   }
 }
+
 
 // -------- WELCOME BATCH (5-second window) --------
 const welcomeBuffers = {};
 
 function scheduleWelcome(groupJid, participants, groupName) {
   try {
-    // Ensure participants is an array of strings
+    // Ensure participants is an array of valid JIDs
     if (!Array.isArray(participants)) {
       console.log("scheduleWelcome: participants is not an array", participants);
       return;
     }
-    const validParticipants = participants.filter(p => typeof p === 'string');
+
+    const validParticipants = participants.filter(
+      p => typeof p === "string" && p.includes("@s.whatsapp.net")
+    );
     if (validParticipants.length === 0) return;
 
+    // Initialize buffer if not present
     if (!welcomeBuffers[groupJid]) {
-      welcomeBuffers[groupJid] = { participants: [] };
+      welcomeBuffers[groupJid] = { participants: [], timer: null };
     }
+
+    // Add new participants to buffer
     welcomeBuffers[groupJid].participants.push(...validParticipants);
 
-    clearTimeout(welcomeBuffers[groupJid].timer);
+    // Reset timer for batching
+    if (welcomeBuffers[groupJid].timer) {
+      clearTimeout(welcomeBuffers[groupJid].timer);
+    }
+
     welcomeBuffers[groupJid].timer = setTimeout(async () => {
       try {
         const members = welcomeBuffers[groupJid]?.participants || [];
-        delete welcomeBuffers[groupJid];
+        delete welcomeBuffers[groupJid]; // clear buffer
+
         if (!members.length || !sock) return;
 
         const mentionText = members.map(u => `@${u.split("@")[0]}`).join(", ");
@@ -377,14 +400,17 @@ function scheduleWelcome(groupJid, participants, groupName) {
           text: `👋 Welcome ${mentionText} to *${groupName}*! \n\n📜 *Group Rules:*\n• No spam\n• No links (unless admin)\n• No vulgar language\n\nEnjoy your stay and be respectful! ✨`,
           mentions: members
         });
+
+        console.log("✅ Welcome message sent to:", members);
       } catch (e) {
-        console.log("Welcome send error:", e?.message);
+        console.error("Welcome send error:", e);
       }
     }, 5000);
   } catch (e) {
-    console.log("scheduleWelcome error:", e?.message);
+    console.error("scheduleWelcome error:", e);
   }
 }
+
 
 // -------- SCHEDULED LOCK / UNLOCK CHECKER --------
 const firedThisMinute = new Set();
@@ -1037,7 +1063,7 @@ async function startBot() {
         if (!settings.bot_active && !isCommand) return;
 
         // Anti-vulgar (delete + warning only, no strike)
-        if (!isUserAdmin && settings.bot_active && settings.anti_vulgar) {
+        if (settings.bot_active && settings.anti_vulgar) {
           const normalizedText = normalize(text);
           const hasVulgar = VULGAR_WORDS.some(word => normalizedText.includes(normalize(word)));
           if (hasVulgar) {
