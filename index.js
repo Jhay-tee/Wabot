@@ -336,27 +336,51 @@ async function ensureGroupScheduledLocks(groupJid) {
   }
 }
 
-// -------- PROVISION GROUPS --------
 async function provisionAllGroups(sock) {
   try {
     console.log('🔍 Checking groups...');
     const groups = await sock.groupFetchAllParticipating();
     const botJid = sock.user?.id;
-    if (!botJid) return;
-    const botNumber = extractPhoneNumber(botJid);
-    console.log('🤖 Bot number:', botNumber);
+    if (!botJid) {
+      console.log('❌ No bot JID');
+      return;
+    }
+    
+    // Extract the raw ID (part before @)
+    const botRawId = botJid.split('@')[0];
+    console.log('🤖 Bot raw ID:', botRawId);
+    console.log('🤖 Bot full JID:', botJid);
+    
     let adminCount = 0;
     for (const [groupJid, meta] of Object.entries(groups)) {
-      const botParticipant = meta.participants?.find(p => extractPhoneNumber(p.id) === botNumber);
-      if (botParticipant && (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin')) {
-        adminCount++;
-        await ensureGroupSettings(groupJid);
-        await ensureGroupScheduledLocks(groupJid);
+      console.log(`\n📌 Group: ${meta.subject || groupJid}`);
+      // Log all participants for debugging
+      if (meta.participants) {
+        meta.participants.forEach(p => {
+          console.log(`   Participant: ${p.id} (admin: ${p.admin})`);
+        });
+      }
+      
+      // Find participant by raw ID (works for both @s.whatsapp.net and @lid)
+      const botParticipant = meta.participants?.find(p => {
+        const participantRaw = p.id.split('@')[0];
+        return participantRaw === botRawId;
+      });
+      
+      if (botParticipant) {
+        console.log(`   ✅ Bot found! Admin: ${botParticipant.admin}`);
+        if (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin') {
+          adminCount++;
+          await ensureGroupSettings(groupJid);
+          await ensureGroupScheduledLocks(groupJid);
+        }
+      } else {
+        console.log(`   ❌ Bot not found in this group`);
       }
     }
-    console.log(`✅ Found ${adminCount} admin groups`);
+    console.log(`\n✅ Found ${adminCount} admin groups`);
   } catch (err) {
-    console.log('Provision error:', err.message);
+    console.log('❌ Provision error:', err.message);
   }
 }
 
