@@ -85,9 +85,8 @@ async function startBot() {
     });
   } catch (err) {
     console.error('Failed to start bot:', err);
-    setTimeout(startBot, 5000);
+    setTimeout(startBot, 5000); // retry on error
   }
 }
 
 startBot();
-
