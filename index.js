@@ -5,29 +5,29 @@ import qrcode from 'qrcode-terminal';
 import pkg from '@whiskeysockets/baileys';
 const { makeWASocket, fetchLatestBaileysVersion, DisconnectReason } = pkg;
 
-import { getSession, saveSession, getGroupSettings, getScheduledLocks } from './db.js';
+import { getSession, saveSession, clearSession, getGroupSettings, getScheduledLocks } from './db.js';
 import { handleCommand } from './commands.js';
 
-config(); // Load .env variables
+config(); // Load .env
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('Supabase URL or Key missing. Set SUPABASE_URL and SUPABASE_KEY in .env.');
+  console.error('Supabase URL or Key is missing. Set SUPABASE_URL and SUPABASE_KEY in your .env.');
   process.exit(1);
 }
 
 async function startBot() {
   try {
-    // Fetch latest WhatsApp Web version
     const { version: waVersion } = await fetchLatestBaileysVersion();
     console.log('Using WhatsApp Web version:', waVersion);
 
-    // Load session from DB
-    const session = await getSession();
-    const authState = session?.auth_data || { creds: {}, keys: {} };
+    // Load session from Supabase
+    let session = await getSession();
+    let authState = session?.auth_data || { creds: {}, keys: {} };
 
+    // Create socket
     const sock = makeWASocket({
       logger: P({ level: 'silent' }),
       printQRInTerminal: true,
@@ -35,12 +35,12 @@ async function startBot() {
       version: waVersion
     });
 
-    // Connection updates
+    // QR code & connection events
     sock.ev.on('connection.update', async (update) => {
       const { connection, qr, lastDisconnect } = update;
 
       if (qr) {
-        console.log('Scan this QR code with WhatsApp:');
+        console.log('📷 QR Code received, scan it with WhatsApp:');
         qrcode.generate(qr, { small: true });
       }
 
@@ -48,8 +48,10 @@ async function startBot() {
         const reason = lastDisconnect?.error?.output?.statusCode;
         console.log('Connection closed, reason:', reason);
 
+        // Clear session if invalid or unexpected disconnect
         if (reason !== DisconnectReason.loggedOut) {
-          await saveSession(null); // Clear corrupted session
+          console.log('Session invalid or broken. Clearing session in DB.');
+          await clearSession();
         }
 
         setTimeout(startBot, 5000); // Reconnect after 5s
@@ -60,13 +62,13 @@ async function startBot() {
       }
     });
 
-    // Save session whenever credentials update
+    // Save updated credentials to Supabase
     sock.ev.on('creds.update', async (creds) => {
       await saveSession({ creds, keys: authState.keys || {} });
       console.log('🔑 Session updated and saved to DB.');
     });
 
-    // Listen to messages
+    // Messages & command handling
     sock.ev.on('messages.upsert', async (m) => {
       const msg = m.messages[0];
       if (!msg.message || msg.key.fromMe) return;
@@ -78,23 +80,23 @@ async function startBot() {
       }
     });
 
-    // Automatic lock/unlock scheduler (every 30s)
+    // Periodic scheduled locks/unlocks (every 30s)
     setInterval(async () => {
       const scheduledLocks = await getScheduledLocks();
       const now = new Date();
 
-      for (const lock of scheduledLocks) {
+      scheduledLocks.forEach(async (lock) => {
         const lockTime = lock.lock_time ? new Date(lock.lock_time) : null;
         const unlockTime = lock.unlock_time ? new Date(lock.unlock_time) : null;
 
         if (lockTime && now >= lockTime && (!unlockTime || now < unlockTime)) {
-          // TODO: lock group logic here
+          // TODO: lock group logic
         }
 
         if (unlockTime && now >= unlockTime) {
-          // TODO: unlock group logic here
+          // TODO: unlock group logic
         }
-      }
+      });
     }, 30_000);
 
   } catch (err) {
@@ -102,5 +104,5 @@ async function startBot() {
   }
 }
 
-// Start the bot
+// Start bot
 startBot();
