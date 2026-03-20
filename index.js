@@ -3,7 +3,7 @@ require('dotenv').config();
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const { useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const { handleMessage } = require('./commands');
-const { initDB, getGroupSettings } = require('./database');
+const { initDB, getGroupSettings } = require('./db');
 
 (async () => {
     await initDB();
