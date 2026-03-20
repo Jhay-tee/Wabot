@@ -31,7 +31,7 @@ export async function getUserStrikes(group_jid, user_jid) {
     return data?.strikes || 0;
 }
 
-export async function incrementUserStrike(group_jid, user_jid) {
+export async function addUserStrike(group_jid, user_jid) {
     const current = await getUserStrikes(group_jid, user_jid);
     const strikes = current + 1;
     await supabase.from('group_strikes').upsert({ group_jid, user_jid, strikes, last_strike: new Date() });
