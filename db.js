@@ -9,7 +9,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('Supabase URL or Key is missing in .env');
+  console.error('❌ Supabase URL or Key is missing in .env');
   process.exit(1);
 }
 
@@ -24,27 +24,53 @@ export async function getSession(id = 1) {
     .eq('id', id)
     .single();
 
-  if (error || !data?.auth_data) return null;
-  return JSON.parse(data.auth_data, BufferJSON.reviver);
+  if (error) {
+    if (error.code !== 'PGRST116') {
+      console.error('❌ Error fetching session:', error);
+    }
+    return null;
+  }
+
+  if (!data?.auth_data) return null;
+
+  try {
+    return JSON.parse(data.auth_data, BufferJSON.reviver);
+  } catch (e) {
+    console.error('❌ Failed to parse saved session:', e);
+    return null;
+  }
 }
 
 export async function saveSession(authState, id = 1) {
+  if (!authState?.creds) {
+    console.warn('⚠️ Attempted to save empty authState');
+    return;
+  }
+
   const serialized = JSON.stringify(authState, BufferJSON.replacer);
+
   const { error } = await supabase
     .from('wa_sessions')
     .upsert({ id, auth_data: serialized }, { onConflict: ['id'] });
 
-  if (error) console.error('Error saving session:', error);
+  if (error) {
+    console.error('❌ Error saving session to Supabase:', error);
+  } else {
+    console.log('✅ Session saved to Supabase');
+  }
 }
 
 export async function clearSession(id = 1) {
   const { error } = await supabase
     .from('wa_sessions')
-    .update({ auth_data: null })
+    .delete()
     .eq('id', id);
 
-  if (error) console.error('Error clearing session:', error);
-  return true;
+  if (error) {
+    console.error('❌ Error clearing session:', error);
+  } else {
+    console.log('🗑️ Session cleared from Supabase');
+  }
 }
 
 // ======================= GROUP SETTINGS =======================
@@ -65,7 +91,7 @@ export async function setGroupSettings(groupJid, updates) {
     .from('group_settings')
     .upsert({ group_jid: groupJid, ...updates }, { onConflict: ['group_jid'] });
 
-  if (error) console.error('Error updating group settings:', error);
+  if (error) console.error('❌ Error updating group settings:', error);
 }
 
 // ======================= STRIKES =======================
@@ -88,7 +114,7 @@ export async function addUserStrike(groupJid, userJid) {
       { onConflict: ['group_jid', 'user_jid'] }
     );
 
-  if (error) console.error('Error adding strike:', error);
+  if (error) console.error('❌ Error adding strike:', error);
   return strikes;
 }
 
@@ -100,7 +126,7 @@ export async function resetUserStrikes(groupJid, userJid) {
       { onConflict: ['group_jid', 'user_jid'] }
     );
 
-  if (error) console.error('Error resetting strikes:', error);
+  if (error) console.error('❌ Error resetting strikes:', error);
 }
 
 // ======================= SCHEDULED LOCKS =======================
@@ -118,9 +144,45 @@ export async function setScheduledLocks(groupJid, lockTime, unlockTime) {
   const { error } = await supabase
     .from('group_scheduled_locks')
     .upsert(
-      { group_jid: groupJid, lock_time: lockTime, unlock_time: unlockTime },
+      { 
+        group_jid: groupJid, 
+        lock_time: lockTime, 
+        unlock_time: unlockTime 
+      },
       { onConflict: ['group_jid'] }
     );
 
-  if (error) console.error('Error updating scheduled locks:', error);
+  if (error) console.error('❌ Error updating scheduled locks:', error);
+}
+
+/**
+ * Clear lock_time after it has been triggered (prevents repeated locking)
+ */
+export async function clearUsedLockTime(groupJid) {
+  const { error } = await supabase
+    .from('group_scheduled_locks')
+    .update({ lock_time: null })
+    .eq('group_jid', groupJid);
+
+  if (error) {
+    console.error(`❌ Failed to clear lock_time for ${groupJid}:`, error);
+  } else {
+    console.log(`🕒 Cleared used lock_time for group: ${groupJid}`);
+  }
+}
+
+/**
+ * Clear unlock_time after it has been triggered (prevents repeated unlocking)
+ */
+export async function clearUsedUnlockTime(groupJid) {
+  const { error } = await supabase
+    .from('group_scheduled_locks')
+    .update({ unlock_time: null })
+    .eq('group_jid', groupJid);
+
+  if (error) {
+    console.error(`❌ Failed to clear unlock_time for ${groupJid}:`, error);
+  } else {
+    console.log(`🕒 Cleared used unlock_time for group: ${groupJid}`);
+  }
 }

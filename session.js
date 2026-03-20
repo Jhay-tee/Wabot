@@ -1,113 +1,113 @@
-import pkg from '@whiskeysockets/baileys';
-const { makeWASocket, initAuthCreds, makeCacheableSignalKeyStore, DisconnectReason } = pkg;
+// session.js
+import { 
+  makeWASocket, 
+  DisconnectReason, 
+  // initAuthCreds,     ← remove or comment if unused (it's internal / rarely needed directly)
+  // BufferJSON         ← same, usually not needed directly anymore
+} from '@whiskeysockets/baileys';
+
+import { Boom } from '@hapi/boom';
 import P from 'pino';
 import { getSession, saveSession, clearSession } from './db.js';
 
 let socketInstance = null;
-let creds = null;
-let keys = {};
-let connected = false;
+let saveTimeout = null;
+let isConnecting = false;
 
 export const initSession = async () => {
-  let savedSession = null;
+  if (isConnecting) {
+    console.log('⚠️ Connection already in progress, skipping...');
+    return socketInstance;
+  }
+
+  isConnecting = true;
+
   try {
-    savedSession = await getSession();
-  } catch {
-    console.error('❌ Error reading session from Supabase');
-  }
+    const saved = await getSession();
 
-  // Detect corrupt or missing data
-  if (!savedSession || !savedSession.creds || !savedSession.keys) {
-    console.warn('⚠️ No valid session found or data corrupt. Clearing and starting fresh.');
-    await clearSession();
-    creds = initAuthCreds();
-    keys = {};
-  } else {
-    creds = savedSession.creds;
-    keys = savedSession.keys;
-    console.log('✅ Restored session from Supabase');
-  }
+    let authState;
 
-  const keyStore = makeCacheableSignalKeyStore({
-    get: async (type, ids) => {
-      const data = {};
-      for (const id of ids || []) {
-        if (keys[type]?.[id] !== undefined) data[id] = keys[type][id];
+    if (!saved) {
+      console.warn('⚠️ No saved session found. Starting with fresh credentials.');
+      authState = { creds: initAuthCreds(), keys: {} };
+    } else {
+      console.log('✅ Restored session from Supabase');
+      authState = {
+        creds: saved.creds,
+        keys: saved.keys || {}
+      };
+    }
+
+    // Debounced save to prevent DB spam
+    const debouncedSave = () => {
+      if (saveTimeout) clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(async () => {
+        try {
+          await saveSession(authState);
+        } catch (err) {
+          console.error('❌ Failed to save session to Supabase:', err);
+        }
+      }, 5000);
+    };
+
+    socketInstance = makeWASocket({
+      auth: authState,
+      logger: P({ level: 'silent' }),
+      printQRInTerminal: false,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 30000,
+    });
+
+    // Save on creds update
+    socketInstance.ev.on('creds.update', () => {
+      authState.creds = socketInstance.authState.creds;
+      debouncedSave();
+    });
+
+    // Connection updates
+    socketInstance.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) return;
+
+      if (connection === 'open') {
+        console.log('✅ WhatsApp connected successfully!');
+        isConnecting = false;
+        debouncedSave();
       }
-      return data;
-    },
-    set: async (data) => {
-      for (const cat in data) {
-        keys[cat] = keys[cat] || {};
-        for (const id in data[cat]) {
-          if (data[cat][id] == null) delete keys[cat][id];
-          else keys[cat][id] = data[cat][id];
+
+      if (connection === 'close') {
+        isConnecting = false;
+        const boomError = lastDisconnect?.error;
+        const statusCode = boomError?.output?.statusCode 
+                        ?? (boomError instanceof Boom ? boomError.output.statusCode : null);
+
+        console.log(`Connection closed (reason: ${statusCode || 'unknown'})`);
+
+        if (statusCode === DisconnectReason.loggedOut) {
+          console.log('🚪 Logged out - clearing session');
+          await clearSession();
+        } 
+        else if (statusCode === 440 || statusCode === DisconnectReason.connectionReplaced) {
+          console.log('⚠️ 440 Connection Replaced - Waiting longer...');
+        } 
+        else if (statusCode === 428 || statusCode === DisconnectReason.connectionClosed) {
+          console.log('⚠️ Connection closed - will retry');
+        } 
+        else {
+          console.warn('⚠️ Unexpected disconnect');
         }
       }
-      await saveSession({ creds, keys });
-      console.log('🔑 Keys updated and saved to Supabase (via keyStore.set)');
-    }
-  });
+    });
 
-  const silentLogger = P({ level: 'silent' });
+    return socketInstance;
 
-  socketInstance = makeWASocket({
-    auth: { creds, keys: keyStore },
-    logger: silentLogger,
-    printQRInTerminal: false // handled in index.js
-  });
-
-  // Connection lifecycle
-  socketInstance.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
-    if (connection === 'open') {
-      connected = true;
-      console.log('✅ Device connected successfully!');
-      await saveSession({ creds, keys });
-    }
-
-    if (connection === 'close') {
-      connected = false;
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.log(`Connection closed (reason: ${code || 'unknown'})`);
-
-      if (code === DisconnectReason.restartRequired) {
-        console.log('⚠️ Pairing restart detected, waiting for new QR...');
-        return; // don’t clear session here
-      }
-
-      if (code === DisconnectReason.loggedOut) {
-        console.log('🚪 Logged out, clearing session and forcing new QR');
-        await clearSession();
-        creds = initAuthCreds();
-        keys = {};
-      } else {
-        console.warn('⚠️ Unexpected disconnect, keeping session for retry');
-        // Do NOT clear here — let index.js restart and request new QR
-      }
-    }
-  });
-
-  // Save creds immediately
-  socketInstance.ev.on('creds.update', async (updatedCreds) => {
-    creds = updatedCreds;
-    await saveSession({ creds, keys });
-    console.log('🔑 Credentials updated and saved to Supabase');
-  });
-
-  // Save keys immediately (critical fix)
-  socketInstance.ev.on('keys.update', async (updatedKeys) => {
-    for (const cat in updatedKeys) {
-      keys[cat] = keys[cat] || {};
-      for (const id in updatedKeys[cat]) {
-        if (updatedKeys[cat][id] == null) delete keys[cat][id];
-        else keys[cat][id] = updatedKeys[cat][id];
-      }
-    }
-    await saveSession({ creds, keys });
-    console.log('🔑 Keys updated and saved to Supabase (via keys.update event)');
-  });
-
-  return socketInstance;
+  } catch (err) {
+    console.error('❌ Error during initSession:', err);
+    isConnecting = false;
+    throw err;
+  }
 };
 
 export const getSocket = () => socketInstance;

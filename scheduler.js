@@ -1,26 +1,66 @@
-import { getScheduledLock } from './db.js';
+// scheduler.js
+import { getScheduledLocks, clearUsedLockTime, clearUsedUnlockTime } from './db.js';
 import { logger } from './logger.js';
 import { getSocket } from './session.js';
 
 export const startScheduler = () => {
+  console.log('⏰ Auto Scheduler Started - Checking scheduled locks every minute');
+
   setInterval(async () => {
-    const client = getSocket();
-    if (!client) return;
-
-    // For demonstration, fetch all scheduled locks (you may want to optimize)
-    const { data } = await client.supabase.from('group_scheduled_locks').select('*');
-    if (!data) return;
-
-    const now = new Date();
-    for (const lock of data) {
-      if (lock.lock_time && new Date(lock.lock_time) <= now) {
-        await client.groupSettingUpdate(lock.group_jid, 'locked');
-        logger.info(`Auto-locked group ${lock.group_jid}`);
-      }
-      if (lock.unlock_time && new Date(lock.unlock_time) <= now) {
-        await client.groupSettingUpdate(lock.group_jid, 'unlocked');
-        logger.info(`Auto-unlocked group ${lock.group_jid}`);
-      }
+    const sock = getSocket();
+    if (!sock) {
+      logger.warn('Scheduler: Socket not ready yet');
+      return;
     }
-  }, 60 * 1000); // every minute
+
+    try {
+      const scheduledLocks = await getScheduledLocks();
+
+      if (!scheduledLocks || scheduledLocks.length === 0) {
+        return; // Nothing to process
+      }
+
+      const now = new Date();
+
+      for (const lock of scheduledLocks) {
+        const groupJid = lock.group_jid;
+
+        // ==================== AUTO LOCK ====================
+        if (lock.lock_time) {
+          const lockTime = new Date(lock.lock_time);
+
+          if (lockTime <= now) {
+            try {
+              await sock.groupSettingUpdate(groupJid, 'announce', true); // true = locked
+              logger.success(`🔒 Auto-locked group: ${groupJid}`);
+
+              // Clear the lock_time so it doesn't trigger again every minute
+              await clearUsedLockTime(groupJid);
+            } catch (err) {
+              logger.error(`Failed to auto-lock group ${groupJid}:`, err.message);
+            }
+          }
+        }
+
+        // ==================== AUTO UNLOCK ====================
+        if (lock.unlock_time) {
+          const unlockTime = new Date(lock.unlock_time);
+
+          if (unlockTime <= now) {
+            try {
+              await sock.groupSettingUpdate(groupJid, 'announce', false); // false = unlocked
+              logger.success(`🔓 Auto-unlocked group: ${groupJid}`);
+
+              // Clear the unlock_time so it doesn't trigger again every minute
+              await clearUsedUnlockTime(groupJid);
+            } catch (err) {
+              logger.error(`Failed to auto-unlock group ${groupJid}:`, err.message);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      logger.error('Scheduler Error:', error.message);
+    }
+  }, 60 * 1000); // Every 1 minute
 };

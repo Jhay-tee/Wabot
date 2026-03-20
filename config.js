@@ -6,7 +6,7 @@ export const CONFIG = {
   NAMESPACE: 'wa_bot',
   BOT_PREFIX: '.',
   ADMIN_IDS: process.env.ADMIN_IDS?.split(',') || [], // optional static admins
-  VULGAR_WORDS: ['bitch', 'fuck', 'shit', 'ass', 'damn'],
+  VULGAR_WORDS: ['bitch', 'fuck', 'shit', 'ass'],
   NODE_ENV: process.env.NODE_ENV || 'production',
   TIMEZONE: 'Africa/Lagos'
 };
