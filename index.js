@@ -1,71 +1,108 @@
 // index.js
-import makeWASocket, { useSingleFileAuthState, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import pkg from '@whiskeysockets/baileys';
+const { default: makeWASocket, useSingleFileAuthState, fetchLatestBaileysVersion, DisconnectReason, makeInMemoryStore } = pkg;
+
 import P from 'pino';
-import { getSession, saveSession, getGroupSettings, getScheduledLocks } from './db.js';
+import { getSession, saveSession, getGroupSettings, getScheduledLocks, setScheduledLocks } from './db.js';
 import { handleCommand, handleMessage } from './commands.js';
 
-const SESSION_DEBOUNCE_MS = 5000;
+import * as fs from 'fs';
+import * as path from 'path';
 
-let saveSessionTimer;
-function debouncedSaveSession(authData) {
-    clearTimeout(saveSessionTimer);
-    saveSessionTimer = setTimeout(() => saveSession(authData), SESSION_DEBOUNCE_MS);
-}
+// -------------------
+// Setup Auth & Store
+// -------------------
+const { state, saveState } = useSingleFileAuthState('session.json');
+const store = makeInMemoryStore({ logger: P().child({ level: 'info', stream: 'store' }) });
 
+// -------------------
+// Connect to WhatsApp
+// -------------------
 async function startBot() {
-    const { version } = await fetchLatestBaileysVersion();
+    const [version] = await fetchLatestBaileysVersion();
+    console.log(`Using WhatsApp Web v${version.join('.')}`);
+
     const sock = makeWASocket({
-        logger: P({ level: 'silent' }),
-        printQRInTerminal: true,
         version,
-        auth: await getSession() ? { creds: await getSession() } : useSingleFileAuthState('./session.json')
+        logger: P({ level: 'info' }),
+        printQRInTerminal: true,
+        auth: state
     });
 
-    // Connection updates
-    sock.ev.on('connection.update', (update) => {
+    store.bind(sock.ev);
+
+    // -------------------
+    // Connection Updates
+    // -------------------
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
-        if (qr) console.log('Scan this QR code to connect:', qr);
-        if (connection === 'close') {
-            console.log('Connection closed. Reason:', lastDisconnect?.error?.output?.statusCode);
+
+        if (qr) {
+            console.log('Scan the QR code to connect WhatsApp!');
         }
+
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
+            console.log('Connection closed, reconnecting?', shouldReconnect);
+            if (shouldReconnect) {
+                startBot();
+            }
+        }
+
+        if (connection === 'open') {
+            console.log('✅ WhatsApp connected successfully!');
+        }
+
+        // Always save auth data when it changes
+        saveState();
+        await saveSession(state);
     });
 
-    sock.ev.on('creds.update', debouncedSaveSession);
+    // -------------------
+    // Incoming Messages
+    // -------------------
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
 
-    // Message listener
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        for (let msg of messages) {
+        for (const msg of messages) {
             if (!msg.message || msg.key.fromMe) continue;
 
-            const sender = msg.key.participant || msg.key.remoteJid;
-            const groupSettings = msg.key.remoteJid.includes('@g.us') ? await getGroupSettings(msg.key.remoteJid) : null;
-            const isAdmin = true; // Placeholder: Replace with actual admin check logic
-            const text = msg.message.conversation || msg.message?.extendedTextMessage?.text;
-
-            if (text?.startsWith('.')) {
-                await handleCommand(sock, msg, sender, isAdmin);
-            } else if (groupSettings) {
-                await handleMessage(sock, msg, groupSettings, sender, isAdmin);
+            // Handle commands
+            const isCommand = await handleCommand(sock, msg);
+            if (!isCommand) {
+                // Non-command messages
+                await handleMessage(sock, msg);
             }
         }
     });
 
-    // Automatic scheduled locks/unlocks
+    // -------------------
+    // Scheduled locks
+    // -------------------
     setInterval(async () => {
         const locks = await getScheduledLocks();
         const now = new Date();
-        for (let lock of locks) {
-            const groupJid = lock.group_jid;
-            if (lock.lock_time && new Date(lock.lock_time) <= now) {
-                await sock.groupSettingUpdate(groupJid, 'announcement');
-                await setScheduledLocks(groupJid, null, lock.unlock_time);
+
+        for (const lock of locks) {
+            const { group_jid, lock_time, unlock_time } = lock;
+            if (lock_time) {
+                const lockDate = new Date(lock_time);
+                if (now >= lockDate) {
+                    await sock.groupSettingUpdate(group_jid, 'announcement'); // lock group
+                    await setScheduledLocks(group_jid, null, unlock_time); // remove lock_time
+                    console.log(`🔒 Group ${group_jid} locked automatically`);
+                }
             }
-            if (lock.unlock_time && new Date(lock.unlock_time) <= now) {
-                await sock.groupSettingUpdate(groupJid, 'not_announcement');
-                await setScheduledLocks(groupJid, lock.lock_time, null);
+            if (unlock_time) {
+                const unlockDate = new Date(unlock_time);
+                if (now >= unlockDate) {
+                    await sock.groupSettingUpdate(group_jid, 'not_announcement'); // unlock group
+                    await setScheduledLocks(group_jid, lock_time, null); // remove unlock_time
+                    console.log(`🔓 Group ${group_jid} unlocked automatically`);
+                }
             }
         }
-    }, 60 * 1000);
+    }, 60000); // check every minute
 }
 
-startBot().catch(console.error);
+startBot();
