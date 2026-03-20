@@ -1,121 +1,136 @@
 // db.js
 import { createClient } from '@supabase/supabase-js';
-import { config } from 'dotenv';
-import { BufferJSON } from '@whiskeysockets/baileys';
+import 'dotenv/config';
 
-config();
+const url = process.env.SUPABASE_URL;
+const key = process.env.SUPABASE_ANON_KEY;
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
-
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('❌ Supabase URL or Key is missing in .env');
+if (!url || !key) {
+  console.error('Missing Supabase URL or ANON key');
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(url, key);
 
-// ======================= SESSION =======================
+// ────────────────────────────────────────────────
+// Auth session (Baileys v7 compatible – no BufferJSON)
+// ────────────────────────────────────────────────
 
 export async function getSession(id = 1) {
   const { data, error } = await supabase
     .from('wa_sessions')
     .select('auth_data')
     .eq('id', id)
-    .single();
+    .maybeSingle();
 
-  if (error) {
-    if (error.code !== 'PGRST116') {
-      console.error('❌ Error fetching session:', error);
-    }
+  if (error && error.code !== 'PGRST116') {
+    console.error('getSession → error:', error.message);
     return null;
   }
 
   if (!data?.auth_data) return null;
 
   try {
-    return JSON.parse(data.auth_data, BufferJSON.reviver);
+    return JSON.parse(data.auth_data);
   } catch (e) {
-    console.error('❌ Failed to parse saved session:', e);
+    console.error('Failed to parse stored auth data:', e.message);
     return null;
   }
 }
 
 export async function saveSession(authState, id = 1) {
   if (!authState?.creds) {
-    console.warn('⚠️ Attempted to save empty authState');
+    console.warn('saveSession called with incomplete authState');
     return;
   }
 
-  const serialized = JSON.stringify(authState, BufferJSON.replacer);
+  try {
+    const payload = JSON.stringify(authState);
 
-  const { error } = await supabase
-    .from('wa_sessions')
-    .upsert({ id, auth_data: serialized }, { onConflict: ['id'] });
+    const { error } = await supabase
+      .from('wa_sessions')
+      .upsert({ id, auth_data: payload }, { onConflict: 'id' });
 
-  if (error) {
-    console.error('❌ Error saving session to Supabase:', error);
-  } else {
-    console.log('✅ Session saved to Supabase');
+    if (error) throw error;
+
+    console.log('Auth state saved');
+  } catch (err) {
+    console.error('saveSession failed:', err.message);
   }
 }
 
 export async function clearSession(id = 1) {
-  const { error } = await supabase
-    .from('wa_sessions')
-    .delete()
-    .eq('id', id);
+  try {
+    const { error } = await supabase
+      .from('wa_sessions')
+      .delete()
+      .eq('id', id);
 
-  if (error) {
-    console.error('❌ Error clearing session:', error);
-  } else {
-    console.log('🗑️ Session cleared from Supabase');
+    if (error) throw error;
+
+    console.log('Session cleared');
+  } catch (err) {
+    console.error('clearSession failed:', err.message);
   }
 }
 
-// ======================= GROUP SETTINGS =======================
+// ────────────────────────────────────────────────
+// Group settings
+// ────────────────────────────────────────────────
 
 export async function getGroupSettings(groupJid) {
   const { data, error } = await supabase
     .from('group_settings')
     .select('*')
     .eq('group_jid', groupJid)
-    .single();
+    .maybeSingle();
 
-  if (error) return null;
+  if (error) {
+    console.error('getGroupSettings error:', error.message);
+    return null;
+  }
   return data;
 }
 
 export async function setGroupSettings(groupJid, updates) {
   const { error } = await supabase
     .from('group_settings')
-    .upsert({ group_jid: groupJid, ...updates }, { onConflict: ['group_jid'] });
+    .upsert({ group_jid: groupJid, ...updates }, { onConflict: 'group_jid' });
 
-  if (error) console.error('❌ Error updating group settings:', error);
+  if (error) {
+    console.error('setGroupSettings failed:', error.message);
+  }
 }
 
-// ======================= STRIKES =======================
+// ────────────────────────────────────────────────
+// Strikes
+// ────────────────────────────────────────────────
 
 export async function addUserStrike(groupJid, userJid) {
-  const { data } = await supabase
-    .from('group_strikes')
-    .select('strikes')
-    .eq('group_jid', groupJid)
-    .eq('user_jid', userJid)
-    .single();
+  try {
+    const { data } = await supabase
+      .from('group_strikes')
+      .select('strikes')
+      .eq('group_jid', groupJid)
+      .eq('user_jid', userJid)
+      .maybeSingle();
 
-  let strikes = data?.strikes ?? 0;
-  strikes += 1;
+    let strikes = data?.strikes ?? 0;
+    strikes += 1;
 
-  const { error } = await supabase
-    .from('group_strikes')
-    .upsert(
-      { group_jid: groupJid, user_jid: userJid, strikes },
-      { onConflict: ['group_jid', 'user_jid'] }
-    );
+    const { error } = await supabase
+      .from('group_strikes')
+      .upsert(
+        { group_jid: groupJid, user_jid: userJid, strikes },
+        { onConflict: ['group_jid', 'user_jid'] }
+      );
 
-  if (error) console.error('❌ Error adding strike:', error);
-  return strikes;
+    if (error) throw error;
+    return strikes;
+  } catch (err) {
+    console.error('addUserStrike failed:', err.message);
+    return null;
+  }
 }
 
 export async function resetUserStrikes(groupJid, userJid) {
@@ -126,63 +141,55 @@ export async function resetUserStrikes(groupJid, userJid) {
       { onConflict: ['group_jid', 'user_jid'] }
     );
 
-  if (error) console.error('❌ Error resetting strikes:', error);
+  if (error) {
+    console.error('resetUserStrikes failed:', error.message);
+  }
 }
 
-// ======================= SCHEDULED LOCKS =======================
+// ────────────────────────────────────────────────
+// Scheduled locks
+// ────────────────────────────────────────────────
 
 export async function getScheduledLocks() {
   const { data, error } = await supabase
     .from('group_scheduled_locks')
     .select('*');
 
-  if (error) return [];
-  return data;
+  if (error) {
+    console.error('getScheduledLocks error:', error.message);
+    return [];
+  }
+  return data || [];
 }
 
-export async function setScheduledLocks(groupJid, lockTime, unlockTime) {
+export async function setScheduledLocks(groupJid, lockTimeIso, unlockTimeIso) {
+  const row = { group_jid: groupJid };
+  if (lockTimeIso !== undefined) row.lock_time = lockTimeIso;
+  if (unlockTimeIso !== undefined) row.unlock_time = unlockTimeIso;
+
   const { error } = await supabase
     .from('group_scheduled_locks')
-    .upsert(
-      { 
-        group_jid: groupJid, 
-        lock_time: lockTime, 
-        unlock_time: unlockTime 
-      },
-      { onConflict: ['group_jid'] }
-    );
+    .upsert(row, { onConflict: 'group_jid' });
 
-  if (error) console.error('❌ Error updating scheduled locks:', error);
+  if (error) {
+    console.error('setScheduledLocks failed:', error.message);
+  }
 }
 
-/**
- * Clear lock_time after it has been triggered (prevents repeated locking)
- */
 export async function clearUsedLockTime(groupJid) {
   const { error } = await supabase
     .from('group_scheduled_locks')
     .update({ lock_time: null })
     .eq('group_jid', groupJid);
 
-  if (error) {
-    console.error(`❌ Failed to clear lock_time for ${groupJid}:`, error);
-  } else {
-    console.log(`🕒 Cleared used lock_time for group: ${groupJid}`);
-  }
+  if (error) console.error('clearUsedLockTime failed:', error.message);
 }
 
-/**
- * Clear unlock_time after it has been triggered (prevents repeated unlocking)
- */
 export async function clearUsedUnlockTime(groupJid) {
   const { error } = await supabase
     .from('group_scheduled_locks')
     .update({ unlock_time: null })
     .eq('group_jid', groupJid);
 
-  if (error) {
-    console.error(`❌ Failed to clear unlock_time for ${groupJid}:`, error);
-  } else {
-    console.log(`🕒 Cleared used unlock_time for group: ${groupJid}`);
-  }
+  if (error) console.error('clearUsedUnlockTime failed:', error.message);
 }
