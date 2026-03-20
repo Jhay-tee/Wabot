@@ -20,8 +20,28 @@ app.get('/', (req, res) => {
     res.send(`
       <h1>Scan QR to connect WhatsApp</h1>
       <div id="qrcode"></div>
+      <div id="timer"></div>
+      <style>
+        body { font-family: Arial; text-align: center; background: #f9f9f9; }
+        #qrcode canvas { border: 2px solid #333; padding: 10px; margin-top: 20px; }
+        #timer { font-size: 18px; color: red; margin-top: 10px; }
+      </style>
       <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
       <script>
+        let seconds = 20;
+        function startTimer() {
+          seconds = 20;
+          const timerEl = document.getElementById('timer');
+          timerEl.textContent = 'QR expires in ' + seconds + 's';
+          const interval = setInterval(() => {
+            if (seconds > 0) {
+              timerEl.textContent = 'QR expires in ' + (--seconds) + 's';
+            } else {
+              clearInterval(interval);
+              timerEl.textContent = 'QR expired, waiting for refresh...';
+            }
+          }, 1000);
+        }
         async function renderQR() {
           const res = await fetch('/qr');
           if (res.ok) {
@@ -30,6 +50,7 @@ app.get('/', (req, res) => {
             QRCode.toCanvas(document.createElement('canvas'), qr, (err, canvas) => {
               if (!err) document.getElementById('qrcode').appendChild(canvas);
             });
+            startTimer();
           } else {
             document.getElementById('qrcode').innerHTML = '<h2>No QR available</h2>';
           }
@@ -69,6 +90,16 @@ async function startBot() {
         latestQR = qr;
         console.log('📷 New QR Code received, scan it quickly:');
         qrcode.generate(qr, { small: true });
+
+        // Terminal countdown
+        let seconds = 20;
+        const interval = setInterval(() => {
+          if (seconds > 0 && !connected) {
+            console.log(`⏳ QR expires in ${seconds--}s`);
+          } else {
+            clearInterval(interval);
+          }
+        }, 1000);
       }
 
       if (connection === 'open') {
