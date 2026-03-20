@@ -1,13 +1,11 @@
 // session.js
-import { 
-  makeWASocket, 
-  DisconnectReason, 
-  // initAuthCreds,     ← remove or comment if unused (it's internal / rarely needed directly)
-  // BufferJSON         ← same, usually not needed directly anymore
+import {
+  makeWASocket,
+  DisconnectReason
 } from '@whiskeysockets/baileys';
 
 import { Boom } from '@hapi/boom';
-import P from 'pino';
+import pino from 'pino';
 import { getSession, saveSession, clearSession } from './db.js';
 
 let socketInstance = null;
@@ -28,83 +26,115 @@ export const initSession = async () => {
     let authState;
 
     if (!saved) {
-      console.warn('⚠️ No saved session found. Starting with fresh credentials.');
-      authState = { creds: initAuthCreds(), keys: {} };
+      console.warn('⚠️ No saved session found. Starting fresh (QR/pairing needed).');
+      // Do NOT call initAuthCreds() manually unless you know it's required
+      // Baileys will generate fresh creds automatically when auth is {} or partial
+      authState = {
+        creds: {},      // let Baileys init
+        keys: {}
+      };
     } else {
       console.log('✅ Restored session from Supabase');
       authState = {
-        creds: saved.creds,
+        creds: saved.creds || {},
         keys: saved.keys || {}
       };
     }
 
-    // Debounced save to prevent DB spam
+    // Debounced save to avoid DB spam
     const debouncedSave = () => {
       if (saveTimeout) clearTimeout(saveTimeout);
       saveTimeout = setTimeout(async () => {
         try {
           await saveSession(authState);
+          console.log('💾 Session saved to Supabase (debounced)');
         } catch (err) {
-          console.error('❌ Failed to save session to Supabase:', err);
+          console.error('❌ Failed to save session:', err.message || err);
         }
       }, 5000);
     };
 
     socketInstance = makeWASocket({
       auth: authState,
-      logger: P({ level: 'silent' }),
-      printQRInTerminal: false,
+      logger: pino({ level: 'silent' }), // change to 'debug' temporarily if troubleshooting
+      printQRInTerminal: false,          // set true for console QR during testing
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 30000,
+      // Stability tweaks (safe in v6.7+)
+      syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false
     });
 
     // Save on creds update
     socketInstance.ev.on('creds.update', () => {
-      authState.creds = socketInstance.authState.creds;
+      // Safe merge - avoid overwriting if authState.creds is undefined
+      if (socketInstance?.authState?.creds) {
+        authState.creds = { ...authState.creds, ...socketInstance.authState.creds };
+      }
       debouncedSave();
     });
 
-    // Connection updates
+    // Connection updates - improved logout detection
     socketInstance.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      if (qr) return;
+      if (qr) {
+        console.log('QR generated (not printing - handle manually if needed)');
+        return;
+      }
 
       if (connection === 'open') {
         console.log('✅ WhatsApp connected successfully!');
         isConnecting = false;
         debouncedSave();
+        return;
       }
 
       if (connection === 'close') {
         isConnecting = false;
-        const boomError = lastDisconnect?.error;
-        const statusCode = boomError?.output?.statusCode 
-                        ?? (boomError instanceof Boom ? boomError.output.statusCode : null);
 
-        console.log(`Connection closed (reason: ${statusCode || 'unknown'})`);
+        const errorObj = lastDisconnect?.error;
+        const statusCode = errorObj?.output?.statusCode ?? 
+                          (errorObj instanceof Boom ? errorObj.output?.statusCode : null) ??
+                          errorObj?.statusCode ?? null;
 
-        if (statusCode === DisconnectReason.loggedOut) {
-          console.log('🚪 Logged out - clearing session');
-          await clearSession();
-        } 
-        else if (statusCode === 440 || statusCode === DisconnectReason.connectionReplaced) {
-          console.log('⚠️ 440 Connection Replaced - Waiting longer...');
-        } 
-        else if (statusCode === 428 || statusCode === DisconnectReason.connectionClosed) {
-          console.log('⚠️ Connection closed - will retry');
-        } 
-        else {
-          console.warn('⚠️ Unexpected disconnect');
+        console.log(
+          `Connection closed (code: ${statusCode ?? 'unknown'})`,
+          errorObj ? JSON.stringify(errorObj, null, 2) : '(no details)'
+        );
+
+        const errorMsg = (errorObj?.message || '').toLowerCase();
+        const isLoggedOut = 
+          statusCode === DisconnectReason.loggedOut ||      // 401
+          statusCode === 405 ||                             // rare variant
+          errorMsg.includes('logged out') ||
+          errorMsg.includes('user not found') ||
+          errorMsg.includes('401') ||
+          errorMsg.includes('device removed');
+
+        if (isLoggedOut) {
+          console.log('🚪 Logout detected → clearing Supabase session');
+          await clearSession().catch(err => 
+            console.error('Clear session failed:', err.message)
+          );
+        } else if (statusCode === DisconnectReason.connectionReplaced || statusCode === 440) {
+          console.log('⚠️ Connection replaced (440) - will retry');
+        } else if (
+          statusCode === DisconnectReason.connectionClosed ||    // 428
+          statusCode === DisconnectReason.connectionLost ||      // 408
+          statusCode === DisconnectReason.timedOut
+        ) {
+          console.log('⚠️ Recoverable close - retry logic should handle');
+        } else {
+          console.warn('⚠️ Unexpected disconnect - check logs');
         }
       }
     });
 
     return socketInstance;
-
   } catch (err) {
-    console.error('❌ Error during initSession:', err);
+    console.error('❌ initSession failed:', err.message || err);
     isConnecting = false;
     throw err;
   }
