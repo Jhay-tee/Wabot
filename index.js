@@ -27,6 +27,9 @@ const VULGAR_WORDS = [
   "shit","pussy","dick","cunt","whore","slut"
 ];
 
+// Hardcode a known working version for Baileys 6.7.2
+const BAILEYS_VERSION = [2, 3000, 1035194821];
+
 // -------- SUPABASE CLIENT --------
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -100,7 +103,7 @@ function formatTime24to12(hhmm) {
 // -------- SESSION MANAGEMENT --------
 async function loadSession() {
   try {
-    console.log('🔍 Loading session...');
+    console.log('🔍 Loading session from Supabase...');
     const { data, error } = await supabase
       .from(WA_TABLE)
       .select('auth_data')
@@ -111,7 +114,7 @@ async function loadSession() {
       return false;
     }
     if (!data?.auth_data) {
-      console.log('📱 No session found');
+      console.log('📱 No session found - will generate QR');
       return false;
     }
     const session = JSON.parse(data.auth_data, BufferJSON.reviver);
@@ -499,12 +502,12 @@ async function startBot() {
           keys[cat][id] = data[cat][id];
         }
       }
-      // We'll rely on creds.update to save, not on every key set
     }
   };
 
+  // Use the hardcoded version array
   sock = makeWASocket({
-    version: [2, 3000, 1035194821], // fetch latest
+    version: BAILEYS_VERSION,
     auth: { creds: creds || initAuthCreds(), keys: keysHandler },
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
@@ -514,18 +517,28 @@ async function startBot() {
     qrTimeout: 60000
   });
 
+  sock.ev.on('error', (err) => {
+    console.log('💥 Socket error:', err);
+  });
+
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
     console.log('📡', { connection, hasQR: !!qr });
 
     if (qr) {
+      console.log('\n✅✅✅ QR READY - SCAN NOW (60 seconds)\n');
       currentQR = qr;
       botStatus = 'qr_ready';
       qrcode.generate(qr, { small: true });
       return;
     }
 
+    if (connection === 'connecting') {
+      console.log('🔄 Connecting to WhatsApp...');
+      return;
+    }
+
     if (connection === 'open') {
-      console.log('✅ CONNECTED');
+      console.log('\n✅✅✅ CONNECTED\n');
       botStatus = 'connected';
       await saveSession();
       setTimeout(() => provisionAllGroups(sock), 3000);
@@ -536,7 +549,9 @@ async function startBot() {
 
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
+      const errorMsg = lastDisconnect?.error?.message;
       console.log('❌ Closed with code:', code);
+      console.log('❌ Error message:', errorMsg);
 
       if (code === 515) {
         console.log('🔄 QR scanned – waiting 5 seconds for save...');
@@ -558,6 +573,7 @@ async function startBot() {
         return;
       }
 
+      // For other codes, just reconnect
       console.log('🔄 Reconnecting in 5s...');
       setTimeout(startBot, 5000);
     }
@@ -565,7 +581,6 @@ async function startBot() {
 
   sock.ev.on('creds.update', async () => {
     console.log('🔐 Credentials updated – saving');
-    // Update local creds from socket
     if (sock?.authState?.creds) {
       creds = sock.authState.creds;
     }
