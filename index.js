@@ -55,9 +55,17 @@ let keys = {};
 // -------- HELPERS --------
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
+// Normalize any WA JID to bare phone number for comparison
+// handles: 234xxx@s.whatsapp.net, 234xxx:0@s.whatsapp.net, 234xxx:0@lid
+function normalizeJid(jid) {
+  if (!jid) return '';
+  return jid.split('@')[0].split(':')[0];
+}
+
 const isAdmin = (jid, participants) => {
   try {
-    const user = participants.find(p => p.id === jid);
+    const normSender = normalizeJid(jid);
+    const user = participants.find(p => normalizeJid(p.id) === normSender);
     return user && (user.admin === "admin" || user.admin === "superadmin");
   } catch {
     return false;
@@ -70,7 +78,7 @@ const normalize = str => {
 
 function extractPhoneNumber(jid) {
   if (!jid) return null;
-  return jid.split('@')[0].split(':')[0].replace(/\.\d+$/, '');
+  return normalizeJid(jid);
 }
 
 function getCurrentTimeInZone() {
@@ -254,12 +262,16 @@ async function incrementStrike(groupJid, userJid) {
   try {
     const current = await getStrikes(groupJid, userJid);
     const newCount = current + 1;
-    await supabase
+    const { error } = await supabase
       .from("group_strikes")
       .upsert(
-        { group_jid: groupJid, user_jid: userJid, strikes: newCount, last_strike: new Date() },
+        { group_jid: groupJid, user_jid: userJid, strikes: newCount, last_strike: new Date().toISOString() },
         { onConflict: 'group_jid,user_jid' }
       );
+    if (error) {
+      console.log(`❌ incrementStrike upsert error:`, error.message);
+      return current; // return previous count so logic still works
+    }
     return newCount;
   } catch (err) {
     console.log(`❌ incrementStrike error:`, err.message);
@@ -302,9 +314,24 @@ async function getScheduledLock(groupJid) {
 
 async function setScheduledLockTime(groupJid, lockTime) {
   try {
-    await supabase
+    // First try to update the existing row to preserve unlock_time
+    const { data: existing } = await supabase
       .from("group_scheduled_locks")
-      .upsert({ group_jid: groupJid, lock_time: lockTime }, { onConflict: 'group_jid' });
+      .select("group_jid")
+      .eq("group_jid", groupJid)
+      .maybeSingle();
+    if (existing) {
+      const { error } = await supabase
+        .from("group_scheduled_locks")
+        .update({ lock_time: lockTime })
+        .eq("group_jid", groupJid);
+      if (error) { console.log(`❌ setScheduledLockTime update error:`, error.message); return false; }
+    } else {
+      const { error } = await supabase
+        .from("group_scheduled_locks")
+        .insert({ group_jid: groupJid, lock_time: lockTime, unlock_time: null });
+      if (error) { console.log(`❌ setScheduledLockTime insert error:`, error.message); return false; }
+    }
     return true;
   } catch (err) {
     console.log(`❌ setScheduledLockTime error:`, err.message);
@@ -314,9 +341,24 @@ async function setScheduledLockTime(groupJid, lockTime) {
 
 async function setScheduledUnlockTime(groupJid, unlockTime) {
   try {
-    await supabase
+    // First try to update the existing row to preserve lock_time
+    const { data: existing } = await supabase
       .from("group_scheduled_locks")
-      .upsert({ group_jid: groupJid, unlock_time: unlockTime }, { onConflict: 'group_jid' });
+      .select("group_jid")
+      .eq("group_jid", groupJid)
+      .maybeSingle();
+    if (existing) {
+      const { error } = await supabase
+        .from("group_scheduled_locks")
+        .update({ unlock_time: unlockTime })
+        .eq("group_jid", groupJid);
+      if (error) { console.log(`❌ setScheduledUnlockTime update error:`, error.message); return false; }
+    } else {
+      const { error } = await supabase
+        .from("group_scheduled_locks")
+        .insert({ group_jid: groupJid, lock_time: null, unlock_time: unlockTime });
+      if (error) { console.log(`❌ setScheduledUnlockTime insert error:`, error.message); return false; }
+    }
     return true;
   } catch (err) {
     console.log(`❌ setScheduledUnlockTime error:`, err.message);
@@ -362,7 +404,7 @@ async function ensureGroupScheduledLocks(groupJid) {
   }
 }
 
-// -------- PROVISION GROUPS (uses learned internal ID) --------
+// -------- PROVISION GROUPS --------
 async function provisionAllGroups(sock) {
   try {
     console.log('🔍 Checking groups...');
@@ -370,24 +412,22 @@ async function provisionAllGroups(sock) {
     const botJid = sock.user?.id;
     if (!botJid) return;
 
-    // Use learned internal ID if available, otherwise fallback to phone number
-    const matchId = botInternalId || botJid.split('@')[0].split(':')[0];
-    console.log('🔍 Matching with ID:', matchId);
+    const botPhone = normalizeJid(botJid);
+    console.log('🔍 Bot phone number:', botPhone);
 
     let adminCount = 0;
+    let memberCount = 0;
     for (const [groupJid, meta] of Object.entries(groups)) {
-      const botParticipant = meta.participants?.find(p => {
-        const participantId = p.id.split('@')[0];
-        return participantId === matchId;
-      });
-
-      if (botParticipant && (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin')) {
+      const botParticipant = meta.participants?.find(p => normalizeJid(p.id) === botPhone);
+      if (!botParticipant) continue;
+      memberCount++;
+      await ensureGroupSettings(groupJid);
+      await ensureGroupScheduledLocks(groupJid);
+      if (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin') {
         adminCount++;
-        await ensureGroupSettings(groupJid);
-        await ensureGroupScheduledLocks(groupJid);
       }
     }
-    console.log(`✅ Found ${adminCount} admin groups`);
+    console.log(`✅ Bot is in ${memberCount} groups, admin in ${adminCount}`);
   } catch (err) {
     console.log('❌ Provision error:', err.message);
   }
@@ -395,14 +435,22 @@ async function provisionAllGroups(sock) {
 
 // -------- STRIKE HANDLER --------
 async function handleStrike(sock, jid, sender, reason) {
+  // sender is already normalized to phone@s.whatsapp.net
   const strikes = await incrementStrike(jid, sender);
-  const tag = `@${sender.split('@')[0]}`;
+  const phone = normalizeJid(sender);
+  const tag = `@${phone}`;
   if (strikes >= 3) {
-    await sock.sendMessage(jid, { text: `⛔ 3/3 ${tag} removed`, mentions: [sender] });
-    await sock.groupParticipantsUpdate(jid, [sender], 'remove');
+    await sock.sendMessage(jid, {
+      text: `⛔ ${tag} has been removed (3/3 strikes — ${reason})`,
+      mentions: [sender]
+    }).catch(() => {});
+    await sock.groupParticipantsUpdate(jid, [sender], 'remove').catch(() => {});
     await resetUserStrikes(jid, sender);
   } else {
-    await sock.sendMessage(jid, { text: `⚠️ Strike ${strikes}/3`, mentions: [sender] });
+    await sock.sendMessage(jid, {
+      text: `⚠️ ${tag} — Strike ${strikes}/3 (${reason}). ${3 - strikes} warning${3 - strikes === 1 ? '' : 's'} left before removal.`,
+      mentions: [sender]
+    }).catch(() => {});
   }
 }
 
@@ -575,7 +623,8 @@ async function startBot() {
       console.log('\n✅✅✅ CONNECTED\n');
       botStatus = 'connected';
       await saveSession();
-      setTimeout(() => provisionAllGroups(sock), 3000);
+      // Wait 15s for WhatsApp multi-device to fully sync before fetching groups
+      setTimeout(() => provisionAllGroups(sock), 15000);
       if (schedulerInterval) clearInterval(schedulerInterval);
       schedulerInterval = startScheduledLockChecker(sock);
       return;
@@ -600,10 +649,17 @@ async function startBot() {
         return;
       }
 
-      if (code === 440 || code === DisconnectReason.loggedOut || code === 401) {
+      if (code === DisconnectReason.loggedOut || code === 401) {
         console.log('🚫 Logged out / unauthorized – clearing session');
-        await clearSession(); // resets DB and memory
-        setTimeout(startBot, 2000);
+        await clearSession();
+        setTimeout(startBot, 3000);
+        return;
+      }
+
+      if (code === 440) {
+        // Conflict: another session is active. DO NOT clear session — just wait and reconnect.
+        console.log('⚡ Session conflict — waiting 10s before reconnect...');
+        setTimeout(startBot, 10000);
         return;
       }
 
@@ -626,40 +682,39 @@ async function startBot() {
     try {
       if (!id || !participants?.length) return;
 
-      // If the bot itself is added
-      if (action === 'add' && participants.includes(sock.user?.id)) {
-        console.log('✅ Bot was added to group, learning its internal ID...');
+      // If the bot itself is added — use normalized phone comparison
+      const botPhone = normalizeJid(sock.user?.id);
+      const botWasAdded = action === 'add' && participants.some(p => normalizeJid(p) === botPhone);
+      if (botWasAdded) {
+        console.log('✅ Bot was added to group:', id);
         await delay(3000);
-        const meta = await sock.groupMetadata(id);
-        const botParticipant = meta.participants.find(p => p.id === sock.user?.id);
-        if (botParticipant) {
-          botInternalId = botParticipant.id.split('@')[0];
-          console.log('🤖 Bot internal ID learned:', botInternalId);
-          await ensureGroupSettings(id);
-          await ensureGroupScheduledLocks(id);
-          // Send a test message to confirm
-          await sock.sendMessage(id, { text: '✅ Bot is now active in this group!' });
-        }
+        await ensureGroupSettings(id);
+        await ensureGroupScheduledLocks(id);
+        await sock.sendMessage(id, { text: '✅ Bot is now active in this group!' }).catch(() => {});
       }
 
-      // Welcome new members
+      // Welcome new members (skip the bot itself)
       const memberJoinActions = ['add', 'invite', 'linked_group_join'];
       if (memberJoinActions.includes(action) && participants?.length > 0) {
-        const settings = await getGroupSettings(id);
-        if (settings.bot_active) {
-          let groupName = 'the group';
-          try {
-            const meta = await sock.groupMetadata(id);
-            groupName = meta.subject || 'the group';
-          } catch {}
-          scheduleWelcome(sock, id, participants, groupName);
+        const nonBotParticipants = participants.filter(p => normalizeJid(p) !== botPhone);
+        if (nonBotParticipants.length > 0) {
+          const settings = await getGroupSettings(id);
+          if (settings.bot_active) {
+            let groupName = 'the group';
+            try {
+              const meta = await sock.groupMetadata(id);
+              groupName = meta.subject || 'the group';
+            } catch {}
+            scheduleWelcome(sock, id, nonBotParticipants, groupName);
+          }
         }
       }
 
-      // Reset strikes when members leave
+      // Reset strikes when members leave (use normalized JID)
       if (action === 'remove' || action === 'leave') {
         for (const user of participants) {
-          await resetUserStrikes(id, user).catch(() => {});
+          const normalizedUser = `${normalizeJid(user)}@s.whatsapp.net`;
+          await resetUserStrikes(id, normalizedUser).catch(() => {});
         }
       }
     } catch (err) {
@@ -676,13 +731,19 @@ async function startBot() {
       const jid = msg.key.remoteJid;
       if (!jid || jid === 'status@broadcast' || !jid.endsWith('@g.us')) return;
 
-      const sender = msg.key.participant || msg.key.remoteJid;
-      if (!sender) return;
+      const rawSender = msg.key.participant || msg.key.remoteJid;
+      if (!rawSender) return;
+      // Normalize sender JID to bare phone@s.whatsapp.net for consistent DB storage
+      const senderPhone = normalizeJid(rawSender);
+      const sender = `${senderPhone}@s.whatsapp.net`;
 
       const metadata = await sock.groupMetadata(jid).catch(() => null);
       if (!metadata) return;
 
-      const isUserAdmin = isAdmin(sender, metadata.participants);
+      // Auto-provision group settings if not yet in DB
+      await ensureGroupSettings(jid);
+
+      const isUserAdmin = isAdmin(rawSender, metadata.participants);
 
       let text = '';
       try {
@@ -725,13 +786,12 @@ async function startBot() {
       if (!isUserAdmin && settings.anti_vulgar) {
         const hasVulgar = VULGAR_WORDS.some(w => text.toLowerCase().includes(w));
         if (hasVulgar) {
+          // Delete the message using original raw JID (needed by WhatsApp)
           await sock.sendMessage(jid, {
-            delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
+            delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: rawSender }
           }).catch(() => {});
-          await sock.sendMessage(jid, {
-            text: `⚠️ @${sender.split('@')[0]}, vulgar words not allowed`,
-            mentions: [sender]
-          }).catch(() => {});
+          // Issue a strike using normalized sender for consistent DB storage
+          await handleStrike(sock, jid, sender, 'Vulgar language');
           return;
         }
       }
@@ -741,9 +801,9 @@ async function startBot() {
         const linkRegex = /(https?:\/\/[^\s]+|wa\.me\/[^\s]+|chat\.whatsapp\.com\/[^\s]+)/i;
         if (linkRegex.test(text)) {
           await sock.sendMessage(jid, {
-            delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: sender }
+            delete: { remoteJid: jid, fromMe: false, id: msg.key.id, participant: rawSender }
           }).catch(() => {});
-          await handleStrike(sock, jid, sender, 'Links');
+          await handleStrike(sock, jid, sender, 'Unauthorized link');
           return;
         }
       }
@@ -762,18 +822,22 @@ async function startBot() {
           await sock.groupSettingUpdate(jid, 'announcement');
           await clearLockTime(jid);
           await sock.sendMessage(jid, { text: '🔒 Group locked' });
+        } else {
+          await sock.sendMessage(jid, { text: '🔒 Group is already locked' });
         }
       } else if (command === '.lock clear') {
         await clearLockTime(jid);
-        await sock.sendMessage(jid, { text: '🔓 Lock schedule cleared' });
+        await sock.sendMessage(jid, { text: '🗑️ Lock schedule cleared' });
       } else if (command.startsWith('.lock ')) {
         const time = parseTimeTo24h(text.slice(6));
         if (!time) {
-          await sock.sendMessage(jid, { text: '❌ Invalid time' });
+          await sock.sendMessage(jid, { text: '❌ Invalid time. Use formats like: 9PM, 9:30PM, 21:00' });
           return;
         }
         if (await setScheduledLockTime(jid, time)) {
-          await sock.sendMessage(jid, { text: `🔒 Auto-lock at ${formatTime24to12(time)}` });
+          await sock.sendMessage(jid, { text: `🔒 Auto-lock scheduled for ${formatTime24to12(time)}` });
+        } else {
+          await sock.sendMessage(jid, { text: '❌ Failed to save lock schedule. Try again.' });
         }
       } else if (command === '.unlock') {
         const meta = await sock.groupMetadata(jid);
@@ -781,56 +845,66 @@ async function startBot() {
           await sock.groupSettingUpdate(jid, 'not_announcement');
           await clearUnlockTime(jid);
           await sock.sendMessage(jid, { text: '🔓 Group unlocked' });
+        } else {
+          await sock.sendMessage(jid, { text: '🔓 Group is already unlocked' });
         }
       } else if (command === '.unlock clear') {
         await clearUnlockTime(jid);
-        await sock.sendMessage(jid, { text: '🔒 Unlock schedule cleared' });
+        await sock.sendMessage(jid, { text: '🗑️ Unlock schedule cleared' });
       } else if (command.startsWith('.unlock ')) {
         const time = parseTimeTo24h(text.slice(8));
         if (!time) {
-          await sock.sendMessage(jid, { text: '❌ Invalid time' });
+          await sock.sendMessage(jid, { text: '❌ Invalid time. Use formats like: 6AM, 6:30AM, 06:00' });
           return;
         }
         if (await setScheduledUnlockTime(jid, time)) {
-          await sock.sendMessage(jid, { text: `🔓 Auto-unlock at ${formatTime24to12(time)}` });
+          await sock.sendMessage(jid, { text: `🔓 Auto-unlock scheduled for ${formatTime24to12(time)}` });
+        } else {
+          await sock.sendMessage(jid, { text: '❌ Failed to save unlock schedule. Try again.' });
         }
       } else if (command === '.kick' || command.startsWith('.kick ')) {
         const targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
         if (!targets.length) {
-          await sock.sendMessage(jid, { text: '❌ Tag or reply to kick' });
+          await sock.sendMessage(jid, { text: '❌ Tag someone or reply to a message to kick them' });
           return;
         }
         for (const user of targets) {
-          const exists = metadata.participants.some(p => p.id === user);
-          if (!exists) {
+          // Use normalized JID for participant lookup
+          const targetPhone = normalizeJid(user);
+          const participant = metadata.participants.find(p => normalizeJid(p.id) === targetPhone);
+          if (!participant) {
             await sock.sendMessage(jid, {
-              text: `❌ @${user.split('@')[0]} not in group`,
+              text: `❌ @${targetPhone} is not in this group`,
               mentions: [user]
             });
             continue;
           }
-          const isAdminTarget = metadata.participants.find(p => p.id === user)?.admin;
-          if (isAdminTarget) {
-            await sock.sendMessage(jid, { text: '❌ Cannot remove admin' });
+          if (participant.admin === 'admin' || participant.admin === 'superadmin') {
+            await sock.sendMessage(jid, {
+              text: `❌ @${targetPhone} is an admin and cannot be removed`,
+              mentions: [user]
+            });
             continue;
           }
-          await sock.groupParticipantsUpdate(jid, [user], 'remove');
+          await sock.groupParticipantsUpdate(jid, [participant.id], 'remove');
           await sock.sendMessage(jid, {
-            text: `✅ @${user.split('@')[0]} removed`,
-            mentions: [user]
+            text: `✅ @${targetPhone} has been removed`,
+            mentions: [participant.id]
           });
           await delay(500);
         }
       } else if (command === '.strike reset' || command.startsWith('.strike reset ')) {
         const targets = mentioned.length ? mentioned : replyTarget ? [replyTarget] : [];
         if (!targets.length) {
-          await sock.sendMessage(jid, { text: '❌ Tag user to reset strikes' });
+          await sock.sendMessage(jid, { text: '❌ Tag the user whose strikes you want to reset' });
           return;
         }
         for (const user of targets) {
-          if (await resetUserStrikes(jid, user)) {
+          const userPhone = normalizeJid(user);
+          const normalizedUser = `${userPhone}@s.whatsapp.net`;
+          if (await resetUserStrikes(jid, normalizedUser)) {
             await sock.sendMessage(jid, {
-              text: `✅ Strikes cleared`,
+              text: `✅ Strikes cleared for @${userPhone}`,
               mentions: [user]
             });
           }
@@ -908,4 +982,13 @@ process.on('SIGTERM', async () => {
   await saveSession();
   if (sock) sock.end();
   process.exit(0);
+});
+
+// -------- GLOBAL ERROR SAFETY --------
+process.on('unhandledRejection', (reason) => {
+  console.log('⚠️ Unhandled rejection (suppressed):', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.log('⚠️ Uncaught exception (suppressed):', err.message);
 });
