@@ -1,7 +1,7 @@
 // commands.js
-import { incrementUserStrike, resetUserStrikes, getGroupSettings, setGroupSettings } from './db.js';
+import { addUserStrike, resetUserStrikes, getGroupSettings, setGroupSettings } from './db.js';
 
-const vulgarWords = ['bitch', 'shit', 'fuck', 'asshole', 'damn', 'dick'];
+const vulgarWords = ['bitch', 'shit', 'fuck', 'asshole', 'cunt', 'pussy', 'doggystyle'];
 
 export async function handleCommand(sock, msg, text, groupSettings) {
     const from = msg.key.remoteJid;
