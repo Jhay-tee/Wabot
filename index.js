@@ -46,6 +46,7 @@ let botStatus = 'starting';
 let currentQR = null;
 let sock = null;
 let schedulerInterval = null;
+let botInternalId = null; // will be learned from first group add
 
 // -------- SESSION STATE --------
 let creds = null;
@@ -156,18 +157,22 @@ async function getGroupSettings(groupJid) {
       .eq("group_jid", groupJid)
       .maybeSingle();
     if (error) {
-      console.log(`Settings error:`, error.message);
+      console.log(`❌ getGroupSettings error:`, error.message);
       return { bot_active: true, anti_link: true, anti_vulgar: true };
     }
     if (!data) {
-      await supabase
+      // Auto-create if doesn't exist
+      const { error: insertError } = await supabase
         .from("group_settings")
         .insert({ group_jid: groupJid, bot_active: true, anti_link: true, anti_vulgar: true });
+      if (insertError) {
+        console.log(`❌ getGroupSettings insert error:`, insertError.message);
+      }
       return { bot_active: true, anti_link: true, anti_vulgar: true };
     }
     return data;
   } catch (err) {
-    console.log(`Settings exception:`, err.message);
+    console.log(`❌ getGroupSettings exception:`, err.message);
     return { bot_active: true, anti_link: true, anti_vulgar: true };
   }
 }
@@ -178,12 +183,12 @@ async function updateGroupSettings(groupJid, updates) {
       .from("group_settings")
       .upsert({ group_jid: groupJid, ...updates }, { onConflict: 'group_jid' });
     if (error) {
-      console.log(`Update error:`, error.message);
+      console.log(`❌ updateGroupSettings error:`, error.message);
       return false;
     }
     return true;
   } catch (err) {
-    console.log(`Update exception:`, err.message);
+    console.log(`❌ updateGroupSettings exception:`, err.message);
     return false;
   }
 }
@@ -194,12 +199,12 @@ async function ensureGroupSettings(groupJid) {
       .from("group_settings")
       .upsert({ group_jid: groupJid, bot_active: true, anti_link: true, anti_vulgar: true }, { onConflict: 'group_jid' });
     if (error) {
-      console.log(`Ensure error:`, error.message);
+      console.log(`❌ ensureGroupSettings error:`, error.message);
       return false;
     }
     return true;
   } catch (err) {
-    console.log(`Ensure exception:`, err.message);
+    console.log(`❌ ensureGroupSettings exception:`, err.message);
     return false;
   }
 }
@@ -214,12 +219,12 @@ async function getStrikes(groupJid, userJid) {
       .eq("user_jid", userJid)
       .maybeSingle();
     if (error) {
-      console.log(`Strikes error:`, error.message);
+      console.log(`❌ getStrikes error:`, error.message);
       return 0;
     }
     return data?.strikes || 0;
   } catch (err) {
-    console.log(`Strikes exception:`, err.message);
+    console.log(`❌ getStrikes exception:`, err.message);
     return 0;
   }
 }
@@ -236,7 +241,7 @@ async function incrementStrike(groupJid, userJid) {
       );
     return newCount;
   } catch (err) {
-    console.log(`Increment error:`, err.message);
+    console.log(`❌ incrementStrike error:`, err.message);
     return 0;
   }
 }
@@ -250,7 +255,7 @@ async function resetUserStrikes(groupJid, userJid) {
       .eq("user_jid", userJid);
     return true;
   } catch (err) {
-    console.log(`Reset error:`, err.message);
+    console.log(`❌ resetUserStrikes error:`, err.message);
     return false;
   }
 }
@@ -264,12 +269,12 @@ async function getScheduledLock(groupJid) {
       .eq("group_jid", groupJid)
       .maybeSingle();
     if (error) {
-      console.log(`Lock error:`, error.message);
+      console.log(`❌ getScheduledLock error:`, error.message);
       return null;
     }
     return data || { lock_time: null, unlock_time: null };
   } catch (err) {
-    console.log(`Lock exception:`, err.message);
+    console.log(`❌ getScheduledLock exception:`, err.message);
     return null;
   }
 }
@@ -281,7 +286,7 @@ async function setScheduledLockTime(groupJid, lockTime) {
       .upsert({ group_jid: groupJid, lock_time: lockTime }, { onConflict: 'group_jid' });
     return true;
   } catch (err) {
-    console.log(`Set lock error:`, err.message);
+    console.log(`❌ setScheduledLockTime error:`, err.message);
     return false;
   }
 }
@@ -293,7 +298,7 @@ async function setScheduledUnlockTime(groupJid, unlockTime) {
       .upsert({ group_jid: groupJid, unlock_time: unlockTime }, { onConflict: 'group_jid' });
     return true;
   } catch (err) {
-    console.log(`Set unlock error:`, err.message);
+    console.log(`❌ setScheduledUnlockTime error:`, err.message);
     return false;
   }
 }
@@ -305,7 +310,7 @@ async function clearLockTime(groupJid) {
       .update({ lock_time: null })
       .eq("group_jid", groupJid);
   } catch (err) {
-    console.log(`Clear lock error:`, err.message);
+    console.log(`❌ clearLockTime error:`, err.message);
   }
 }
 
@@ -316,7 +321,7 @@ async function clearUnlockTime(groupJid) {
       .update({ unlock_time: null })
       .eq("group_jid", groupJid);
   } catch (err) {
-    console.log(`Clear unlock error:`, err.message);
+    console.log(`❌ clearUnlockTime error:`, err.message);
   }
 }
 
@@ -326,59 +331,42 @@ async function ensureGroupScheduledLocks(groupJid) {
       .from("group_scheduled_locks")
       .upsert({ group_jid: groupJid, lock_time: null, unlock_time: null }, { onConflict: 'group_jid' });
     if (error) {
-      console.log(`Ensure locks error:`, error.message);
+      console.log(`❌ ensureGroupScheduledLocks error:`, error.message);
       return false;
     }
     return true;
   } catch (err) {
-    console.log(`Ensure locks exception:`, err.message);
+    console.log(`❌ ensureGroupScheduledLocks exception:`, err.message);
     return false;
   }
 }
 
+// -------- PROVISION GROUPS (uses learned internal ID) --------
 async function provisionAllGroups(sock) {
   try {
     console.log('🔍 Checking groups...');
     const groups = await sock.groupFetchAllParticipating();
     const botJid = sock.user?.id;
-    if (!botJid) {
-      console.log('❌ No bot JID');
-      return;
-    }
-    
-    // Extract the raw ID (part before @)
-    const botRawId = botJid.split('@')[0];
-    console.log('🤖 Bot raw ID:', botRawId);
-    console.log('🤖 Bot full JID:', botJid);
-    
+    if (!botJid) return;
+
+    // Use learned internal ID if available, otherwise fallback to phone number
+    const matchId = botInternalId || botJid.split('@')[0].split(':')[0];
+    console.log('🔍 Matching with ID:', matchId);
+
     let adminCount = 0;
     for (const [groupJid, meta] of Object.entries(groups)) {
-      console.log(`\n📌 Group: ${meta.subject || groupJid}`);
-      // Log all participants for debugging
-      if (meta.participants) {
-        meta.participants.forEach(p => {
-          console.log(`   Participant: ${p.id} (admin: ${p.admin})`);
-        });
-      }
-      
-      // Find participant by raw ID (works for both @s.whatsapp.net and @lid)
       const botParticipant = meta.participants?.find(p => {
-        const participantRaw = p.id.split('@')[0];
-        return participantRaw === botRawId;
+        const participantId = p.id.split('@')[0];
+        return participantId === matchId;
       });
-      
-      if (botParticipant) {
-        console.log(`   ✅ Bot found! Admin: ${botParticipant.admin}`);
-        if (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin') {
-          adminCount++;
-          await ensureGroupSettings(groupJid);
-          await ensureGroupScheduledLocks(groupJid);
-        }
-      } else {
-        console.log(`   ❌ Bot not found in this group`);
+
+      if (botParticipant && (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin')) {
+        adminCount++;
+        await ensureGroupSettings(groupJid);
+        await ensureGroupScheduledLocks(groupJid);
       }
     }
-    console.log(`\n✅ Found ${adminCount} admin groups`);
+    console.log(`✅ Found ${adminCount} admin groups`);
   } catch (err) {
     console.log('❌ Provision error:', err.message);
   }
@@ -529,7 +517,6 @@ async function startBot() {
     }
   };
 
-  // Use the hardcoded version array
   sock = makeWASocket({
     version: BAILEYS_VERSION,
     auth: { creds: creds || initAuthCreds(), keys: keysHandler },
@@ -609,6 +596,52 @@ async function startBot() {
       creds = sock.authState.creds;
     }
     await saveSession();
+  });
+
+  // -------- GROUP PARTICIPANTS UPDATE (learn internal ID) --------
+  sock.ev.on('group-participants.update', async ({ action, participants, id }) => {
+    try {
+      if (!id || !participants?.length) return;
+
+      // If the bot itself is added
+      if (action === 'add' && participants.includes(sock.user?.id)) {
+        console.log('✅ Bot was added to group, learning its internal ID...');
+        await delay(3000);
+        const meta = await sock.groupMetadata(id);
+        const botParticipant = meta.participants.find(p => p.id === sock.user?.id);
+        if (botParticipant) {
+          botInternalId = botParticipant.id.split('@')[0];
+          console.log('🤖 Bot internal ID learned:', botInternalId);
+          await ensureGroupSettings(id);
+          await ensureGroupScheduledLocks(id);
+          // Send a test message to confirm
+          await sock.sendMessage(id, { text: '✅ Bot is now active in this group!' });
+        }
+      }
+
+      // Welcome new members
+      const memberJoinActions = ['add', 'invite', 'linked_group_join'];
+      if (memberJoinActions.includes(action) && participants?.length > 0) {
+        const settings = await getGroupSettings(id);
+        if (settings.bot_active) {
+          let groupName = 'the group';
+          try {
+            const meta = await sock.groupMetadata(id);
+            groupName = meta.subject || 'the group';
+          } catch {}
+          scheduleWelcome(sock, id, participants, groupName);
+        }
+      }
+
+      // Reset strikes when members leave
+      if (action === 'remove' || action === 'leave') {
+        for (const user of participants) {
+          await resetUserStrikes(id, user).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.error('❌ Group update error:', err.message);
+    }
   });
 
   // -------- MESSAGE HANDLER (all commands) --------
@@ -829,48 +862,6 @@ async function startBot() {
       }
     } catch (err) {
       console.error('❌ Message error:', err.message);
-    }
-  });
-
-  // -------- GROUP PARTICIPANTS UPDATE --------
-  sock.ev.on('group-participants.update', async ({ action, participants, id }) => {
-    try {
-      if (!id || !participants?.length) return;
-       if (action === 'add' && participants.includes(sock.user?.id)) {
-      console.log('✅ Bot was added to group, learning its internal ID...');
-      // Wait a moment for WhatsApp to register
-      await delay(3000);
-      const meta = await sock.groupMetadata(id);
-      // Find the bot's own participant entry
-      const botParticipant = meta.participants.find(p => p.id === sock.user?.id);
-      if (botParticipant) {
-        // Extract the numeric ID (part before @)
-        botInternalId = botParticipant.id.split('@')[0];
-        console.log('🤖 Bot internal ID learned:', botInternalId);
-        // Provision this group immediately
-        await ensureGroupSettings(id);
-        await ensureGroupScheduledLocks(id);
-        // Send a confirmation message to verify it works
-        await sock.sendMessage(id, { text: '✅ Bot is now active in this group!' });
-      }
-    }
-      if (['add', 'invite', 'linked_group_join'].includes(action)) {
-        const settings = await getGroupSettings(id);
-        if (settings.bot_active) {
-          let name = 'the group';
-          try {
-            const meta = await sock.groupMetadata(id);
-            name = meta.subject || 'the group';
-          } catch {}
-          scheduleWelcome(sock, id, participants, name);
-        }
-      } else if (action === 'remove' || action === 'leave') {
-        for (const u of participants) {
-          await resetUserStrikes(id, u).catch(() => {});
-        }
-      }
-    } catch (err) {
-      console.error('❌ Group update error:', err.message);
     }
   });
 }
