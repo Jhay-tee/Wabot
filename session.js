@@ -43,13 +43,12 @@ export const initSession = async () => {
           else keys[cat][id] = data[cat][id];
         }
       }
-      // Save keys immediately, not only when connected
+      // Save keys immediately during pairing
       await saveSession({ creds, keys });
       console.log('🔑 Keys updated and saved to Supabase');
     }
   });
 
-  // Silent logger so Baileys doesn’t dump JSON
   const silentLogger = P({ level: 'silent' });
 
   socketInstance = makeWASocket({
