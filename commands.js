@@ -1,69 +1,191 @@
 // commands.js
-import { addUserStrike, resetUserStrikes, getGroupSettings, setGroupSettings } from './db.js';
+import { CONFIG } from './config.js';
+import {
+  addUserStrike,
+  resetUserStrikes,
+  getGroupSettings,
+  setGroupSettings,
+  setScheduledLocks
+} from './db.js';
+import { formatTime } from './utils.js';
 
-const vulgarWords = ['bitch', 'fuck', 'shit', 'asshole']; // extend as needed
+// Helper: check if user is admin in group
+async function isAdminUser(sock, groupJid, userJid) {
+  const metadata = await sock.groupMetadata(groupJid).catch(() => null);
+  if (!metadata) return false;
+  const participant = metadata.participants.find(p => p.id === userJid);
+  return participant?.admin !== null && participant?.admin !== undefined;
+}
 
 export async function handleCommand(sock, msg) {
-  const senderJid = msg.key.participant || msg.key.remoteJid;
-  const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
   const groupJid = msg.key.remoteJid;
-  const isGroup = groupJid.endsWith('@g.us');
+  if (!groupJid.endsWith('@g.us')) return;
 
-  const groupSettings = await getGroupSettings(groupJid) || {};
+  const senderJid = msg.key.participant || msg.key.remoteJid;
+  const text =
+    msg.message?.conversation ||
+    msg.message?.extendedTextMessage?.text ||
+    '';
+  if (!text.startsWith(CONFIG.BOT_PREFIX)) return;
 
-  // Only handle commands if bot is active
-  if (groupSettings.bot_active === false && text.startsWith('.')) {
-    await sock.sendMessage(groupJid, { text: 'Bot is inactive. Use .bot on to activate.' }, { quoted: msg });
-    return;
-  }
+  const groupSettings = (await getGroupSettings(groupJid)) || {};
+  const isAdmin = await isAdminUser(sock, groupJid, senderJid);
 
-  // Anti-vulgar check (skip admin)
-  const isAdmin = false; // TODO: fetch admin status if needed
-  if (!isAdmin && groupSettings.anti_vulgar) {
-    const lower = text.toLowerCase();
-    if (vulgarWords.some(w => lower.includes(w))) {
-      await sock.sendMessage(groupJid, { text: `@${senderJid.split('@')[0]} This message is not allowed in this group.`, mentions: [senderJid] }, { quoted: msg });
-      await sock.sendMessage(groupJid, { delete: msg.key });
-      return;
-    }
-  }
+  const [cmd, ...args] = text.slice(CONFIG.BOT_PREFIX.length).trim().split(/\s+/);
+  console.log('Executing command:', cmd, 'Args:', args);
 
-  // Admin commands
-  if (!text.startsWith('.')) return; // ignore non-commands
-  console.log('Executing command:', text, 'from', senderJid);
-
-  const [cmd, arg] = text.slice(1).split(' ');
-
-  switch (cmd) {
-    case 'kick':
+  switch (cmd.toLowerCase()) {
+    case 'kick': {
       if (!isAdmin) return;
-      // TODO: Implement remove participant logic
-      console.log('Kick command:', arg);
+      const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
+      const mentioned = ctx.mentionedJid || [];
+      if (mentioned.length > 0) {
+        await sock.groupParticipantsUpdate(groupJid, mentioned, 'remove');
+        await sock.sendMessage(groupJid, {
+          text: `👢 Removed ${mentioned.map(u => `@${u.split('@')[0]}`).join(', ')}`,
+          mentions: mentioned
+        });
+      } else {
+        await sock.sendMessage(groupJid, { text: '❌ No user mentioned to kick.' });
+      }
       break;
+    }
+
     case 'delete':
       if (!isAdmin) return;
       if (!msg.message?.contextInfo?.quotedMessage) return;
       await sock.sendMessage(groupJid, { delete: msg.message.contextInfo.stanzaId });
-      console.log('Delete command executed');
       break;
-    case 'bot':
+
+    case 'bot': {
       if (!isAdmin) return;
-      const active = arg === 'on';
+      const active = args[0] === 'on';
       await setGroupSettings(groupJid, { bot_active: active });
-      await sock.sendMessage(groupJid, { text: `Bot is now ${active ? 'active' : 'inactive'}` });
+      await sock.sendMessage(groupJid, {
+        text: `🤖 Bot is now ${active ? 'active' : 'inactive'}`
+      });
       break;
-    case 'link':
+    }
+
+    case 'link': {
       if (!isAdmin) return;
-      const linkActive = arg === 'on';
+      const linkActive = args[0] === 'on';
       await setGroupSettings(groupJid, { anti_link: linkActive });
+      await sock.sendMessage(groupJid, {
+        text: `🔗 Anti-link is now ${linkActive ? 'enabled' : 'disabled'}`
+      });
       break;
+    }
+
     case 'lock':
       if (!isAdmin) return;
-      // TODO: implement group lock
+      await sock.groupSettingUpdate(groupJid, { announce: true });
+      await sock.sendMessage(groupJid, { text: '🔒 Group locked successfully' });
       break;
+
     case 'unlock':
       if (!isAdmin) return;
-      // TODO: implement group unlock
+      await sock.groupSettingUpdate(groupJid, { announce: false });
+      await sock.sendMessage(groupJid, { text: '🔓 Group unlocked successfully' });
+      break;
+
+    case 'locktime': {
+      if (!isAdmin) return;
+      const timeArg = args[0];
+      if (!timeArg) {
+        await sock.sendMessage(groupJid, { text: '❌ Please provide a lock time (YYYY-MM-DD HH:mm).' });
+        return;
+      }
+      const lockTime = new Date(timeArg);
+      await setScheduledLocks(groupJid, lockTime.toISOString(), null);
+      await sock.sendMessage(groupJid, { text: `⏰ Group will auto-lock at ${formatTime(lockTime)}` });
+      break;
+    }
+
+    case 'unlocktime': {
+      if (!isAdmin) return;
+      const timeArg = args[0];
+      if (!timeArg) {
+        await sock.sendMessage(groupJid, { text: '❌ Please provide an unlock time (YYYY-MM-DD HH:mm).' });
+        return;
+      }
+      const unlockTime = new Date(timeArg);
+      await setScheduledLocks(groupJid, null, unlockTime.toISOString());
+      await sock.sendMessage(groupJid, { text: `⏰ Group will auto-unlock at ${formatTime(unlockTime)}` });
+      break;
+    }
+
+    case 'tagall': {
+      const metadata = await sock.groupMetadata(groupJid).catch(() => null);
+      if (!metadata) return;
+      const mentions = metadata.participants.map(p => p.id);
+      const mentionText = mentions.map(u => `@${u.split('@')[0]}`).join(' ');
+      await sock.sendMessage(groupJid, {
+        text: `📢 Tagging all members:\n${mentionText}`,
+        mentions
+      });
+      break;
+    }
+
+    case 'strike': {
+      if (!isAdmin) return;
+      const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
+      const mentioned = ctx.mentionedJid || [];
+      if (mentioned.length > 0) {
+        for (const user of mentioned) {
+          const strikes = await addUserStrike(groupJid, user);
+          await sock.sendMessage(groupJid, {
+            text: `⚠️ @${user.split('@')[0]} now has ${strikes} strike(s).`,
+            mentions: [user]
+          });
+        }
+      } else {
+        await sock.sendMessage(groupJid, { text: '❌ No user mentioned to strike.' });
+      }
+      break;
+    }
+
+    case 'resetstrikes': {
+      if (!isAdmin) return;
+      const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
+      const mentioned = ctx.mentionedJid || [];
+      if (mentioned.length > 0) {
+        for (const user of mentioned) {
+          await resetUserStrikes(groupJid, user);
+          await sock.sendMessage(groupJid, {
+            text: `✅ Strikes reset for @${user.split('@')[0]}.`,
+            mentions: [user]
+          });
+        }
+      } else {
+        await sock.sendMessage(groupJid, { text: '❌ No user mentioned to reset strikes.' });
+      }
+      break;
+    }
+
+    case 'help': {
+      const helpText = `
+📖 *Bot Commands* (prefix: ${CONFIG.BOT_PREFIX})
+
+👮 Admin only:
+- .kick @user → remove user
+- .delete (reply) → delete message
+- .bot on/off → toggle bot
+- .link on/off → toggle anti-link
+- .lock / .unlock → lock/unlock group
+- .locktime YYYY-MM-DD HH:mm → schedule auto-lock
+- .unlocktime YYYY-MM-DD HH:mm → schedule auto-unlock
+- .strike @user → add strike
+- .resetstrikes @user → reset strikes
+
+👥 Everyone:
+- .tagall → mention all members
+      `;
+      await sock.sendMessage(groupJid, { text: helpText });
+      break;
+    }
+
+    default:
       break;
   }
-                             }
+}

@@ -1,6 +1,7 @@
 // db.js
 import { createClient } from '@supabase/supabase-js';
 import { config } from 'dotenv';
+import { BufferJSON } from '@whiskeysockets/baileys';
 
 config();
 
@@ -14,31 +15,47 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// Session
-export async function getSession() {
+// ======================= SESSION =======================
+
+export async function getSession(id = 1) {
   const { data, error } = await supabase
     .from('wa_sessions')
     .select('auth_data')
-    .eq('id', 1)
+    .eq('id', id)
     .single();
-  if (error) return null;
-  return data;
+
+  if (error || !data?.auth_data) return null;
+  return JSON.parse(data.auth_data, BufferJSON.reviver);
 }
 
-export async function saveSession(authData) {
+export async function saveSession(authState, id = 1) {
+  const serialized = JSON.stringify(authState, BufferJSON.replacer);
   const { error } = await supabase
     .from('wa_sessions')
-    .upsert({ id: 1, auth_data: authData }, { onConflict: ['id'] });
+    .upsert({ id, auth_data: serialized }, { onConflict: ['id'] });
+
   if (error) console.error('Error saving session:', error);
 }
 
-// Group settings
+export async function clearSession(id = 1) {
+  const { error } = await supabase
+    .from('wa_sessions')
+    .update({ auth_data: null })
+    .eq('id', id);
+
+  if (error) console.error('Error clearing session:', error);
+  return true;
+}
+
+// ======================= GROUP SETTINGS =======================
+
 export async function getGroupSettings(groupJid) {
   const { data, error } = await supabase
     .from('group_settings')
     .select('*')
     .eq('group_jid', groupJid)
     .single();
+
   if (error) return null;
   return data;
 }
@@ -47,10 +64,12 @@ export async function setGroupSettings(groupJid, updates) {
   const { error } = await supabase
     .from('group_settings')
     .upsert({ group_jid: groupJid, ...updates }, { onConflict: ['group_jid'] });
+
   if (error) console.error('Error updating group settings:', error);
 }
 
-// Strikes
+// ======================= STRIKES =======================
+
 export async function addUserStrike(groupJid, userJid) {
   const { data } = await supabase
     .from('group_strikes')
@@ -58,12 +77,16 @@ export async function addUserStrike(groupJid, userJid) {
     .eq('group_jid', groupJid)
     .eq('user_jid', userJid)
     .single();
+
   let strikes = data?.strikes ?? 0;
   strikes += 1;
 
   const { error } = await supabase
     .from('group_strikes')
-    .upsert({ group_jid: groupJid, user_jid: userJid, strikes }, { onConflict: ['group_jid', 'user_jid'] });
+    .upsert(
+      { group_jid: groupJid, user_jid: userJid, strikes },
+      { onConflict: ['group_jid', 'user_jid'] }
+    );
 
   if (error) console.error('Error adding strike:', error);
   return strikes;
@@ -72,13 +95,21 @@ export async function addUserStrike(groupJid, userJid) {
 export async function resetUserStrikes(groupJid, userJid) {
   const { error } = await supabase
     .from('group_strikes')
-    .upsert({ group_jid: groupJid, user_jid: userJid, strikes: 0 }, { onConflict: ['group_jid', 'user_jid'] });
+    .upsert(
+      { group_jid: groupJid, user_jid: userJid, strikes: 0 },
+      { onConflict: ['group_jid', 'user_jid'] }
+    );
+
   if (error) console.error('Error resetting strikes:', error);
 }
 
-// Scheduled locks
+// ======================= SCHEDULED LOCKS =======================
+
 export async function getScheduledLocks() {
-  const { data, error } = await supabase.from('group_scheduled_locks').select('*');
+  const { data, error } = await supabase
+    .from('group_scheduled_locks')
+    .select('*');
+
   if (error) return [];
   return data;
 }
@@ -86,6 +117,10 @@ export async function getScheduledLocks() {
 export async function setScheduledLocks(groupJid, lockTime, unlockTime) {
   const { error } = await supabase
     .from('group_scheduled_locks')
-    .upsert({ group_jid: groupJid, lock_time: lockTime, unlock_time: unlockTime }, { onConflict: ['group_jid'] });
+    .upsert(
+      { group_jid: groupJid, lock_time: lockTime, unlock_time: unlockTime },
+      { onConflict: ['group_jid'] }
+    );
+
   if (error) console.error('Error updating scheduled locks:', error);
 }
