@@ -44,9 +44,8 @@ export const initSession = async () => {
           else keys[cat][id] = data[cat][id];
         }
       }
-      // Save keys immediately during pairing
       await saveSession({ creds, keys });
-      console.log('🔑 Keys updated and saved to Supabase');
+      console.log('🔑 Keys updated and saved to Supabase (via keyStore.set)');
     }
   });
 
@@ -95,7 +94,7 @@ export const initSession = async () => {
     console.log('🔑 Credentials updated and saved to Supabase');
   });
 
-  // Save keys immediately
+  // Save keys immediately (critical fix)
   socketInstance.ev.on('keys.update', async (updatedKeys) => {
     for (const cat in updatedKeys) {
       keys[cat] = keys[cat] || {};
@@ -105,7 +104,7 @@ export const initSession = async () => {
       }
     }
     await saveSession({ creds, keys });
-    console.log('🔑 Keys updated and saved to Supabase');
+    console.log('🔑 Keys updated and saved to Supabase (via keys.update event)');
   });
 
   return socketInstance;
