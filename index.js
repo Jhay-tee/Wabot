@@ -54,6 +54,17 @@ let botInternalId = null;
 let creds = null;
 let keys = {};
 
+// Debounced key-save: signal sessions are set via rawKeyStore.set() but that
+// does not fire creds.update, so we must persist keys to Supabase ourselves.
+let _keySaveTimer = null;
+function scheduleKeySave() {
+  if (_keySaveTimer) clearTimeout(_keySaveTimer);
+  _keySaveTimer = setTimeout(() => {
+    _keySaveTimer = null;
+    saveSession().catch(() => {});
+  }, 800);
+}
+
 // -------- HELPERS --------
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
@@ -590,9 +601,15 @@ async function startBot() {
       for (const cat in data) {
         keys[cat] = keys[cat] || {};
         for (const id in data[cat]) {
-          keys[cat][id] = data[cat][id];
+          if (data[cat][id] === null || data[cat][id] === undefined) {
+            delete keys[cat][id];
+          } else {
+            keys[cat][id] = data[cat][id];
+          }
         }
       }
+      // Persist immediately — signal sessions are set here, not via creds.update
+      scheduleKeySave();
     }
   };
 
