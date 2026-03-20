@@ -4,7 +4,8 @@ const {
   DisconnectReason, 
   fetchLatestBaileysVersion,
   initAuthCreds,
-  BufferJSON 
+  BufferJSON,
+  makeCacheableSignalKeyStore
 } = pkg;
 
 import qrcode from "qrcode-terminal";
@@ -46,7 +47,8 @@ let botStatus = 'starting';
 let currentQR = null;
 let sock = null;
 let schedulerInterval = null;
-let botInternalId = null; // will be learned from first group add
+let provisionTimer = null;
+let botInternalId = null;
 
 // -------- SESSION STATE --------
 let creds = null;
@@ -561,23 +563,29 @@ app.get('/health', (req, res) => {
 
 // -------- BOT STARTUP --------
 async function startBot() {
+  // Cancel any pending provision attempt from a previous connection
+  if (provisionTimer) { clearTimeout(provisionTimer); provisionTimer = null; }
+
   if (sock) {
     sock.ev.removeAllListeners();
-    sock.end();
+    try { sock.end(); } catch {}
     sock = null;
   }
 
-  await loadSession(); // this may set creds to null if no session
+  await loadSession();
 
-  const keysHandler = {
-    get: (type, ids) => {
+  const logger = pino({ level: 'silent' });
+
+  // Raw key store backed by in-memory `keys` object
+  const rawKeyStore = {
+    get: async (type, ids) => {
       const data = {};
       for (const id of ids || []) {
-        if (keys[type]?.[id]) data[id] = keys[type][id];
+        if (keys[type]?.[id] !== undefined) data[id] = keys[type][id];
       }
       return data;
     },
-    set: (data) => {
+    set: async (data) => {
       if (!data) return;
       for (const cat in data) {
         keys[cat] = keys[cat] || {};
@@ -588,10 +596,13 @@ async function startBot() {
     }
   };
 
+  // Wrap with Baileys' cacheable store — this fixes "No sessions" encryption errors
+  const keysHandler = makeCacheableSignalKeyStore(rawKeyStore, logger);
+
   sock = makeWASocket({
     version: BAILEYS_VERSION,
     auth: { creds: creds || initAuthCreds(), keys: keysHandler },
-    logger: pino({ level: 'silent' }),
+    logger,
     printQRInTerminal: false,
     browser: ['Ubuntu', 'Chrome', '126.0.0.0'],
     connectTimeoutMs: 60000,
@@ -624,13 +635,23 @@ async function startBot() {
       botStatus = 'connected';
       await saveSession();
       // Wait 15s for WhatsApp multi-device to fully sync before fetching groups
-      setTimeout(() => provisionAllGroups(sock), 15000);
+      if (provisionTimer) clearTimeout(provisionTimer);
+      const currentSock = sock;
+      provisionTimer = setTimeout(() => {
+        provisionTimer = null;
+        if (sock === currentSock && botStatus === 'connected') {
+          provisionAllGroups(sock);
+        }
+      }, 15000);
       if (schedulerInterval) clearInterval(schedulerInterval);
       schedulerInterval = startScheduledLockChecker(sock);
       return;
     }
 
     if (connection === 'close') {
+      // Cancel any pending group provision — connection is gone
+      if (provisionTimer) { clearTimeout(provisionTimer); provisionTimer = null; }
+      botStatus = 'disconnected';
       const code = lastDisconnect?.error?.output?.statusCode;
       const errorMsg = lastDisconnect?.error?.message;
       console.log('❌ Closed with code:', code);
