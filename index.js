@@ -107,6 +107,8 @@ async function startBot() {
       botStatus = "connected";
       await saveSession();
       console.log("✅ CONNECTED");
+      // give Baileys time to sync sessions
+      setTimeout(() => console.log("🔑 Sessions ready for sending"), 15000);
     }
     if (connection === "close") {
       botStatus = "disconnected";
@@ -138,7 +140,6 @@ async function startBot() {
       ).trim();
 
       if (!text.startsWith(".")) return;
-
       const command = text.toLowerCase();
 
       if (command === ".lock") {
@@ -173,4 +174,4 @@ async function startBot() {
   });
 }
 
-startBot();
+startBot(); 
