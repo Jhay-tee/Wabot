@@ -1,90 +1,92 @@
 // index.js
-import pkg from '@whiskeysockets/baileys';
-const { makeWASocket, fetchLatestBaileysVersion, DisconnectReason } = pkg;
-
+import makeWASocket, { fetchLatestBaileysVersion, DisconnectReason } from '@whiskeysockets/baileys';
+import P from 'pino';
+import { config } from 'dotenv';
 import qrcode from 'qrcode-terminal';
+
 import { getSession, saveSession, getGroupSettings, getScheduledLocks } from './db.js';
 import { handleCommand } from './commands.js';
 
-async function startBot() {
-    try {
-        // fetch latest WhatsApp version
-        const [version] = await fetchLatestBaileysVersion();
-        console.log('Using WhatsApp Web version:', version);
+config(); // Load .env variables
 
-        // get session from Supabase
-        let authState = await getSession();
-        if (!authState || !authState.creds) {
-            console.log('No valid session found. You need to scan QR code.');
-            authState = { creds: null, keys: {} };
-        }
+// Supabase URL & Key must be in .env
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
 
-        // initialize WhatsApp socket
-        const sock = makeWASocket({
-            version,
-            auth: authState,
-            printQRInTerminal: true,
-        });
-
-        // QR code event
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, qr, lastDisconnect } = update;
-
-            if (qr) {
-                console.log('Scan this QR code to log in:');
-                qrcode.generate(qr, { small: true });
-            }
-
-            if (connection === 'close') {
-                const reason = lastDisconnect?.error?.output?.statusCode;
-                console.log('Connection closed. Reason:', reason);
-                if (reason !== DisconnectReason.loggedOut) {
-                    console.log('Reconnecting...');
-                    startBot();
-                } else {
-                    console.log('Logged out. Clear session in DB.');
-                    await saveSession({ creds: null, keys: {} });
-                }
-            }
-
-            if (connection === 'open') {
-                console.log('Connected to WhatsApp!');
-            }
-        });
-
-        // update session on creds change
-        sock.ev.on('creds.update', async (creds) => {
-            if (!creds) return;
-            console.log('Session updated, saving to DB...');
-            await saveSession({ creds, keys: authState.keys });
-        });
-
-        // message handling
-        sock.ev.on('messages.upsert', async (msgUpdate) => {
-            try {
-                const messages = msgUpdate.messages;
-                if (!messages || !messages.length) return;
-
-                for (const msg of messages) {
-                    if (!msg.message || msg.key.fromMe) continue; // ignore bot messages
-
-                    // pass the message to commands.js
-                    await handleCommand(sock, msg);
-                }
-            } catch (err) {
-                console.error('Error handling messages:', err);
-            }
-        });
-
-        // periodic tasks: check group locks
-        setInterval(async () => {
-            const locks = await getScheduledLocks();
-            // logic to auto lock/unlock groups based on locks
-            // you can implement inside a helper function
-        }, 30_000); // every 30 seconds
-    } catch (err) {
-        console.error('Failed to start bot:', err);
-    }
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('Supabase URL or Key is missing. Set SUPABASE_URL and SUPABASE_KEY in your .env.');
+  process.exit(1);
 }
 
-startBot();
+// Main bot function
+async function startBot() {
+  try {
+    // Get latest WhatsApp Web version
+    const { version: waVersion } = await fetchLatestBaileysVersion();
+    console.log('Using WhatsApp Web version:', waVersion);
+
+    // Load session from Supabase
+    let session = await getSession();
+    let authState = session?.auth_data || {};
+
+    // Create socket
+    const sock = makeWASocket({
+      logger: P({ level: 'silent' }),
+      printQRInTerminal: true,
+      auth: authState,
+      version: waVersion
+    });
+
+    // QR code handling
+    sock.ev.on('connection.update', (update) => {
+      const { connection, qr } = update;
+      if (qr) {
+        console.log('QR Code received, scan it with WhatsApp:');
+        qrcode.generate(qr, { small: true });
+      }
+      if (connection === 'close') {
+        const reason = update.lastDisconnect?.error?.output?.statusCode;
+        console.log('Connection closed, reason:', reason);
+        // Clear session if disconnected unexpectedly
+        if (reason !== DisconnectReason.loggedOut) {
+          saveSession(null);
+        }
+        startBot(); // Reconnect
+      }
+      if (connection === 'open') {
+        console.log('✅ Bot connected successfully!');
+      }
+    });
+
+    // Listen to credential updates and save session
+    sock.ev.on('creds.update', async (newCreds) => {
+      await saveSession({ creds: newCreds });
+      console.log('🔑 Session updated and saved to DB.');
+    });
+
+    // Listen to messages
+    sock.ev.on('messages.upsert', async (m) => {
+      const msg = m.messages[0];
+      if (!msg.message || msg.key.fromMe) return;
+
+      try {
+        await handleCommand(sock, msg); // Handle commands & strikes
+      } catch (err) {
+        console.error('Error handling command:', err);
+      }
+    });
+
+    // Optional: Periodic checks (locks/unlocks)
+    setInterval(async () => {
+      const scheduledLocks = await getScheduledLocks();
+      // You can iterate over scheduledLocks and apply lock/unlock logic
+      // based on current time
+    }, 30_000); // every 30 seconds
+
+  } catch (err) {
+    console.error('Failed to start bot:', err);
+  }
+}
+
+// Start the bot
+startBot(); 
