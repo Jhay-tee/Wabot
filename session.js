@@ -81,9 +81,8 @@ export const initSession = async () => {
         keys = {};
       } else {
         console.warn('Connection closed unexpectedly, resetting session');
-        await clearSession();
-        creds = initAuthCreds();
-        keys = {};
+        
+        
       }
     }
   });
