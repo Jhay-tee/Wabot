@@ -836,6 +836,24 @@ async function startBot() {
   sock.ev.on('group-participants.update', async ({ action, participants, id }) => {
     try {
       if (!id || !participants?.length) return;
+       if (action === 'add' && participants.includes(sock.user?.id)) {
+      console.log('✅ Bot was added to group, learning its internal ID...');
+      // Wait a moment for WhatsApp to register
+      await delay(3000);
+      const meta = await sock.groupMetadata(id);
+      // Find the bot's own participant entry
+      const botParticipant = meta.participants.find(p => p.id === sock.user?.id);
+      if (botParticipant) {
+        // Extract the numeric ID (part before @)
+        botInternalId = botParticipant.id.split('@')[0];
+        console.log('🤖 Bot internal ID learned:', botInternalId);
+        // Provision this group immediately
+        await ensureGroupSettings(id);
+        await ensureGroupScheduledLocks(id);
+        // Send a confirmation message to verify it works
+        await sock.sendMessage(id, { text: '✅ Bot is now active in this group!' });
+      }
+    }
       if (['add', 'invite', 'linked_group_join'].includes(action)) {
         const settings = await getGroupSettings(id);
         if (settings.bot_active) {
