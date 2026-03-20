@@ -1,52 +1,114 @@
-import { createClient } from '@supabase/supabase-js';
-import { CONFIG } from './config.js';
+// database.js
+require('dotenv').config();
+const { createClient } = require('@supabase/supabase-js');
 
-export const supabase = createClient(CONFIG.SUPERBASE_URL, CONFIG.SUPERBASE_KEY);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-// WA Sessions
-export const getSession = async () => {
-  const { data, error } = await supabase.from('wa_sessions').select('*').eq('id', 1).single();
-  if (error) throw error;
-  return data?.auth_data || null;
-};
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-export const saveSession = async (authData) => {
-  const { error } = await supabase.from('wa_sessions').update({ auth_data: authData }).eq('id', 1);
-  if (error) console.error('Error saving session:', error);
-};
+// ---------- INITIALIZATION ----------
+async function initDB() {
+    console.log('✅ Supabase client initialized');
+}
 
-// Group Settings
-export const getGroupSettings = async (groupJid) => {
-  const { data } = await supabase.from('group_settings').select('*').eq('group_jid', groupJid).single();
-  return data;
-};
+// ---------- SESSION HANDLING ----------
+async function getSession() {
+    const { data, error } = await supabase
+        .from('wa_sessions')
+        .select('*')
+        .eq('id', 1)
+        .single();
 
-export const updateGroupSetting = async (groupJid, update) => {
-  await supabase.from('group_settings').upsert({ group_jid: groupJid, ...update });
-};
+    if (error) throw error;
+    return data?.auth_data || null;
+}
 
-// Strikes
-export const getStrikes = async (groupJid, userJid) => {
-  const { data } = await supabase.from('group_strikes').select('*').eq('group_jid', groupJid).eq('user_jid', userJid).single();
-  return data?.strikes || 0;
-};
+async function saveSession(authData) {
+    const { error } = await supabase
+        .from('wa_sessions')
+        .upsert({ id: 1, auth_data: authData, updated_at: new Date() })
+        .eq('id', 1);
 
-export const incrementStrike = async (groupJid, userJid) => {
-  const strikes = await getStrikes(groupJid, userJid);
-  await supabase.from('group_strikes').upsert({ group_jid: groupJid, user_jid: userJid, strikes: strikes + 1 });
-  return strikes + 1;
-};
+    if (error) console.error('[DB] Failed to save session:', error);
+}
 
-export const resetStrikes = async (groupJid, userJid) => {
-  await supabase.from('group_strikes').delete().eq('group_jid', groupJid).eq('user_jid', userJid);
-};
+// ---------- GROUP SETTINGS ----------
+async function getGroupSettings(groupJid) {
+    const { data, error } = await supabase
+        .from('group_settings')
+        .select('*')
+        .eq('group_jid', groupJid)
+        .single();
 
-// Scheduled Locks
-export const getScheduledLock = async (groupJid) => {
-  const { data } = await supabase.from('group_scheduled_locks').select('*').eq('group_jid', groupJid).single();
-  return data;
-};
+    if (error || !data) {
+        // Default settings if not found
+        return {
+            bot_active: true,
+            anti_link: true,
+            anti_vulgar: true,
+            locked: false
+        };
+    }
+    return data;
+}
 
-export const upsertScheduledLock = async (groupJid, lockTime, unlockTime) => {
-  await supabase.from('group_scheduled_locks').upsert({ group_jid: groupJid, lock_time: lockTime, unlock_time: unlockTime });
+async function updateGroupSettings(groupJid, settings) {
+    const { error } = await supabase
+        .from('group_settings')
+        .upsert({ group_jid: groupJid, ...settings });
+    if (error) console.error('[DB] Failed to update group settings:', error);
+}
+
+// ---------- STRIKES ----------
+async function increaseStrike(groupJid, userJid) {
+    const { data } = await supabase
+        .from('group_strikes')
+        .select('*')
+        .eq('group_jid', groupJid)
+        .eq('user_jid', userJid)
+        .single();
+
+    if (data) {
+        const newStrikes = data.strikes + 1;
+        await supabase
+            .from('group_strikes')
+            .update({ strikes: newStrikes, last_strike: new Date() })
+            .eq('group_jid', groupJid)
+            .eq('user_jid', userJid);
+        return newStrikes;
+    } else {
+        await supabase
+            .from('group_strikes')
+            .insert({ group_jid: groupJid, user_jid: userJid, strikes: 1 });
+        return 1;
+    }
+}
+
+// ---------- SCHEDULED LOCKS ----------
+async function getScheduledLocks() {
+    const { data, error } = await supabase
+        .from('group_scheduled_locks')
+        .select('*');
+    if (error) console.error('[DB] Failed to get scheduled locks:', error);
+    return data || [];
+}
+
+async function updateScheduledLock(groupJid, lockTime, unlockTime) {
+    const { error } = await supabase
+        .from('group_scheduled_locks')
+        .upsert({ group_jid: groupJid, lock_time: lockTime, unlock_time: unlockTime });
+    if (error) console.error('[DB] Failed to update scheduled lock:', error);
+}
+
+module.exports = {
+    supabase,
+    initDB,
+    getSession,
+    saveSession,
+    getGroupSettings,
+    updateGroupSettings,
+    increaseStrike,
+    getScheduledLocks,
+    updateScheduledLock
 };
