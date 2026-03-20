@@ -116,6 +116,9 @@ async function loadSession() {
     }
     if (!data?.auth_data) {
       console.log('📱 No session found - will generate QR');
+      // Reset in-memory credentials to force fresh start
+      creds = null;
+      keys = {};
       return false;
     }
     const session = JSON.parse(data.auth_data, BufferJSON.reviver);
@@ -125,6 +128,9 @@ async function loadSession() {
     return true;
   } catch (err) {
     console.log('Load error:', err.message);
+    // On error, also reset credentials
+    creds = null;
+    keys = {};
     return false;
   }
 }
@@ -145,6 +151,21 @@ async function saveSession() {
   } catch (err) {
     console.error('❌ Save exception:', err);
     return false;
+  }
+}
+
+// -------- CLEAR SESSION (both DB and memory) --------
+async function clearSession() {
+  try {
+    console.log('🗑️ Clearing session from Supabase...');
+    await supabase.from(WA_TABLE).update({ auth_data: null }).eq('id', SESSION_ID);
+    // Reset in-memory credentials
+    creds = null;
+    keys = {};
+    botInternalId = null; // also forget learned ID
+    console.log('✅ Session cleared (memory reset)');
+  } catch (err) {
+    console.log('❌ Clear session error:', err?.message);
   }
 }
 
@@ -479,7 +500,9 @@ app.get('/', async (req, res) => {
 
 app.get('/force-qr', async (req, res) => {
   console.log('⚠️ /force-qr endpoint called');
-  await supabase.from(WA_TABLE).update({ auth_data: null }).eq('id', SESSION_ID);
+  await clearSession(); // clears DB and resets memory
+  currentQR = null;
+  botStatus = 'starting';
   if (sock) sock.end();
   res.redirect('/');
 });
@@ -496,7 +519,7 @@ async function startBot() {
     sock = null;
   }
 
-  await loadSession();
+  await loadSession(); // this may set creds to null if no session
 
   const keysHandler = {
     get: (type, ids) => {
@@ -577,9 +600,9 @@ async function startBot() {
         return;
       }
 
-      if (code === 440 || code === DisconnectReason.loggedOut) {
-        console.log('🚫 Logged out – clearing session');
-        await supabase.from(WA_TABLE).update({ auth_data: null }).eq('id', SESSION_ID);
+      if (code === 440 || code === DisconnectReason.loggedOut || code === 401) {
+        console.log('🚫 Logged out / unauthorized – clearing session');
+        await clearSession(); // resets DB and memory
         setTimeout(startBot, 2000);
         return;
       }
