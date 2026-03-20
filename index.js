@@ -1,10 +1,12 @@
-import makeWASocket, {
+import baileys from "@whiskeysockets/baileys";
+
+const {
+  default: makeWASocket,
   DisconnectReason,
   fetchLatestBaileysVersion,
   initAuthCreds,
   BufferJSON
-} from "@whiskeysockets/baileys";
-
+} = baileys; 
 import express from "express";
 import QRCode from "qrcode";
 import qrcode from "qrcode-terminal";
