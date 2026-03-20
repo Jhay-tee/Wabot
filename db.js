@@ -1,85 +1,116 @@
 // db.js
 import { createClient } from '@supabase/supabase-js';
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+// Initialize Supabase client
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+export const supabase = createClient(supabaseUrl, supabaseKey);
 
-export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-// --- WA Sessions ---
+// -------------------
+// WA Sessions
+// -------------------
 export async function getSession() {
     const { data, error } = await supabase
         .from('wa_sessions')
-        .select('auth_data')
+        .select('*')
         .eq('id', 1)
         .single();
-    if (error) throw error;
+    if (error) {
+        console.error('getSession error:', error);
+        return null;
+    }
     return data?.auth_data || null;
 }
 
 export async function saveSession(authData) {
-    // Only save if valid object
-    if (!authData) return;
-    await supabase
+    const { error } = await supabase
         .from('wa_sessions')
-        .update({ auth_data: authData, updated_at: new Date().toISOString() })
-        .eq('id', 1);
+        .upsert({ id: 1, auth_data: authData });
+    if (error) console.error('saveSession error:', error);
 }
 
-// --- Group Settings ---
-export async function getGroupSettings(groupJid) {
-    const { data } = await supabase
+// -------------------
+// Group Settings
+// -------------------
+export async function getGroupSettings(group_jid) {
+    const { data, error } = await supabase
         .from('group_settings')
         .select('*')
-        .eq('group_jid', groupJid)
+        .eq('group_jid', group_jid)
         .single();
-    return data || null;
+    if (error) {
+        console.error('getGroupSettings error:', error);
+        return null;
+    }
+    return data;
 }
 
-export async function setGroupSettings(groupJid, settings) {
-    await supabase
+export async function setGroupSettings(group_jid, settings = {}) {
+    const { error } = await supabase
         .from('group_settings')
-        .upsert({ group_jid: groupJid, ...settings });
+        .upsert({ group_jid, ...settings });
+    if (error) console.error('setGroupSettings error:', error);
 }
 
-// --- Strikes ---
-export async function getUserStrikes(groupJid, userJid) {
-    const { data } = await supabase
+// -------------------
+// Group Strikes
+// -------------------
+export async function getUserStrikes(group_jid, user_jid) {
+    const { data, error } = await supabase
         .from('group_strikes')
-        .select('strikes')
-        .eq('group_jid', groupJid)
-        .eq('user_jid', userJid)
+        .select('*')
+        .eq('group_jid', group_jid)
+        .eq('user_jid', user_jid)
         .single();
-    return data?.strikes || 0;
+    if (error) return null;
+    return data;
 }
 
-export async function addUserStrike(groupJid, userJid) {
-    const current = await getUserStrikes(groupJid, userJid);
-    const strikes = current + 1;
-    await supabase
-        .from('group_strikes')
-        .upsert({ group_jid: groupJid, user_jid: userJid, strikes, last_strike: new Date().toISOString() });
-    return strikes;
+export async function incrementUserStrike(group_jid, user_jid) {
+    const current = await getUserStrikes(group_jid, user_jid);
+    if (!current) {
+        const { error } = await supabase
+            .from('group_strikes')
+            .insert({ group_jid, user_jid, strikes: 1 });
+        if (error) console.error('incrementUserStrike error:', error);
+        return 1;
+    } else {
+        const { error } = await supabase
+            .from('group_strikes')
+            .update({ strikes: current.strikes + 1, last_strike: new Date() })
+            .eq('group_jid', group_jid)
+            .eq('user_jid', user_jid);
+        if (error) console.error('incrementUserStrike error:', error);
+        return current.strikes + 1;
+    }
 }
 
-export async function resetUserStrikes(groupJid, userJid) {
-    await supabase
+export async function resetUserStrikes(group_jid, user_jid) {
+    const { error } = await supabase
         .from('group_strikes')
         .delete()
-        .eq('group_jid', groupJid)
-        .eq('user_jid', userJid);
+        .eq('group_jid', group_jid)
+        .eq('user_jid', user_jid);
+    if (error) console.error('resetUserStrikes error:', error);
 }
 
-// --- Scheduled Locks ---
+// -------------------
+// Scheduled Locks
+// -------------------
 export async function getScheduledLocks() {
-    const { data } = await supabase
+    const { data, error } = await supabase
         .from('group_scheduled_locks')
         .select('*');
+    if (error) {
+        console.error('getScheduledLocks error:', error);
+        return [];
+    }
     return data || [];
 }
 
-export async function setScheduledLock(groupJid, lockTime, unlockTime) {
-    await supabase
+export async function setScheduledLocks(group_jid, lock_time = null, unlock_time = null) {
+    const { error } = await supabase
         .from('group_scheduled_locks')
-        .upsert({ group_jid: groupJid, lock_time: lockTime, unlock_time: unlockTime });
-            }
+        .upsert({ group_jid, lock_time, unlock_time });
+    if (error) console.error('setScheduledLocks error:', error);
+}
