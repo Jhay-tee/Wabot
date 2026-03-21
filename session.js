@@ -12,7 +12,6 @@ import { mkdirSync, existsSync } from 'fs';
 import { getSession, saveSession, clearSession } from './db.js';
 
 let socketInstance = null;
-let saveTimeout = null;
 let isConnecting = false;
 
 async function makeSupabaseAuthState() {
@@ -20,34 +19,36 @@ async function makeSupabaseAuthState() {
   if (!existsSync(tempDir)) mkdirSync(tempDir, { recursive: true });
 
   const saved = await getSession();
-  let state;
+  let state, saveCreds;
 
-  if (saved) {
-    console.log('✅ Restored auth state from Supabase');
+  if (saved && saved.creds?.registered) {
+    // ✅ Valid session
+    console.log('✅ Restored valid auth state from Supabase');
     state = saved;
-  } else {
-    console.warn('⚠️ No saved auth found. Creating new.');
-    const { state: newState } = await useMultiFileAuthState(tempDir);
-    state = newState;
-  }
-
-  const saveState = async () => {
-    try {
+    const { saveCreds: localSaveCreds } = await useMultiFileAuthState(tempDir);
+    saveCreds = async () => {
       await saveSession(state);
-      console.log('💾 Auth state saved to Supabase');
-    } catch (err) {
-      console.error('❌ Failed to save auth state:', err);
+      await localSaveCreds();
+      console.log('💾 Auth state updated (Supabase + local)');
+    };
+  } else {
+    if (saved) {
+      console.warn('⚠️ Saved session is stale (registered=false). Clearing...');
+      await clearSession();
     }
-  };
-
-  const debouncedSave = () => {
-    clearTimeout(saveTimeout);
-    saveTimeout = setTimeout(saveState, 4000);
-  };
+    console.warn('⚠️ No valid auth found. Creating new.');
+    const { state: newState, saveCreds: newSaveCreds } = await useMultiFileAuthState(tempDir);
+    state = newState;
+    saveCreds = async () => {
+      await saveSession(state);
+      await newSaveCreds();
+      console.log('💾 Auth state saved to Supabase + local');
+    };
+  }
 
   return {
     state,
-    saveCreds: debouncedSave,
+    saveCreds,
     clear: async () => {
       await clearSession();
       console.log('🗑️ Auth state cleared');
@@ -61,7 +62,6 @@ export const initSession = async () => {
 
   try {
     const { state, saveCreds } = await makeSupabaseAuthState();
-
     const { version } = await fetchLatestBaileysVersion().catch(() => ({
       version: [2, 3000, 1029030078],
     }));
@@ -81,6 +81,7 @@ export const initSession = async () => {
       markOnlineOnConnect: true,
     });
 
+    // ✅ Persist creds on every update
     socketInstance.ev.on('creds.update', saveCreds);
 
     socketInstance.ev.on('connection.update', async (update) => {
@@ -94,7 +95,7 @@ export const initSession = async () => {
       if (connection === 'open') {
         console.log('✅ Connected to WhatsApp');
         isConnecting = false;
-        saveCreds();
+        await saveCreds(); // save immediately on connect
       }
 
       if (connection === 'close') {
@@ -104,7 +105,6 @@ export const initSession = async () => {
           : lastDisconnect?.error?.statusCode ?? 'unknown';
 
         console.log(`Connection closed (code: ${statusCode})`, lastDisconnect?.error);
-        // You can trigger reconnect here if desired
       }
     });
 

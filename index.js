@@ -92,30 +92,49 @@ async function startBot() {
       // Non‑admins: do nothing, commands ignored
     });
 
-    sock.ev.on('connection.update', (update) => {
-      const { connection, qr } = update;
-      if (qr) {
-        sock.qrString = qr;
-        qrcode.generate(qr, { small: true }); // still prints in terminal
-      }
-      if (connection === 'open') {
-        console.log('🎉 Connected to WhatsApp');
-        isConnected = true;
-        reconnectAttempts = 0;
-        startScheduler();
-      }
-      if (connection === 'close') {
-        isConnected = false;
-        console.warn('Connection closed, restarting...');
-        handleReconnect();
-      }
-    });
+    sock.ev.on('connection.update', async (update) => {
+  const { connection, lastDisconnect, qr } = update;
 
-  } catch (err) {
-    console.error('Failed to start bot:', err.message || err);
+  if (qr) {
+    sock.qrString = qr;
+    qrcode.generate(qr, { small: true }); // still prints in terminal
+  }
+
+  if (connection === 'open') {
+    console.log('🎉 Connected to WhatsApp');
+    isConnected = true;
+    reconnectAttempts = 0;
+    startScheduler();
+  }
+
+  if (connection === 'close') {
+    isConnected = false;
+    const statusCode = (lastDisconnect?.error instanceof Boom)
+      ? lastDisconnect.error.output?.statusCode
+      : lastDisconnect?.error?.statusCode ?? 'unknown';
+
+    console.warn(`Connection closed (code: ${statusCode})`);
+
+    // 🔑 Only clear session if WhatsApp explicitly logged us out
+    if (statusCode === 401) {
+      console.error('⚠️ Logged out from WhatsApp. Clearing session...');
+      try {
+        await clearSession();
+      } catch (e) {
+        console.error('Failed to clear session:', e.message);
+      }
+    }
+
     handleReconnect();
   }
-}
+});
+
+
+    } catch (err) {
+      console.error('Failed to start bot:', err.message || err);
+      handleReconnect();
+    }
+  }
 
 function handleReconnect() {
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
