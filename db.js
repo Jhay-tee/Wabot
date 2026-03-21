@@ -1,5 +1,6 @@
 // db.js
 import { createClient } from '@supabase/supabase-js';
+import { BufferJSON } from '@whiskeysockets/baileys';
 import 'dotenv/config';
 
 const url = process.env.SUPABASE_URL;
@@ -13,7 +14,7 @@ if (!url || !key) {
 const supabase = createClient(url, key);
 
 // ────────────────────────────────────────────────
-// Auth session (Baileys v7 compatible – no BufferJSON)
+// Auth session (Baileys v7 compatible – with BufferJSON)
 // ────────────────────────────────────────────────
 
 export async function getSession(id = 1) {
@@ -31,7 +32,8 @@ export async function getSession(id = 1) {
   if (!data?.auth_data) return null;
 
   try {
-    return JSON.parse(data.auth_data);
+    // Use BufferJSON.reviver to restore Buffers
+    return JSON.parse(data.auth_data, BufferJSON.reviver);
   } catch (e) {
     console.error('Failed to parse stored auth data:', e.message);
     return null;
@@ -45,7 +47,8 @@ export async function saveSession(authState, id = 1) {
   }
 
   try {
-    const payload = JSON.stringify(authState);
+    // Use BufferJSON.replacer to serialize Buffers
+    const payload = JSON.stringify(authState, BufferJSON.replacer);
 
     const { error } = await supabase
       .from('wa_sessions')
@@ -53,7 +56,7 @@ export async function saveSession(authState, id = 1) {
 
     if (error) throw error;
 
-    console.log('Auth state saved');
+    console.log('💾 Auth state saved to Supabase');
   } catch (err) {
     console.error('saveSession failed:', err.message);
   }
@@ -68,7 +71,7 @@ export async function clearSession(id = 1) {
 
     if (error) throw error;
 
-    console.log('Session cleared');
+    console.log('🗑️ Session cleared');
   } catch (err) {
     console.error('clearSession failed:', err.message);
   }

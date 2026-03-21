@@ -16,7 +16,6 @@ let socketInstance = null;
 let saveTimeout = null;
 let isConnecting = false;
 
-// Supabase-backed auth state
 async function makeSupabaseAuthState() {
   const tempDir = join(process.cwd(), 'auth_info_temp');
   if (!existsSync(tempDir)) mkdirSync(tempDir, { recursive: true });
@@ -106,8 +105,6 @@ export const initSession = async () => {
           : lastDisconnect?.error?.statusCode ?? 'unknown';
 
         console.log(`Connection closed (code: ${statusCode})`, lastDisconnect?.error);
-
-        // index.js handles reconnect logic
       }
     });
 

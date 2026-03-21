@@ -1,14 +1,13 @@
 // index.js
 import express from 'express';
 import qrcode from 'qrcode-terminal';
-import 'dotenv/config';  // loads .env automatically in v7-era projects
+import 'dotenv/config';
 
 import { initSession, getSocket } from './session.js';
 import { startScheduler } from './scheduler.js';
 
 const app = express();
 
-let latestQR = null;
 let isConnected = false;
 let reconnectAttempts = 0;
 
@@ -42,34 +41,42 @@ app.get('/', (req, res) => {
       <style>
         body { font-family:system-ui; background:#f8f9fa; text-align:center; padding:20px; }
       </style>
-      <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
+      <!-- Load QRCode library -->
+      <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
       <script>
         async function updateQR() {
           try {
-            const r = await fetch('/qr');
+            const r = await fetch('/qr'); // same origin, correct port
             if (!r.ok) return;
             const { qr } = await r.json();
             if (!qr) return;
-            document.getElementById('qrcode').innerHTML = '';
-            QRCode.toCanvas(qr, { 
-              width: 300,
-              errorCorrectionLevel: 'H',
-              margin: 2
-            }, (err, canvas) => {
-              if (!err) document.getElementById('qrcode').appendChild(canvas);
+
+            const container = document.getElementById('qrcode');
+            container.innerHTML = '';
+
+            const canvas = document.createElement('canvas');
+            QRCode.toCanvas(canvas, qr, { width: 300 }, function (error) {
+              if (error) {
+                console.error('QR render error:', error);
+              } else {
+                container.appendChild(canvas);
+              }
             });
-          } catch {}
+          } catch (err) {
+            console.error('updateQR failed:', err);
+          }
         }
         updateQR();
-        setInterval(updateQR, 14000);
+        setInterval(updateQR, 10000);
       </script>
     `);
   }
 });
 
 app.get('/qr', (req, res) => {
-  if (latestQR && !isConnected) {
-    res.json({ qr: latestQR });
+  const sock = getSocket();
+  if (sock?.qrString && !isConnected) {
+    res.json({ qr: sock.qrString });
   } else {
     res.status(404).json({ error: 'No QR code active' });
   }
@@ -80,7 +87,7 @@ app.get('/health', (req, res) => {
     status: isConnected ? 'connected' : 'disconnected',
     uptimeSeconds: Math.floor(process.uptime()),
     reconnectAttempts,
-    qrActive: !!latestQR && !isConnected,
+    qrActive: !!getSocket()?.qrString && !isConnected,
     timestamp: new Date().toISOString(),
   });
 });
@@ -96,40 +103,24 @@ async function startBot() {
     const sock = await initSession();
 
     sock.ev.on('connection.update', (update) => {
-      const { connection, qr, lastDisconnect } = update;
+      const { connection, qr } = update;
 
-      // ── QR ───────────────────────────────────────
       if (qr && !isConnected) {
-        latestQR = qr;
-        console.log('New QR generated');
-        qrcode.generate(qr, { small: true });
+        sock.qrString = qr; // save QR string for /qr
+        console.log('📷 New QR generated');
+        qrcode.generate(qr, { small: true }); // terminal display
       }
 
-      // ── Connected ────────────────────────────────
       if (connection === 'open') {
         console.log('🎉 Connected to WhatsApp');
         isConnected = true;
-        latestQR = null;
         reconnectAttempts = 0;
         startScheduler();
       }
 
-      // ── Disconnected ─────────────────────────────
       if (connection === 'close') {
         isConnected = false;
-        latestQR = null;
-
-        const status = lastDisconnect?.error?.output?.statusCode
-                     ?? lastDisconnect?.error?.statusCode
-                     ?? 'unknown';
-
-        console.log(`Disconnected (reason: ${status})`);
-
-        if (status === 405) {
-          console.log('Logged out / bad session → clearing credentials');
-          // clearSession() is called inside session.js close handler
-        }
-
+        console.warn('Connection closed, restarting...');
         handleReconnect();
       }
     });
@@ -154,7 +145,7 @@ function handleReconnect() {
 }
 
 // ────────────────────────────────────────────────
-// Graceful shutdown & global error handling
+// Shutdown & error handling
 // ────────────────────────────────────────────────
 
 process.on('SIGINT', async () => {
@@ -177,16 +168,9 @@ process.on('SIGTERM', () => {
 });
 
 process.on('uncaughtException', (err) => {
-  if (err.message?.includes('Connection') || 
-      err?.output?.statusCode === 428 || 
-      err?.output?.statusCode === 440) {
-    console.log('Recoverable WA connection error – reconnecting');
-    isConnected = false;
-    handleReconnect();
-  } else {
-    console.error('UNCAUGHT EXCEPTION:', err);
-    process.exit(1);
-  }
+  console.error('UNCAUGHT EXCEPTION:', err);
+  isConnected = false;
+  handleReconnect();
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -196,7 +180,7 @@ process.on('unhandledRejection', (reason) => {
 // Start everything
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`🚀 Server listening on port ${PORT}`);
 });
 
 startBot();
