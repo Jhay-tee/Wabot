@@ -7,7 +7,8 @@ import { initSession, getSocket } from './session.js';
 import { startScheduler } from './scheduler.js';
 import { handleCommand } from './commands.js';
 import { checkAntiLink, checkAntiVulgar } from './anti.js';
-import { isAdminStatic, normalizeJid } from './utils.js';
+import { normalizeJid } from './utils.js';
+import { isAdmin } from './auth.js';  // ✅ Combined admin check
 
 const app = express();
 let isConnected = false;
@@ -21,33 +22,7 @@ const BASE_RECONNECT_DELAY_MS = 10000;
 // ────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  if (isConnected) {
-    res.send(`<h1>✅ WhatsApp Bot is Connected</h1>`);
-  } else {
-    res.send(`
-      <h1>Scan QR to Link WhatsApp</h1>
-      <div id="qrcode"></div>
-      <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
-      <script>
-        async function updateQR() {
-          try {
-            const r = await fetch('/qr');
-            if (!r.ok) return;
-            const { qr } = await r.json();
-            if (!qr) return;
-            const container = document.getElementById('qrcode');
-            container.innerHTML = '';
-            const canvas = document.createElement('canvas');
-            QRCode.toCanvas(canvas, qr, { width: 300 }, (err) => {
-              if (!err) container.appendChild(canvas);
-            });
-          } catch (err) { console.error(err); }
-        }
-        updateQR();
-        setInterval(updateQR, 10000);
-      </script>
-    `);
-  }
+  res.send(isConnected ? '<h1>✅ WhatsApp Bot is Connected</h1>' : '<h1>Scan QR to Link WhatsApp</h1>');
 });
 
 app.get('/qr', (req, res) => {
@@ -78,7 +53,7 @@ async function startBot() {
     console.log('🔄 Starting WhatsApp connection attempt...');
     const sock = await initSession();
 
-    // Listen for incoming messages
+    // 🔑 Listen for incoming messages
     sock.ev.on('messages.upsert', async ({ messages }) => {
       const msg = messages[0];
       if (!msg.message) return;
@@ -93,15 +68,18 @@ async function startBot() {
         msg.message?.videoMessage?.caption ||
         '';
 
-      // Static admin check (you can also use dynamic group admin check)
-      const isAdmin = isAdminStatic(senderJid);
+      // ✅ Production‑ready admin check
+      const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
 
-      // Run moderation checks first
-      await checkAntiLink(text, isAdmin, groupJid, senderJid, sock);
-      await checkAntiVulgar(msg, isAdmin, groupJid, senderJid, sock);
+      // Run moderation checks (apply to non‑admins)
+      await checkAntiLink(text, isAdminFlag, groupJid, senderJid, sock);
+      await checkAntiVulgar(msg, isAdminFlag, groupJid, senderJid, sock);
 
-      // Then run command handler
-      await handleCommand(sock, msg);
+      // Run commands ONLY if admin
+      if (isAdminFlag) {
+        await handleCommand(sock, msg);
+      }
+      // Non‑admins: do nothing, commands ignored
     });
 
     sock.ev.on('connection.update', (update) => {

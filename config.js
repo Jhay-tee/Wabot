@@ -2,7 +2,7 @@ import 'dotenv/config';
 
 export const CONFIG = {
   SUPABASE_URL: process.env.SUPABASE_URL,
-  SUPABASE_KEY: process.env.SUPABASE_KEY,
+  SUPABASE_KEY: process.env.SUPABASE_ANON_KEY,
   NAMESPACE: 'wa_bot',
   BOT_PREFIX: '.',
   ADMIN_IDS: process.env.ADMIN_IDS?.split(',') || [], // optional static admins
