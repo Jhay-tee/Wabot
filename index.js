@@ -22,15 +22,25 @@ const BASE_RECONNECT_DELAY_MS = 10000;
 // ────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.send(isConnected ? '<h1>✅ WhatsApp Bot is Connected</h1>' : '<h1>Scan QR to Link WhatsApp</h1>');
-});
-
-app.get('/qr', (req, res) => {
   const sock = getSocket();
-  if (sock?.qrString && !isConnected) {
-    res.json({ qr: sock.qrString });
+  if (isConnected) {
+    res.send('<h1>✅ WhatsApp Bot is Connected</h1>');
+  } else if (sock?.qrString) {
+    res.send(`
+      <h1>Scan QR to Link WhatsApp</h1>
+      <div id="qrcode"></div>
+      <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+      <script>
+        const qr = "${sock.qrString}";
+        const container = document.getElementById('qrcode');
+        const canvas = document.createElement('canvas');
+        QRCode.toCanvas(canvas, qr, { width: 300 }, (err) => {
+          if (!err) container.appendChild(canvas);
+        });
+      </script>
+    `);
   } else {
-    res.status(404).json({ error: 'No QR code active' });
+    res.send('<h1>No QR code active</h1>');
   }
 });
 
@@ -84,9 +94,9 @@ async function startBot() {
 
     sock.ev.on('connection.update', (update) => {
       const { connection, qr } = update;
-      if (qr && !isConnected) {
+      if (qr) {
         sock.qrString = qr;
-        qrcode.generate(qr, { small: true });
+        qrcode.generate(qr, { small: true }); // still prints in terminal
       }
       if (connection === 'open') {
         console.log('🎉 Connected to WhatsApp');
