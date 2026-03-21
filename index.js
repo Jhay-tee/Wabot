@@ -6,7 +6,7 @@ import 'dotenv/config';
 import { initSession, getSocket } from './session.js';
 import { startScheduler } from './scheduler.js';
 import { handleCommand } from './commands.js';
-import { checkAntiLink, checkAntiVulgar } from './antiSpam.js';
+import { checkAntiLink, checkAntiVulgar } from './anti.js';
 import { isAdminStatic, normalizeJid } from './utils.js';
 
 const app = express();
