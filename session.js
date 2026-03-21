@@ -5,7 +5,6 @@ import {
   useMultiFileAuthState,
   Browsers,
 } from '@whiskeysockets/baileys';
-
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import { join } from 'path';
@@ -88,7 +87,7 @@ export const initSession = async () => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        socketInstance.qrString = qr; // expose QR string
+        socketInstance.qrString = qr;
         console.log('📷 New QR Code received');
       }
 
@@ -105,6 +104,7 @@ export const initSession = async () => {
           : lastDisconnect?.error?.statusCode ?? 'unknown';
 
         console.log(`Connection closed (code: ${statusCode})`, lastDisconnect?.error);
+        // You can trigger reconnect here if desired
       }
     });
 

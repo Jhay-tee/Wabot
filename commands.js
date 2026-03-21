@@ -14,7 +14,7 @@ async function isAdminUser(sock, groupJid, userJid) {
   try {
     const metadata = await sock.groupMetadata(groupJid);
     const participant = metadata.participants.find(p => p.id === userJid);
-    return participant?.admin !== null && participant?.admin !== undefined;
+    return participant?.admin === 'admin' || participant?.admin === 'superadmin';
   } catch (err) {
     console.error('Failed to fetch group metadata for admin check:', err);
     return false;
@@ -52,7 +52,7 @@ export async function handleCommand(sock, msg) {
         if (!isAdmin) return;
         const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
         const mentioned = ctx.mentionedJid || [];
-        
+
         if (mentioned.length === 0) {
           await sock.sendMessage(groupJid, { text: '❌ Please mention user(s) to kick.' });
           return;
@@ -66,16 +66,22 @@ export async function handleCommand(sock, msg) {
         break;
       }
 
-      case 'delete':
+      case 'delete': {
         if (!isAdmin) return;
-        const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-        if (!quoted) {
+        const ctx = msg.message?.extendedTextMessage?.contextInfo;
+        const stanzaId = ctx?.stanzaId;
+        const participant = ctx?.participant;
+
+        if (!stanzaId) {
           await sock.sendMessage(groupJid, { text: '❌ Reply to a message to delete it.' });
           return;
         }
-        const messageId = msg.message.extendedTextMessage.contextInfo.stanzaId;
-        await sock.sendMessage(groupJid, { delete: messageId });
+
+        await sock.sendMessage(groupJid, {
+          delete: { remoteJid: groupJid, id: stanzaId, participant }
+        });
         break;
+      }
 
       case 'bot': {
         if (!isAdmin) return;
@@ -97,17 +103,19 @@ export async function handleCommand(sock, msg) {
         break;
       }
 
-      case 'lock':
+      case 'lock': {
         if (!isAdmin) return;
-        await sock.groupSettingUpdate(groupJid, 'announce', true);
+        await sock.groupSettingUpdate(groupJid, { announce: true });
         await sock.sendMessage(groupJid, { text: '🔒 Group locked successfully' });
         break;
+      }
 
-      case 'unlock':
+      case 'unlock': {
         if (!isAdmin) return;
-        await sock.groupSettingUpdate(groupJid, 'announce', false);
+        await sock.groupSettingUpdate(groupJid, { announce: false });
         await sock.sendMessage(groupJid, { text: '🔓 Group unlocked successfully' });
         break;
+      }
 
       case 'locktime': {
         if (!isAdmin) return;
@@ -167,7 +175,7 @@ export async function handleCommand(sock, msg) {
         if (!isAdmin) return;
         const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
         const mentioned = ctx.mentionedJid || [];
-        
+
         if (mentioned.length === 0) {
           await sock.sendMessage(groupJid, { text: '❌ Please mention user(s) to strike.' });
           return;
@@ -187,7 +195,7 @@ export async function handleCommand(sock, msg) {
         if (!isAdmin) return;
         const ctx = msg.message?.extendedTextMessage?.contextInfo || {};
         const mentioned = ctx.mentionedJid || [];
-        
+
         if (mentioned.length === 0) {
           await sock.sendMessage(groupJid, { text: '❌ Please mention user(s) to reset strikes.' });
           return;

@@ -32,7 +32,6 @@ export async function getSession(id = 1) {
   if (!data?.auth_data) return null;
 
   try {
-    // Use BufferJSON.reviver to restore Buffers
     return JSON.parse(data.auth_data, BufferJSON.reviver);
   } catch (e) {
     console.error('Failed to parse stored auth data:', e.message);
@@ -47,7 +46,6 @@ export async function saveSession(authState, id = 1) {
   }
 
   try {
-    // Use BufferJSON.replacer to serialize Buffers
     const payload = JSON.stringify(authState, BufferJSON.replacer);
 
     const { error } = await supabase

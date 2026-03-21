@@ -31,11 +31,10 @@ export const startScheduler = () => {
 
           if (lockTime <= now) {
             try {
-              await sock.groupSettingUpdate(groupJid, 'announce', true); // true = locked
+              await sock.groupSettingUpdate(groupJid, { announce: true }); // lock group
               logger.success(`🔒 Auto-locked group: ${groupJid}`);
 
-              // Clear the lock_time so it doesn't trigger again every minute
-              await clearUsedLockTime(groupJid);
+              await clearUsedLockTime(groupJid); // clear so it doesn’t repeat
             } catch (err) {
               logger.error(`Failed to auto-lock group ${groupJid}:`, err.message);
             }
@@ -48,11 +47,10 @@ export const startScheduler = () => {
 
           if (unlockTime <= now) {
             try {
-              await sock.groupSettingUpdate(groupJid, 'announce', false); // false = unlocked
+              await sock.groupSettingUpdate(groupJid, { announce: false }); // unlock group
               logger.success(`🔓 Auto-unlocked group: ${groupJid}`);
 
-              // Clear the unlock_time so it doesn't trigger again every minute
-              await clearUsedUnlockTime(groupJid);
+              await clearUsedUnlockTime(groupJid); // clear so it doesn’t repeat
             } catch (err) {
               logger.error(`Failed to auto-unlock group ${groupJid}:`, err.message);
             }

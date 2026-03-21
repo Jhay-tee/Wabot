@@ -5,9 +5,11 @@ import 'dotenv/config';
 
 import { initSession, getSocket } from './session.js';
 import { startScheduler } from './scheduler.js';
+import { handleCommand } from './commands.js';
+import { checkAntiLink, checkAntiVulgar } from './antiSpam.js';
+import { isAdminStatic, normalizeJid } from './utils.js';
 
 const app = express();
-
 let isConnected = false;
 let reconnectAttempts = 0;
 
@@ -20,51 +22,26 @@ const BASE_RECONNECT_DELAY_MS = 10000;
 
 app.get('/', (req, res) => {
   if (isConnected) {
-    res.send(`
-      <h1 style="color: #2ecc71; text-align: center; margin-top: 60px; font-family: system-ui;">
-        ✅ WhatsApp Bot is Connected
-      </h1>
-      <p style="text-align: center; color: #555;">
-        Uptime: ${Math.floor(process.uptime() / 3600)} h 
-        ${Math.floor((process.uptime() % 3600) / 60)} min
-      </p>
-    `);
+    res.send(`<h1>✅ WhatsApp Bot is Connected</h1>`);
   } else {
     res.send(`
-      <h1 style="text-align:center; margin-top:60px; font-family:system-ui;">
-        Scan QR to Link WhatsApp
-      </h1>
-      <div id="qrcontainer" style="margin:40px auto; width:340px; padding:20px; background:white; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.1);">
-        <div id="qrcode"></div>
-      </div>
-
-      <style>
-        body { font-family:system-ui; background:#f8f9fa; text-align:center; padding:20px; }
-      </style>
-      <!-- Load QRCode library -->
+      <h1>Scan QR to Link WhatsApp</h1>
+      <div id="qrcode"></div>
       <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
       <script>
         async function updateQR() {
           try {
-            const r = await fetch('/qr'); // same origin, correct port
+            const r = await fetch('/qr');
             if (!r.ok) return;
             const { qr } = await r.json();
             if (!qr) return;
-
             const container = document.getElementById('qrcode');
             container.innerHTML = '';
-
             const canvas = document.createElement('canvas');
-            QRCode.toCanvas(canvas, qr, { width: 300 }, function (error) {
-              if (error) {
-                console.error('QR render error:', error);
-              } else {
-                container.appendChild(canvas);
-              }
+            QRCode.toCanvas(canvas, qr, { width: 300 }, (err) => {
+              if (!err) container.appendChild(canvas);
             });
-          } catch (err) {
-            console.error('updateQR failed:', err);
-          }
+          } catch (err) { console.error(err); }
         }
         updateQR();
         setInterval(updateQR, 10000);
@@ -99,25 +76,46 @@ app.get('/health', (req, res) => {
 async function startBot() {
   try {
     console.log('🔄 Starting WhatsApp connection attempt...');
-
     const sock = await initSession();
+
+    // Listen for incoming messages
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+      const msg = messages[0];
+      if (!msg.message) return;
+
+      const groupJid = msg.key.remoteJid;
+      const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
+
+      const text =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        msg.message?.imageMessage?.caption ||
+        msg.message?.videoMessage?.caption ||
+        '';
+
+      // Static admin check (you can also use dynamic group admin check)
+      const isAdmin = isAdminStatic(senderJid);
+
+      // Run moderation checks first
+      await checkAntiLink(text, isAdmin, groupJid, senderJid, sock);
+      await checkAntiVulgar(msg, isAdmin, groupJid, senderJid, sock);
+
+      // Then run command handler
+      await handleCommand(sock, msg);
+    });
 
     sock.ev.on('connection.update', (update) => {
       const { connection, qr } = update;
-
       if (qr && !isConnected) {
-        sock.qrString = qr; // save QR string for /qr
-        console.log('📷 New QR generated');
-        qrcode.generate(qr, { small: true }); // terminal display
+        sock.qrString = qr;
+        qrcode.generate(qr, { small: true });
       }
-
       if (connection === 'open') {
         console.log('🎉 Connected to WhatsApp');
         isConnected = true;
         reconnectAttempts = 0;
         startScheduler();
       }
-
       if (connection === 'close') {
         isConnected = false;
         console.warn('Connection closed, restarting...');
@@ -136,11 +134,9 @@ function handleReconnect() {
     console.error('Max reconnect attempts reached. Giving up.');
     return;
   }
-
   reconnectAttempts++;
   const delay = Math.min(BASE_RECONNECT_DELAY_MS * (1.6 ** (reconnectAttempts - 1)), 600000);
-
-  console.log(`Reconnecting in ${Math.round(delay / 1000)} s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+  console.log(`Reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts})`);
   setTimeout(startBot, delay);
 }
 
@@ -152,35 +148,16 @@ process.on('SIGINT', async () => {
   console.log('SIGINT received – shutting down');
   const sock = getSocket();
   if (sock) {
-    try {
-      await sock.logout();
-      console.log('Logged out cleanly');
-    } catch (e) {
-      console.error('Logout failed during shutdown:', e.message);
-    }
+    try { await sock.logout(); } catch (e) { console.error('Logout failed:', e.message); }
   }
   process.exit(0);
 });
 
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received – exiting');
-  process.exit(0);
-});
-
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT EXCEPTION:', err);
-  isConnected = false;
-  handleReconnect();
-});
-
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled rejection:', reason);
-});
+process.on('SIGTERM', () => process.exit(0));
+process.on('uncaughtException', (err) => { console.error('UNCAUGHT EXCEPTION:', err); isConnected = false; handleReconnect(); });
+process.on('unhandledRejection', (reason) => { console.error('Unhandled rejection:', reason); });
 
 // Start everything
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
-});
-
+app.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`));
 startBot();
