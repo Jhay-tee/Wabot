@@ -8,7 +8,9 @@ import { startScheduler } from './scheduler.js';
 import { handleCommand } from './commands.js';
 import { checkAntiLink, checkAntiVulgar } from './anti.js';
 import { normalizeJid } from './utils.js';
-import { isAdmin } from './auth.js';  // ✅ Combined admin check
+import { isAdmin, isBotAdmin } from './auth.js';   // ✅ import both
+import { Boom } from '@hapi/boom';                 // ✅ Fix: import Boom
+import { clearSession } from './db.js';            // ✅ Needed for logout clearing
 
 const app = express();
 let isConnected = false;
@@ -69,8 +71,12 @@ async function startBot() {
       if (!msg.message) return;
 
       const groupJid = msg.key.remoteJid;
-      const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
 
+      // ✅ If bot is not admin in this group, do nothing
+      const botIsAdmin = await isBotAdmin(sock, groupJid);
+      if (!botIsAdmin) return;
+
+      const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
       const text =
         msg.message?.conversation ||
         msg.message?.extendedTextMessage?.text ||
@@ -78,63 +84,61 @@ async function startBot() {
         msg.message?.videoMessage?.caption ||
         '';
 
-      // ✅ Production‑ready admin check
       const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
 
-      // Run moderation checks (apply to non‑admins)
+      // Moderation checks
       await checkAntiLink(text, isAdminFlag, groupJid, senderJid, sock);
       await checkAntiVulgar(msg, isAdminFlag, groupJid, senderJid, sock);
 
-      // Run commands ONLY if admin
+      // Commands only for admins
       if (isAdminFlag) {
         await handleCommand(sock, msg);
       }
-      // Non‑admins: do nothing, commands ignored
     });
 
     sock.ev.on('connection.update', async (update) => {
-  const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect, qr } = update;
 
-  if (qr) {
-    sock.qrString = qr;
-    qrcode.generate(qr, { small: true }); // still prints in terminal
-  }
-
-  if (connection === 'open') {
-    console.log('🎉 Connected to WhatsApp');
-    isConnected = true;
-    reconnectAttempts = 0;
-    startScheduler();
-  }
-
-  if (connection === 'close') {
-    isConnected = false;
-    const statusCode = (lastDisconnect?.error instanceof Boom)
-      ? lastDisconnect.error.output?.statusCode
-      : lastDisconnect?.error?.statusCode ?? 'unknown';
-
-    console.warn(`Connection closed (code: ${statusCode})`);
-
-    // 🔑 Only clear session if WhatsApp explicitly logged us out
-    if (statusCode === 401) {
-      console.error('⚠️ Logged out from WhatsApp. Clearing session...');
-      try {
-        await clearSession();
-      } catch (e) {
-        console.error('Failed to clear session:', e.message);
+      if (qr) {
+        sock.qrString = qr;
+        qrcode.generate(qr, { small: true });
       }
-    }
 
+      if (connection === 'open') {
+        console.log('🎉 Connected to WhatsApp');
+        isConnected = true;
+        reconnectAttempts = 0;
+        startScheduler();
+      }
+
+      if (connection === 'close') {
+        isConnected = false;
+        const statusCode = (lastDisconnect?.error instanceof Boom)
+          ? lastDisconnect.error.output?.statusCode
+          : lastDisconnect?.error?.statusCode ?? 'unknown';
+
+        console.warn(`Connection closed (code: ${statusCode})`);
+
+        if (statusCode === 401) {
+          console.error('⚠️ Logged out from WhatsApp. Clearing session...');
+          try {
+            await clearSession();
+          } catch (e) {
+            console.error('Failed to clear session:', e.message);
+          }
+        } else {
+          console.log('🔄 Transient error, will attempt reconnect.');
+        }
+
+        handleReconnect();
+      }
+    });
+
+  } catch (err) {
+    console.error('Failed to start bot:', err.message || err);
     handleReconnect();
   }
-});
-
-
-    } catch (err) {
-      console.error('Failed to start bot:', err.message || err);
-      handleReconnect();
-    }
-  }
+}
 
 function handleReconnect() {
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
@@ -161,8 +165,14 @@ process.on('SIGINT', async () => {
 });
 
 process.on('SIGTERM', () => process.exit(0));
-process.on('uncaughtException', (err) => { console.error('UNCAUGHT EXCEPTION:', err); isConnected = false; handleReconnect(); });
-process.on('unhandledRejection', (reason) => { console.error('Unhandled rejection:', reason); });
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+  isConnected = false;
+  handleReconnect();
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+});
 
 // Start everything
 const PORT = process.env.PORT || 3000;

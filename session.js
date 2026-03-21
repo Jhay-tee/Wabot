@@ -105,6 +105,12 @@ export const initSession = async () => {
           : lastDisconnect?.error?.statusCode ?? 'unknown';
 
         console.log(`Connection closed (code: ${statusCode})`, lastDisconnect?.error);
+
+        // 🔑 Only clear session if WhatsApp explicitly logged us out
+        if (statusCode === 401) {
+          console.error('⚠️ Logged out from WhatsApp. Clearing session...');
+          await clearSession();
+        }
       }
     });
 
