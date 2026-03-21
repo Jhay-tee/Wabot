@@ -1,10 +1,9 @@
 // session.js
 import {
   makeWASocket,
-  DisconnectReason,
   fetchLatestBaileysVersion,
-  useMultiFileAuthState, // ← recommended helper in v7
-  Browsers,              // ← better browser constants
+  useMultiFileAuthState,
+  Browsers,
 } from '@whiskeysockets/baileys';
 
 import { Boom } from '@hapi/boom';
@@ -17,30 +16,26 @@ let socketInstance = null;
 let saveTimeout = null;
 let isConnecting = false;
 
-// Custom Supabase-backed auth state (v7 style)
+// Supabase-backed auth state
 async function makeSupabaseAuthState() {
-  const tempDir = join(process.cwd(), 'auth_info_temp'); // fallback temp dir
+  const tempDir = join(process.cwd(), 'auth_info_temp');
   if (!existsSync(tempDir)) mkdirSync(tempDir, { recursive: true });
 
-  // Load from Supabase on start
   const saved = await getSession();
   let state;
 
   if (saved) {
     console.log('✅ Restored auth state from Supabase');
-    // In v7, state is more complex — we assume your saveSession stores the full JSON
-    state = saved; // adjust if structure changed
+    state = saved;
   } else {
     console.warn('⚠️ No saved auth found. Creating new.');
-    // Use multi-file style, but we'll override save/load
-    const { state: newState, saveCreds } = await useMultiFileAuthState(tempDir);
+    const { state: newState } = await useMultiFileAuthState(tempDir);
     state = newState;
-    // We'll handle saveCreds ourselves
   }
 
   const saveState = async () => {
     try {
-      await saveSession(state); // your Supabase function — must serialize full state
+      await saveSession(state);
       console.log('💾 Auth state saved to Supabase');
     } catch (err) {
       console.error('❌ Failed to save auth state:', err);
@@ -49,7 +44,7 @@ async function makeSupabaseAuthState() {
 
   const debouncedSave = () => {
     clearTimeout(saveTimeout);
-    saveTimeout = setTimeout(saveState, 4000); // debounce
+    saveTimeout = setTimeout(saveState, 4000);
   };
 
   return {
@@ -70,7 +65,7 @@ export const initSession = async () => {
     const { state, saveCreds } = await makeSupabaseAuthState();
 
     const { version } = await fetchLatestBaileysVersion().catch(() => ({
-      version: [2, 3000, 1029030078], // fallback
+      version: [2, 3000, 1029030078],
     }));
     console.log('📡 Using WA version:', version.join('.'));
 
@@ -81,28 +76,27 @@ export const initSession = async () => {
       printQRInTerminal: false,
       connectTimeoutMs: 60000,
       keepAliveIntervalMs: 30000,
-      browser: Browsers.ubuntu('Chrome'), // ← better in v7
+      browser: Browsers.ubuntu('Chrome'),
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
       generateHighQualityLinkPreview: true,
       markOnlineOnConnect: true,
     });
 
-    // Save on creds update (v7 style)
     socketInstance.ev.on('creds.update', saveCreds);
 
     socketInstance.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // handle QR in index.js instead
-        return;
+        socketInstance.qrString = qr; // expose QR string
+        console.log('📷 New QR Code received');
       }
 
       if (connection === 'open') {
         console.log('✅ Connected to WhatsApp');
         isConnecting = false;
-        saveCreds(); // final save
+        saveCreds();
       }
 
       if (connection === 'close') {
@@ -113,17 +107,7 @@ export const initSession = async () => {
 
         console.log(`Connection closed (code: ${statusCode})`, lastDisconnect?.error);
 
-        const shouldReconnect =
-          statusCode !== DisconnectReason.loggedOut &&
-          statusCode !== DisconnectReason.badSession &&
-          statusCode !== 405; // common logout variants
-
-        if (!shouldReconnect) {
-          console.log('🚪 Logged out or bad session → clearing auth');
-          await clearSession();
-        }
-
-        // index.js handles reconnect
+        // index.js handles reconnect logic
       }
     });
 

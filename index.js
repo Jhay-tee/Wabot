@@ -125,9 +125,7 @@ async function startBot() {
 
         console.log(`Disconnected (reason: ${status})`);
 
-        if (status === DisconnectReason.loggedOut ||
-            status === DisconnectReason.badSession ||
-            status === 405) {
+        if (status === 405) {
           console.log('Logged out / bad session → clearing credentials');
           // clearSession() is called inside session.js close handler
         }
