@@ -22,8 +22,13 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
   const [cmd, ...args] = text.slice(1).split(/\s+/);
   const arg = args.join(' ');
-  const groupJid = groupMetadata.id;
+
+  // ✅ Use remoteJid directly instead of groupMetadata.id
+  const groupJid = msg.key.remoteJid;
   const senderJid = msg.key.participant || msg.key.remoteJid;
+
+  // ✅ Only run in groups
+  if (!groupJid.endsWith('@g.us')) return;
 
   // Dynamic group admin check
   const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
@@ -35,7 +40,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
   }
 
   switch (cmd.toLowerCase()) {
-    // ──────────────── BOT ON/OFF ────────────────
     case 'bot':
       if (arg === 'on') {
         await setGroupSettings(groupJid, { bot_active: true });
@@ -46,7 +50,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       }
       break;
 
-    // ──────────────── ANTI-LINK ────────────────
     case 'link':
       if (arg === 'on') {
         await setGroupSettings(groupJid, { anti_link: true });
@@ -57,7 +60,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       }
       break;
 
-    // ──────────────── VULGAR FILTER ────────────────
     case 'vulgar':
       if (arg === 'on') {
         await setGroupSettings(groupJid, { vulgar_filter: true });
@@ -68,7 +70,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       }
       break;
 
-    // ──────────────── LOCK GROUP ────────────────
     case 'lock':
       if (!arg) {
         await sock.groupSettingUpdate(groupJid, { announce: true });
@@ -84,7 +85,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       }
       break;
 
-    // ──────────────── UNLOCK GROUP ────────────────
     case 'unlock':
       if (!arg) {
         await sock.groupSettingUpdate(groupJid, { announce: false });
@@ -100,19 +100,16 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       }
       break;
 
-    // ──────────────── CLEAR LOCK ────────────────
     case 'lockclear':
       await clearUsedLockTime(groupJid);
       await sock.sendMessage(groupJid, { text: '🗑️ Scheduled lock time cleared' });
       break;
 
-    // ──────────────── CLEAR UNLOCK ────────────────
     case 'unlockclear':
       await clearUsedUnlockTime(groupJid);
       await sock.sendMessage(groupJid, { text: '🗑️ Scheduled unlock time cleared' });
       break;
 
-    // ──────────────── KICK USER ────────────────
     case 'kick':
       if (!msg.message?.extendedTextMessage?.contextInfo?.participant) {
         await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user to kick them' });
@@ -123,7 +120,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       await sock.sendMessage(groupJid, { text: `👢 User ${kickTarget} has been removed` });
       break;
 
-    // ──────────────── DELETE MESSAGE ────────────────
     case 'delete':
       try {
         const stanzaId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
@@ -140,7 +136,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       }
       break;
 
-    // ──────────────── STRIKE USER ────────────────
     case 'strike':
       if (!msg.message?.extendedTextMessage?.contextInfo?.participant) {
         await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user to strike them' });
@@ -151,7 +146,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       await sock.sendMessage(groupJid, { text: `⚠️ Strike added to ${target}. Total strikes: ${strikes}` });
       break;
 
-    // ──────────────── RESET STRIKES ────────────────
     case 'resetstrikes':
       if (!msg.message?.extendedTextMessage?.contextInfo?.participant) {
         await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user to reset their strikes' });
@@ -159,4 +153,45 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       }
       const resetTarget = msg.message.extendedTextMessage.contextInfo.participant;
       await resetUserStrikes(groupJid, resetTarget);
-      await sock.sendMessage(groupJid, { text: `✅ Strikes reset for ${resetTarget
+      await sock.sendMessage(groupJid, { text: `✅ Strikes reset for ${resetTarget}` });
+      break;
+
+    case 'tagall':
+      const mentions = groupMetadata.participants.map(p => p.id);
+      const mentionText = mentions.map(m => `@${m.split('@')[0]}`).join(' ');
+      await sock.sendMessage(groupJid, { text: mentionText, mentions });
+      break;
+
+    case 'help':
+      await sock.sendMessage(groupJid, {
+        text: `📖 Available Commands:
+- .help (everyone)
+- .menu (everyone)
+- .ping (everyone)
+- .bot on/off (admin)
+- .link on/off (admin)
+- .vulgar on/off (admin)
+- .lock [time] (admin)
+- .unlock [time] (admin)
+- .lockclear (admin)
+- .unlockclear (admin)
+- .kick (admin, reply to user)
+- .delete (admin, reply to message)
+- .strike (admin, reply to user)
+- .resetstrikes (admin, reply to user)
+- .tagall (admin)`
+      });
+      break;
+
+    case 'ping':
+      await sock.sendMessage(groupJid, { text: 'pong!' });
+      break;
+
+    case 'menu':
+      await sock.sendMessage(groupJid, { text: '📋 Menu: .help, .ping, .lock, .unlock, .kick, etc.' });
+      break;
+
+    default:
+      break;
+  }
+};
