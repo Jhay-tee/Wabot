@@ -42,9 +42,12 @@ export const isBotAdmin = async (sock, groupJid) => {
   if (!groupJid?.endsWith('@g.us')) return false;
   try {
     const metadata = await sock.groupMetadata(groupJid);
-    const botJid = parseJid(sock.user.id) + '@s.whatsapp.net';
+
+    // ✅ FIX: sock.user.id is already a full JID (e.g. 2348012345678@s.whatsapp.net)
+    const botJid = parseJid(sock.user.id);
+
     const participant = metadata.participants.find(
-      p => parseJid(p.id) === parseJid(botJid)
+      p => parseJid(p.id) === botJid
     );
 
     return participant?.admin === 'admin' || participant?.admin === 'superadmin';
