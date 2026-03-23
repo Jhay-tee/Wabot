@@ -6,7 +6,7 @@ import { initSession, getSocket } from './session.js';
 import { startScheduler } from './scheduler.js';
 import { handleCommand } from './commands.js';
 import { checkAntiLink, checkAntiVulgar } from './anti.js';
-import { normalizeJid, extractText } from './utils.js';   // ✅ import extractText
+import { normalizeJid, extractText } from './utils.js';
 import { isAdmin, isBotAdmin } from './auth.js';
 import { Boom } from '@hapi/boom';
 import { clearSession } from './db.js';
@@ -76,7 +76,7 @@ async function startBot() {
       if (!botIsAdmin) return;
 
       const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
-      const text = extractText(msg);   // ✅ centralized parsing
+      const text = extractText(msg);
 
       const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
 
@@ -90,7 +90,8 @@ async function startBot() {
 
       // Commands only for admins
       if (isAdminFlag) {
-        await handleCommand(sock, msg);
+        const groupMetadata = await sock.groupMetadata(groupJid);
+        await handleCommand(sock, msg, groupMetadata);
       }
     });
 
