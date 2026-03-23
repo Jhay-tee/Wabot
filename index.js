@@ -1,3 +1,5 @@
+// index.js
+
 import express from 'express';
 import qrcode from 'qrcode-terminal';
 import 'dotenv/config';
@@ -77,8 +79,9 @@ async function startBot() {
       // ✅ Check if bot is admin
       const botIsAdmin = await isBotAdmin(sock, groupJid);
 
-      // ✅ Allow .help for everyone, enforce bot admin for other commands
-      if (!botIsAdmin && cmd && cmd !== 'help') return;
+      // ✅ Allow public commands even if bot isn’t admin
+      const publicCommands = ['help', 'menu', 'ping'];
+      if (!botIsAdmin && cmd && !publicCommands.includes(cmd)) return;
 
       // ✅ Check if sender is admin
       const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
@@ -94,8 +97,16 @@ async function startBot() {
         await checkAntiVulgar(msg, isAdminFlag, groupJid, senderJid, sock);
       }
 
-      // ✅ Handle commands
-      const groupMetadata = await sock.groupMetadata(groupJid);
+      // ✅ Handle commands safely
+      let groupMetadata = { id: groupJid, participants: [] };
+      if (groupJid.endsWith('@g.us')) {
+        try {
+          groupMetadata = await sock.groupMetadata(groupJid);
+        } catch (err) {
+          console.error('Failed to fetch group metadata:', err.message);
+        }
+      }
+
       await handleCommand(sock, msg, groupMetadata);
     });
 
