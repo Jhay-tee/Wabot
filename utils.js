@@ -1,3 +1,5 @@
+// utils.js
+
 import { CONFIG } from './config.js';
 
 /**
@@ -18,9 +20,13 @@ export const extractText = (msg) => {
     innerMsg?.extendedTextMessage?.text || // replies/quotes
     innerMsg?.imageMessage?.caption || // image with caption
     innerMsg?.videoMessage?.caption || // video with caption
+    innerMsg?.documentMessage?.caption || // document with caption
+    innerMsg?.audioMessage?.caption || // audio with caption
+    innerMsg?.stickerMessage?.caption || // sticker with caption
     innerMsg?.buttonsResponseMessage?.selectedButtonId || // button press
     innerMsg?.listResponseMessage?.singleSelectReply?.selectedRowId || // list selection
     innerMsg?.templateButtonReplyMessage?.selectedId || // template button reply
+    innerMsg?.pollUpdateMessage?.pollCreationMessage?.name || // poll name
     ''
   );
 };
