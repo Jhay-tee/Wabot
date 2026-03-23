@@ -1,3 +1,5 @@
+// commands.js
+
 import {
   setGroupSettings,
   addUserStrike,
@@ -10,6 +12,7 @@ import {
   extractText,
   formatTime,
   parseTimeString,
+  normalizeJid,
 } from './utils.js';
 import { isAdmin } from './auth.js';
 
@@ -25,7 +28,7 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
   // ✅ Use remoteJid directly instead of groupMetadata.id
   const groupJid = msg.key.remoteJid;
-  const senderJid = msg.key.participant || msg.key.remoteJid;
+  const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
 
   // ✅ Only run in groups
   if (!groupJid.endsWith('@g.us')) return;
@@ -116,8 +119,12 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
         return;
       }
       const kickTarget = msg.message.extendedTextMessage.contextInfo.participant;
-      await sock.groupParticipantsUpdate(groupJid, [kickTarget], 'remove');
-      await sock.sendMessage(groupJid, { text: `👢 User ${kickTarget} has been removed` });
+      try {
+        await sock.groupParticipantsUpdate(groupJid, [kickTarget], 'remove');
+        await sock.sendMessage(groupJid, { text: `👢 User ${kickTarget} has been removed` });
+      } catch (err) {
+        await sock.sendMessage(groupJid, { text: '⚠️ Failed to kick user (bot may not be admin)' });
+      }
       break;
 
     case 'delete':
@@ -132,7 +139,7 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
           await sock.sendMessage(groupJid, { text: '⚠️ Reply to a message to delete it' });
         }
       } catch (err) {
-        console.error('Delete failed:', err.message);
+        await sock.sendMessage(groupJid, { text: '⚠️ Failed to delete message (bot may not be admin)' });
       }
       break;
 
@@ -163,10 +170,10 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       break;
 
     case 'help':
+    case 'menu':
       await sock.sendMessage(groupJid, {
         text: `📖 Available Commands:
-- .help (everyone)
-- .menu (everyone)
+- .help / .menu (everyone)
 - .ping (everyone)
 - .bot on/off (admin)
 - .link on/off (admin)
@@ -185,10 +192,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
     case 'ping':
       await sock.sendMessage(groupJid, { text: 'pong!' });
-      break;
-
-    case 'menu':
-      await sock.sendMessage(groupJid, { text: '📋 Menu: .help, .ping, .lock, .unlock, .kick, etc.' });
       break;
 
     default:
