@@ -1,4 +1,3 @@
-// session.js
 import {
   makeWASocket,
   fetchLatestBaileysVersion,
@@ -22,14 +21,15 @@ async function makeSupabaseAuthState() {
   let state, saveCreds;
 
   if (saved && saved.creds?.registered) {
-    // ✅ Valid session
     console.log('✅ Restored valid auth state from Supabase');
     state = saved;
     const { saveCreds: localSaveCreds } = await useMultiFileAuthState(tempDir);
     saveCreds = async () => {
-      await saveSession(state);
+      if (state.creds?.registered) {
+        await saveSession(state);
+        console.log('💾 Auth state updated (Supabase + local)');
+      }
       await localSaveCreds();
-      console.log('💾 Auth state updated (Supabase + local)');
     };
   } else {
     if (saved) {
@@ -40,20 +40,15 @@ async function makeSupabaseAuthState() {
     const { state: newState, saveCreds: newSaveCreds } = await useMultiFileAuthState(tempDir);
     state = newState;
     saveCreds = async () => {
-      await saveSession(state);
+      if (state.creds?.registered) {
+        await saveSession(state);
+        console.log('💾 Auth state saved to Supabase + local');
+      }
       await newSaveCreds();
-      console.log('💾 Auth state saved to Supabase + local');
     };
   }
 
-  return {
-    state,
-    saveCreds,
-    clear: async () => {
-      await clearSession();
-      console.log('🗑️ Auth state cleared');
-    },
-  };
+  return { state, saveCreds, clear: async () => { await clearSession(); } };
 }
 
 export const initSession = async () => {
@@ -62,9 +57,7 @@ export const initSession = async () => {
 
   try {
     const { state, saveCreds } = await makeSupabaseAuthState();
-    const { version } = await fetchLatestBaileysVersion().catch(() => ({
-      version: [2, 3000, 1029030078],
-    }));
+    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1029030078] }));
     console.log('📡 Using WA version:', version.join('.'));
 
     socketInstance = makeWASocket({
@@ -81,7 +74,6 @@ export const initSession = async () => {
       markOnlineOnConnect: true,
     });
 
-    // ✅ Persist creds on every update
     socketInstance.ev.on('creds.update', saveCreds);
 
     socketInstance.ev.on('connection.update', async (update) => {
@@ -95,7 +87,7 @@ export const initSession = async () => {
       if (connection === 'open') {
         console.log('✅ Connected to WhatsApp');
         isConnecting = false;
-        await saveCreds(); // save immediately on connect
+        await saveCreds();
       }
 
       if (connection === 'close') {
@@ -104,9 +96,8 @@ export const initSession = async () => {
           ? lastDisconnect.error.output?.statusCode
           : lastDisconnect?.error?.statusCode ?? 'unknown';
 
-        console.log(`Connection closed (code: ${statusCode})`, lastDisconnect?.error);
+        console.log(`Connection closed (code: ${statusCode})`);
 
-        // 🔑 Only clear session if WhatsApp explicitly logged us out
         if (statusCode === 401) {
           console.error('⚠️ Logged out from WhatsApp. Clearing session...');
           await clearSession();
