@@ -1,4 +1,3 @@
-// auth.js
 import { isAdminStatic, normalizeJid } from './utils.js';
 
 /**
@@ -19,8 +18,8 @@ export const isAdmin = async (sock, groupJid, userJid) => {
       const participant = metadata.participants.find(p => p.id === cleanJid);
 
       if (participant) {
-        // ✅ Baileys v7 uses boolean flags
-        return participant.admin === true || participant.isAdmin === true;
+        // Baileys v7: admin is a string ('admin' or 'superadmin')
+        return participant.admin === 'admin' || participant.admin === 'superadmin';
       }
       return false;
     } catch (err) {
@@ -44,7 +43,7 @@ export const isBotAdmin = async (sock, groupJid) => {
     const botJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
     const participant = metadata.participants.find(p => p.id === botJid);
 
-    return participant?.admin === true || participant?.isAdmin === true;
+    return participant?.admin === 'admin' || participant?.admin === 'superadmin';
   } catch (err) {
     console.error('Bot admin check failed:', err.message);
     return false;
