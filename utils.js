@@ -6,17 +6,21 @@ import { CONFIG } from './config.js';
  * @returns {string}
  */
 export const extractText = (msg) => {
-  const innerMsg = msg.message?.ephemeralMessage?.message 
-                || msg.message?.viewOnceMessage?.message 
-                || msg.message;
+  // Unwrap ephemeral/viewOnce containers
+  const innerMsg =
+    msg.message?.ephemeralMessage?.message ||
+    msg.message?.viewOnceMessage?.message ||
+    msg.message;
 
+  // ✅ Cover all common message types
   return (
-    innerMsg?.conversation ||
-    innerMsg?.extendedTextMessage?.text ||
-    innerMsg?.imageMessage?.caption ||
-    innerMsg?.videoMessage?.caption ||
-    innerMsg?.buttonsResponseMessage?.selectedButtonId ||
-    innerMsg?.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    innerMsg?.conversation || // plain typed text
+    innerMsg?.extendedTextMessage?.text || // replies/quotes
+    innerMsg?.imageMessage?.caption || // image with caption
+    innerMsg?.videoMessage?.caption || // video with caption
+    innerMsg?.buttonsResponseMessage?.selectedButtonId || // button press
+    innerMsg?.listResponseMessage?.singleSelectReply?.selectedRowId || // list selection
+    innerMsg?.templateButtonReplyMessage?.selectedId || // template button reply
     ''
   );
 };
