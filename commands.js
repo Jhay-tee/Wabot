@@ -28,8 +28,11 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
   // Dynamic group admin check
   const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
 
-  // ✅ Allow .help for everyone, enforce admin for others
-  if (!isAdminFlag && cmd.toLowerCase() !== 'help') return;
+  // ✅ Allow safe commands for everyone, enforce admin for sensitive ones
+  const publicCommands = ['help', 'menu', 'ping'];
+  if (!isAdminFlag && !publicCommands.includes(cmd.toLowerCase())) {
+    return;
+  }
 
   switch (cmd.toLowerCase()) {
     // ──────────────── BOT ON/OFF ────────────────
@@ -156,37 +159,4 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       }
       const resetTarget = msg.message.extendedTextMessage.contextInfo.participant;
       await resetUserStrikes(groupJid, resetTarget);
-      await sock.sendMessage(groupJid, { text: `✅ Strikes reset for ${resetTarget}` });
-      break;
-
-    // ──────────────── TAG ALL ────────────────
-    case 'tagall':
-      const mentions = groupMetadata.participants.map(p => p.id);
-      const mentionText = mentions.map(m => `@${m.split('@')[0]}`).join(' ');
-      await sock.sendMessage(groupJid, { text: mentionText, mentions });
-      break;
-
-    // ──────────────── HELP ────────────────
-    case 'help':
-      await sock.sendMessage(groupJid, {
-        text: `📖 Available Commands:
-- .bot on/off
-- .link on/off
-- .vulgar on/off
-- .lock [time] (or immediate)
-- .unlock [time] (or immediate)
-- .lockclear (cancel scheduled lock)
-- .unlockclear (cancel scheduled unlock)
-- .kick (reply to user)
-- .delete (reply to message)
-- .strike (reply to user)
-- .resetstrikes (reply to user)
-- .tagall (tags everyone) 
-- .help`
-      });
-      break;
-
-    default:
-      break;
-  }
-};
+      await sock.sendMessage(groupJid, { text: `✅ Strikes reset for ${resetTarget
