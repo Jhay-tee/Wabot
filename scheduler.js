@@ -1,4 +1,3 @@
-// scheduler.js
 import { getScheduledLocks, clearUsedLockTime, clearUsedUnlockTime } from './db.js';
 import { logger } from './logger.js';
 import { getSocket } from './session.js';
@@ -27,7 +26,7 @@ export const startScheduler = () => {
 
         // ==================== AUTO LOCK ====================
         if (lock.lock_time) {
-          const lockTime = new Date(lock.lock_time);
+          const lockTime = new Date(lock.lock_time); // ISO string → Date
 
           if (lockTime <= now) {
             try {
@@ -43,7 +42,7 @@ export const startScheduler = () => {
 
         // ==================== AUTO UNLOCK ====================
         if (lock.unlock_time) {
-          const unlockTime = new Date(lock.unlock_time);
+          const unlockTime = new Date(lock.unlock_time); // ISO string → Date
 
           if (unlockTime <= now) {
             try {
