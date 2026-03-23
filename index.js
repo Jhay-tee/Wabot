@@ -69,7 +69,9 @@ async function startBot() {
     // 🔑 Listen for incoming messages
     sock.ev.on('messages.upsert', async ({ messages }) => {
       const msg = messages[0];
+      console.log('RAW MESSAGE:', JSON.stringify(msg.message, null, 2));
       if (!msg.message) return;
+      console.log('RAW MESSAGE:', JSON.stringify(msg.message, null, 2));
 
       const groupJid = msg.key.remoteJid;
       const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
