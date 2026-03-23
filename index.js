@@ -1,4 +1,3 @@
-// index.js
 import express from 'express';
 import qrcode from 'qrcode-terminal';
 import 'dotenv/config';
@@ -7,10 +6,10 @@ import { initSession, getSocket } from './session.js';
 import { startScheduler } from './scheduler.js';
 import { handleCommand } from './commands.js';
 import { checkAntiLink, checkAntiVulgar } from './anti.js';
-import { normalizeJid } from './utils.js';
-import { isAdmin, isBotAdmin } from './auth.js';   // ✅ import both
-import { Boom } from '@hapi/boom';                 // ✅ Fix: import Boom
-import { clearSession } from './db.js';            // ✅ Needed for logout clearing
+import { normalizeJid, extractText } from './utils.js';   // ✅ import extractText
+import { isAdmin, isBotAdmin } from './auth.js';
+import { Boom } from '@hapi/boom';
+import { clearSession } from './db.js';
 
 const app = express();
 let isConnected = false;
@@ -77,14 +76,13 @@ async function startBot() {
       if (!botIsAdmin) return;
 
       const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        msg.message?.videoMessage?.caption ||
-        '';
+      const text = extractText(msg);   // ✅ centralized parsing
 
       const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
+
+      // Debug logs
+      console.log('Parsed text:', text);
+      console.log('Sender admin?', isAdminFlag, 'Bot admin?', botIsAdmin);
 
       // Moderation checks
       await checkAntiLink(text, isAdminFlag, groupJid, senderJid, sock);
