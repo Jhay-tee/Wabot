@@ -181,7 +181,7 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 - .delete (reply to message)
 - .strike (reply to user)
 - .resetstrikes (reply to user)
-- .tagall
+- .tagall (tags everyone) 
 - .help`
       });
       break;
