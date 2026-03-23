@@ -18,6 +18,7 @@ export const extractText = (msg) => {
   return (
     innerMsg?.conversation || // plain typed text
     innerMsg?.extendedTextMessage?.text || // replies/quotes
+    innerMsg?.ephemeralMessage?.message?.extendedTextMessage?.text || // nested case
     innerMsg?.imageMessage?.caption || // image with caption
     innerMsg?.videoMessage?.caption || // video with caption
     innerMsg?.documentMessage?.caption || // document with caption
@@ -89,12 +90,23 @@ export const parseTimeString = (input) => {
 
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Normalize JIDs so comparisons always succeed
+ */
 export const normalizeJid = (jid) => {
   if (!jid) return '';
-  let cleaned = jid.trim();
+  let cleaned = jid.split(':')[0].trim();
+
+  // Convert @c.us → @s.whatsapp.net
+  if (cleaned.endsWith('@c.us')) {
+    cleaned = cleaned.replace('@c.us', '@s.whatsapp.net');
+  }
+
+  // Default to user JID if no suffix
   if (!cleaned.endsWith('@s.whatsapp.net') && !cleaned.endsWith('@g.us')) {
     cleaned += '@s.whatsapp.net';
   }
+
   return cleaned;
 };
 
