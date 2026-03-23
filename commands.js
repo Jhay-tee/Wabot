@@ -3,13 +3,15 @@ import {
   addUserStrike,
   resetUserStrikes,
   setScheduledLocks,
+  clearUsedLockTime,
+  clearUsedUnlockTime,
 } from './db.js';
 import {
   extractText,
-  isAdminStatic,
   formatTime,
   parseTimeString,
 } from './utils.js';
+import { isAdmin } from './auth.js';
 
 /**
  * Handle incoming group commands
@@ -23,17 +25,13 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
   const groupJid = groupMetadata.id;
   const senderJid = msg.key.participant || msg.key.remoteJid;
 
-  // Get current group settings
-  const settings = await setGroupSettings(groupJid, {});
-  const botActive = settings?.bot_active ?? true;
-
-  // Only allow .bot on when bot is inactive
-  if (!botActive && cmd !== 'bot') return;
+  // Dynamic group admin check
+  const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
+  if (!isAdminFlag) return;
 
   switch (cmd.toLowerCase()) {
     // ──────────────── BOT ON/OFF ────────────────
     case 'bot':
-      if (!isAdminStatic(senderJid)) return;
       if (arg === 'on') {
         await setGroupSettings(groupJid, { bot_active: true });
         await sock.sendMessage(groupJid, { text: '🤖 Bot has been activated' });
@@ -45,7 +43,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
     // ──────────────── ANTI-LINK ────────────────
     case 'link':
-      if (!isAdminStatic(senderJid)) return;
       if (arg === 'on') {
         await setGroupSettings(groupJid, { anti_link: true });
         await sock.sendMessage(groupJid, { text: '🔗 Anti-link enabled' });
@@ -57,7 +54,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
     // ──────────────── VULGAR FILTER ────────────────
     case 'vulgar':
-      if (!isAdminStatic(senderJid)) return;
       if (arg === 'on') {
         await setGroupSettings(groupJid, { vulgar_filter: true });
         await sock.sendMessage(groupJid, { text: '🛑 Vulgar filter enabled' });
@@ -69,13 +65,10 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
     // ──────────────── LOCK GROUP ────────────────
     case 'lock':
-      if (!isAdminStatic(senderJid)) return;
       if (!arg) {
-        // Ordinary lock (immediate)
         await sock.groupSettingUpdate(groupJid, { announce: true });
         await sock.sendMessage(groupJid, { text: '🔒 Group locked immediately' });
       } else {
-        // Scheduled lock
         const parsed = parseTimeString(arg);
         if (!parsed) {
           await sock.sendMessage(groupJid, { text: '⚠️ Please specify a valid time (e.g. 6:30pm)' });
@@ -88,13 +81,10 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
     // ──────────────── UNLOCK GROUP ────────────────
     case 'unlock':
-      if (!isAdminStatic(senderJid)) return;
       if (!arg) {
-        // Ordinary unlock (immediate)
         await sock.groupSettingUpdate(groupJid, { announce: false });
         await sock.sendMessage(groupJid, { text: '🔓 Group unlocked immediately' });
       } else {
-        // Scheduled unlock
         const parsed = parseTimeString(arg);
         if (!parsed) {
           await sock.sendMessage(groupJid, { text: '⚠️ Please specify a valid time (e.g. 6:30am)' });
@@ -105,9 +95,20 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       }
       break;
 
+    // ──────────────── CLEAR LOCK ────────────────
+    case 'lockclear':
+      await clearUsedLockTime(groupJid);
+      await sock.sendMessage(groupJid, { text: '🗑️ Scheduled lock time cleared' });
+      break;
+
+    // ──────────────── CLEAR UNLOCK ────────────────
+    case 'unlockclear':
+      await clearUsedUnlockTime(groupJid);
+      await sock.sendMessage(groupJid, { text: '🗑️ Scheduled unlock time cleared' });
+      break;
+
     // ──────────────── KICK USER ────────────────
     case 'kick':
-      if (!isAdminStatic(senderJid)) return;
       if (!msg.message?.extendedTextMessage?.contextInfo?.participant) {
         await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user to kick them' });
         return;
@@ -119,11 +120,16 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
     // ──────────────── DELETE MESSAGE ────────────────
     case 'delete':
-      if (!isAdminStatic(senderJid)) return;
       try {
-        await sock.sendMessage(groupJid, {
-          delete: msg.key, // silently delete the message
-        });
+        const stanzaId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
+        const participant = msg.message?.extendedTextMessage?.contextInfo?.participant;
+        if (stanzaId && participant) {
+          await sock.sendMessage(groupJid, {
+            delete: { remoteJid: groupJid, fromMe: false, id: stanzaId, participant },
+          });
+        } else {
+          await sock.sendMessage(groupJid, { text: '⚠️ Reply to a message to delete it' });
+        }
       } catch (err) {
         console.error('Delete failed:', err.message);
       }
@@ -131,7 +137,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
     // ──────────────── STRIKE USER ────────────────
     case 'strike':
-      if (!isAdminStatic(senderJid)) return;
       if (!msg.message?.extendedTextMessage?.contextInfo?.participant) {
         await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user to strike them' });
         return;
@@ -143,7 +148,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
     // ──────────────── RESET STRIKES ────────────────
     case 'resetstrikes':
-      if (!isAdminStatic(senderJid)) return;
       if (!msg.message?.extendedTextMessage?.contextInfo?.participant) {
         await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user to reset their strikes' });
         return;
@@ -155,7 +159,6 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
     // ──────────────── TAG ALL ────────────────
     case 'tagall':
-      if (!isAdminStatic(senderJid)) return;
       const mentions = groupMetadata.participants.map(p => p.id);
       const mentionText = mentions.map(m => `@${m.split('@')[0]}`).join(' ');
       await sock.sendMessage(groupJid, { text: mentionText, mentions });
@@ -170,6 +173,8 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 - .vulgar on/off
 - .lock [time] (or immediate)
 - .unlock [time] (or immediate)
+- .lockclear (cancel scheduled lock)
+- .unlockclear (cancel scheduled unlock)
 - .kick (reply to user)
 - .delete (reply to message)
 - .strike (reply to user)
