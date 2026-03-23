@@ -1,4 +1,4 @@
-import { isAdminStatic, normalizeJid } from './utils.js';
+import { isAdminStatic, normalizeJid, parseJid } from './utils.js';
 
 /**
  * Check if a given user is an admin.
@@ -15,7 +15,9 @@ export const isAdmin = async (sock, groupJid, userJid) => {
   if (groupJid?.endsWith('@g.us')) {
     try {
       const metadata = await sock.groupMetadata(groupJid);
-      const participant = metadata.participants.find(p => p.id === cleanJid);
+      const participant = metadata.participants.find(
+        p => parseJid(p.id) === parseJid(cleanJid)
+      );
 
       if (participant) {
         // Baileys v7: admin is a string ('admin' or 'superadmin')
@@ -40,8 +42,10 @@ export const isBotAdmin = async (sock, groupJid) => {
   if (!groupJid?.endsWith('@g.us')) return false;
   try {
     const metadata = await sock.groupMetadata(groupJid);
-    const botJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-    const participant = metadata.participants.find(p => p.id === botJid);
+    const botJid = parseJid(sock.user.id) + '@s.whatsapp.net';
+    const participant = metadata.participants.find(
+      p => parseJid(p.id) === parseJid(botJid)
+    );
 
     return participant?.admin === 'admin' || participant?.admin === 'superadmin';
   } catch (err) {
