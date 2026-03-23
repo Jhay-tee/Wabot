@@ -4,7 +4,7 @@ import { isAdminStatic, normalizeJid } from './utils.js';
 /**
  * Check if a given user is an admin.
  * - Static admins (from .env) are always treated as admins.
- * - For groups, checks WhatsApp metadata to see if the user is admin/superadmin.
+ * - For groups, checks WhatsApp metadata to see if the user is admin.
  */
 export const isAdmin = async (sock, groupJid, userJid) => {
   const cleanJid = normalizeJid(userJid);
@@ -19,7 +19,8 @@ export const isAdmin = async (sock, groupJid, userJid) => {
       const participant = metadata.participants.find(p => p.id === cleanJid);
 
       if (participant) {
-        return participant.admin === 'admin' || participant.admin === 'superadmin';
+        // ✅ Baileys v7 uses boolean flags
+        return participant.admin === true || participant.isAdmin === true;
       }
       return false;
     } catch (err) {
@@ -33,7 +34,7 @@ export const isAdmin = async (sock, groupJid, userJid) => {
 
 /**
  * Check if the bot itself is an admin in the group.
- * - Returns true only if the bot’s JID is marked as admin/superadmin in group metadata.
+ * - Returns true only if the bot’s JID is marked as admin in group metadata.
  * - If not a group, returns false.
  */
 export const isBotAdmin = async (sock, groupJid) => {
@@ -42,7 +43,8 @@ export const isBotAdmin = async (sock, groupJid) => {
     const metadata = await sock.groupMetadata(groupJid);
     const botJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
     const participant = metadata.participants.find(p => p.id === botJid);
-    return participant?.admin === 'admin' || participant?.admin === 'superadmin';
+
+    return participant?.admin === true || participant?.isAdmin === true;
   } catch (err) {
     console.error('Bot admin check failed:', err.message);
     return false;
