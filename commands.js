@@ -27,7 +27,9 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
 
   // Dynamic group admin check
   const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
-  if (!isAdminFlag) return;
+
+  // ✅ Allow .help for everyone, enforce admin for others
+  if (!isAdminFlag && cmd.toLowerCase() !== 'help') return;
 
   switch (cmd.toLowerCase()) {
     // ──────────────── BOT ON/OFF ────────────────
