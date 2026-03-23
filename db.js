@@ -1,196 +1,122 @@
-// db.js
-import { createClient } from '@supabase/supabase-js';
-import { BufferJSON } from '@whiskeysockets/baileys';
-import 'dotenv/config';
+import {
+  makeWASocket,
+  fetchLatestBaileysVersion,
+  useMultiFileAuthState,
+  Browsers,
+} from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import pino from 'pino';
+import { join } from 'path';
+import { mkdirSync, existsSync } from 'fs';
+import debounce from 'lodash.debounce';
+import { getSession, saveSession, clearSession } from './db.js';
 
-const url = process.env.SUPABASE_URL;
-const key = process.env.SUPABASE_ANON_KEY;
+let socketInstance = null;
+let isConnecting = false;
 
-if (!url || !key) {
-  console.error('Missing Supabase URL or ANON key');
-  process.exit(1);
+async function makeSupabaseAuthState() {
+  const tempDir = join(process.cwd(), 'auth_info_temp');
+  if (!existsSync(tempDir)) mkdirSync(tempDir, { recursive: true });
+
+  const saved = await getSession();
+  let state, saveCreds;
+
+  if (saved && saved.creds?.registered) {
+    console.log('✅ Restored valid auth state from Supabase');
+    state = saved;
+
+    // Local file fallback
+    const { saveCreds: localSaveCreds } = await useMultiFileAuthState(tempDir);
+
+    // Debounced save to Supabase + local
+    const debouncedSave = debounce(async () => {
+      await saveSession(state);
+      await localSaveCreds();
+      console.log('💾 Auth state updated (Supabase + local)');
+    }, 5000, { leading: true, trailing: true });
+
+    saveCreds = debouncedSave;
+  } else {
+    if (saved) {
+      console.warn('⚠️ Saved session is stale (registered=false). Clearing...');
+      await clearSession();
+    }
+    console.warn('⚠️ No valid auth found. Creating new.');
+    const { state: newState, saveCreds: newSaveCreds } = await useMultiFileAuthState(tempDir);
+    state = newState;
+
+    const debouncedSave = debounce(async () => {
+      await saveSession(state);
+      await newSaveCreds();
+      console.log('💾 Auth state saved to Supabase + local');
+    }, 5000, { leading: true, trailing: true });
+
+    saveCreds = debouncedSave;
+  }
+
+  return { state, saveCreds, clear: async () => { await clearSession(); } };
 }
 
-const supabase = createClient(url, key);
-
-// ────────────────────────────────────────────────
-// Auth session (Baileys v7 compatible – with BufferJSON)
-// ────────────────────────────────────────────────
-
-export async function getSession(id = 1) {
-  const { data, error } = await supabase
-    .from('wa_sessions')
-    .select('auth_data')
-    .eq('id', id)
-    .maybeSingle();
-
-  if (error && error.code !== 'PGRST116') {
-    console.error('getSession → error:', error.message);
-    return null;
-  }
-
-  if (!data?.auth_data) return null;
+export const initSession = async () => {
+  if (isConnecting) return socketInstance;
+  isConnecting = true;
 
   try {
-    return JSON.parse(data.auth_data, BufferJSON.reviver);
-  } catch (e) {
-    console.error('Failed to parse stored auth data:', e.message);
-    return null;
-  }
-}
+    const { state, saveCreds } = await makeSupabaseAuthState();
+    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1029030078] }));
+    console.log('📡 Using WA version:', version.join('.'));
 
-export async function saveSession(authState, id = 1) {
-  if (!authState?.creds) {
-    console.warn('saveSession called with incomplete authState');
-    return;
-  }
+    socketInstance = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: process.env.LOG_LEVEL || 'silent' }),
+      printQRInTerminal: false,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 30000,
+      browser: Browsers.ubuntu('Chrome'),
+      syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
+      generateHighQualityLinkPreview: true,
+      markOnlineOnConnect: true,
+    });
 
-  try {
-    const payload = JSON.stringify(authState, BufferJSON.replacer);
+    socketInstance.ev.on('creds.update', saveCreds);
 
-    const { error } = await supabase
-      .from('wa_sessions')
-      .upsert({ id, auth_data: payload }, { onConflict: 'id' });
+    socketInstance.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-    if (error) throw error;
+      if (qr) {
+        socketInstance.qrString = qr;
+        console.log('📷 New QR Code received');
+      }
 
-    console.log('💾 Auth state saved to Supabase');
+      if (connection === 'open') {
+        console.log('✅ Connected to WhatsApp');
+        isConnecting = false;
+        await saveCreds(); // force save once on connect
+      }
+
+      if (connection === 'close') {
+        isConnecting = false;
+        const statusCode = (lastDisconnect?.error instanceof Boom)
+          ? lastDisconnect.error.output?.statusCode
+          : lastDisconnect?.error?.statusCode ?? 'unknown';
+
+        console.log(`Connection closed (code: ${statusCode})`);
+
+        if (statusCode === 401) {
+          console.error('⚠️ Logged out from WhatsApp. Clearing session...');
+          await clearSession();
+        }
+      }
+    });
+
+    return socketInstance;
   } catch (err) {
-    console.error('saveSession failed:', err.message);
+    console.error('❌ initSession failed:', err);
+    isConnecting = false;
+    throw err;
   }
-}
+};
 
-export async function clearSession(id = 1) {
-  try {
-    const { error } = await supabase
-      .from('wa_sessions')
-      .delete()
-      .eq('id', id);
-
-    if (error) throw error;
-
-    console.log('🗑️ Session cleared');
-  } catch (err) {
-    console.error('clearSession failed:', err.message);
-  }
-}
-
-// ────────────────────────────────────────────────
-// Group settings
-// ────────────────────────────────────────────────
-
-export async function getGroupSettings(groupJid) {
-  const { data, error } = await supabase
-    .from('group_settings')
-    .select('*')
-    .eq('group_jid', groupJid)
-    .maybeSingle();
-
-  if (error) {
-    console.error('getGroupSettings error:', error.message);
-    return null;
-  }
-  return data;
-}
-
-export async function setGroupSettings(groupJid, updates) {
-  const { error } = await supabase
-    .from('group_settings')
-    .upsert({ group_jid: groupJid, ...updates }, { onConflict: 'group_jid' });
-
-  if (error) {
-    console.error('setGroupSettings failed:', error.message);
-  }
-}
-
-// ────────────────────────────────────────────────
-// Strikes
-// ────────────────────────────────────────────────
-
-export async function addUserStrike(groupJid, userJid) {
-  try {
-    const { data } = await supabase
-      .from('group_strikes')
-      .select('strikes')
-      .eq('group_jid', groupJid)
-      .eq('user_jid', userJid)
-      .maybeSingle();
-
-    let strikes = data?.strikes ?? 0;
-    strikes += 1;
-
-    const { error } = await supabase
-      .from('group_strikes')
-      .upsert(
-        { group_jid: groupJid, user_jid: userJid, strikes },
-        { onConflict: ['group_jid', 'user_jid'] }
-      );
-
-    if (error) throw error;
-    return strikes;
-  } catch (err) {
-    console.error('addUserStrike failed:', err.message);
-    return null;
-  }
-}
-
-export async function resetUserStrikes(groupJid, userJid) {
-  const { error } = await supabase
-    .from('group_strikes')
-    .upsert(
-      { group_jid: groupJid, user_jid: userJid, strikes: 0 },
-      { onConflict: ['group_jid', 'user_jid'] }
-    );
-
-  if (error) {
-    console.error('resetUserStrikes failed:', error.message);
-  }
-}
-
-// ────────────────────────────────────────────────
-// Scheduled locks
-// ────────────────────────────────────────────────
-
-export async function getScheduledLocks() {
-  const { data, error } = await supabase
-    .from('group_scheduled_locks')
-    .select('*');
-
-  if (error) {
-    console.error('getScheduledLocks error:', error.message);
-    return [];
-  }
-  return data || [];
-}
-
-export async function setScheduledLocks(groupJid, lockTimeIso, unlockTimeIso) {
-  const row = { group_jid: groupJid };
-  if (lockTimeIso !== undefined) row.lock_time = lockTimeIso;
-  if (unlockTimeIso !== undefined) row.unlock_time = unlockTimeIso;
-
-  const { error } = await supabase
-    .from('group_scheduled_locks')
-    .upsert(row, { onConflict: 'group_jid' });
-
-  if (error) {
-    console.error('setScheduledLocks failed:', error.message);
-  }
-}
-
-export async function clearUsedLockTime(groupJid) {
-  const { error } = await supabase
-    .from('group_scheduled_locks')
-    .update({ lock_time: null })
-    .eq('group_jid', groupJid);
-
-  if (error) console.error('clearUsedLockTime failed:', error.message);
-}
-
-export async function clearUsedUnlockTime(groupJid) {
-  const { error } = await supabase
-    .from('group_scheduled_locks')
-    .update({ unlock_time: null })
-    .eq('group_jid', groupJid);
-
-  if (error) console.error('clearUsedUnlockTime failed:', error.message);
-}
+export const getSocket = () => socketInstance;
