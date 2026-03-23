@@ -1,9 +1,7 @@
-import { isAdminStatic, normalizeJid, parseJid } from './utils.js';
+import { isAdminStatic, normalizeJid } from './utils.js';
 
 /**
  * Check if a given user is an admin.
- * - Static admins (from .env) are always treated as admins.
- * - For groups, checks WhatsApp metadata to see if the user is admin.
  */
 export const isAdmin = async (sock, groupJid, userJid) => {
   const cleanJid = normalizeJid(userJid);
@@ -16,14 +14,10 @@ export const isAdmin = async (sock, groupJid, userJid) => {
     try {
       const metadata = await sock.groupMetadata(groupJid);
       const participant = metadata.participants.find(
-        p => parseJid(p.id) === parseJid(cleanJid)
+        p => normalizeJid(p.id) === cleanJid
       );
 
-      if (participant) {
-        // Baileys v7: admin is a string ('admin' or 'superadmin')
-        return participant.admin === 'admin' || participant.admin === 'superadmin';
-      }
-      return false;
+      return ['admin', 'superadmin'].includes(participant?.admin);
     } catch (err) {
       console.error('Admin check failed:', err.message);
       return false;
@@ -35,22 +29,18 @@ export const isAdmin = async (sock, groupJid, userJid) => {
 
 /**
  * Check if the bot itself is an admin in the group.
- * - Returns true only if the bot’s JID is marked as admin in group metadata.
- * - If not a group, returns false.
  */
 export const isBotAdmin = async (sock, groupJid) => {
   if (!groupJid?.endsWith('@g.us')) return false;
   try {
     const metadata = await sock.groupMetadata(groupJid);
-
-    // ✅ FIX: sock.user.id is already a full JID (e.g. 2348012345678@s.whatsapp.net)
-    const botJid = parseJid(sock.user.id);
+    const botJid = normalizeJid(sock.user.id);
 
     const participant = metadata.participants.find(
-      p => parseJid(p.id) === botJid
+      p => normalizeJid(p.id) === botJid
     );
 
-    return participant?.admin === 'admin' || participant?.admin === 'superadmin';
+    return ['admin', 'superadmin'].includes(participant?.admin);
   } catch (err) {
     console.error('Bot admin check failed:', err.message);
     return false;
