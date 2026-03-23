@@ -70,29 +70,33 @@ async function startBot() {
       if (!msg.message) return;
 
       const groupJid = msg.key.remoteJid;
-
-      // ✅ If bot is not admin in this group, do nothing
-      const botIsAdmin = await isBotAdmin(sock, groupJid);
-      if (!botIsAdmin) return;
-
       const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
-      const text = extractText(msg);
+      const text = extractText(msg).trim();
+      const cmd = text.startsWith('.') ? text.slice(1).split(/\s+/)[0].toLowerCase() : null;
 
+      // ✅ Check if bot is admin
+      const botIsAdmin = await isBotAdmin(sock, groupJid);
+
+      // ✅ Allow .help for everyone, enforce bot admin for other commands
+      if (!botIsAdmin && cmd && cmd !== 'help') return;
+
+      // ✅ Check if sender is admin
       const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
 
       // Debug logs
       console.log('Parsed text:', text);
+      console.log('Command:', cmd);
       console.log('Sender admin?', isAdminFlag, 'Bot admin?', botIsAdmin);
 
-      // Moderation checks
-      await checkAntiLink(text, isAdminFlag, groupJid, senderJid, sock);
-      await checkAntiVulgar(msg, isAdminFlag, groupJid, senderJid, sock);
-
-      // Commands only for admins
-      if (isAdminFlag) {
-        const groupMetadata = await sock.groupMetadata(groupJid);
-        await handleCommand(sock, msg, groupMetadata);
+      // Moderation checks (only if bot is admin)
+      if (botIsAdmin) {
+        await checkAntiLink(text, isAdminFlag, groupJid, senderJid, sock);
+        await checkAntiVulgar(msg, isAdminFlag, groupJid, senderJid, sock);
       }
+
+      // ✅ Handle commands
+      const groupMetadata = await sock.groupMetadata(groupJid);
+      await handleCommand(sock, msg, groupMetadata);
     });
 
     sock.ev.on('connection.update', async (update) => {
