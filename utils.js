@@ -34,6 +34,9 @@ export const parseJid = (jid) => {
   return jid.split(':')[0] || jid;
 };
 
+/**
+ * Format ISO date/time string into human-friendly text
+ */
 export const formatTime = (date) => {
   if (!date) return 'Invalid Date';
   try {
@@ -45,6 +48,33 @@ export const formatTime = (date) => {
   } catch {
     return new Date(date).toLocaleString();
   }
+};
+
+/**
+ * Parse user input like "6:30pm" into a Date object
+ * Returns a Date scheduled for today or tomorrow if time has passed
+ */
+export const parseTimeString = (input) => {
+  const now = new Date();
+  const match = input.match(/^(\d{1,2}):(\d{2})(am|pm)$/i);
+  if (!match) return null;
+
+  let [ , hour, minute, meridian ] = match;
+  hour = parseInt(hour, 10);
+  minute = parseInt(minute, 10);
+
+  if (meridian.toLowerCase() === 'pm' && hour < 12) hour += 12;
+  if (meridian.toLowerCase() === 'am' && hour === 12) hour = 0;
+
+  const scheduled = new Date(now);
+  scheduled.setHours(hour, minute, 0, 0);
+
+  // If time has already passed today, schedule for tomorrow
+  if (scheduled <= now) {
+    scheduled.setDate(scheduled.getDate() + 1);
+  }
+
+  return scheduled;
 };
 
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -66,6 +96,7 @@ export default {
   isAdminStatic,
   parseJid,
   formatTime,
+  parseTimeString,
   delay,
   normalizeJid,
   isGroup,
