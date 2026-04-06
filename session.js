@@ -4,61 +4,160 @@ import {
   useMultiFileAuthState,
   Browsers,
 } from '@whiskeysockets/baileys';
+
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import { join } from 'path';
-import { mkdirSync, existsSync } from 'fs';
+import { mkdirSync, existsSync, promises as fs } from 'fs';
 import { getSession, saveSession, clearSession } from './db.js';
+
+const AUTH_DIR = join(process.cwd(), 'auth_info_baileys');
 
 let socketInstance = null;
 let isConnecting = false;
 
-async function makeSupabaseAuthState() {
-  const tempDir = join(process.cwd(), 'auth_info_temp');
-  if (!existsSync(tempDir)) mkdirSync(tempDir, { recursive: true });
+// =========================
+// ⏱️ BACKUP CONTROL
+// =========================
+let backupTimer = null;
+let lastBackupHash = null;
 
-  const saved = await getSession();
-  let state, saveCreds;
+// 🔒 prevent reconnect stacking
+let reconnectTimeout = null;
 
-  if (saved && saved.creds?.registered) {
-    console.log('✅ Restored valid auth state from Supabase');
-    state = saved;
-    const { saveCreds: localSaveCreds } = await useMultiFileAuthState(tempDir);
-    saveCreds = async () => {
-      if (state.creds?.registered) {
-        await saveSession(state);
-        console.log('💾 Auth state updated (Supabase + local)');
-      }
-      await localSaveCreds();
-    };
-  } else {
-    if (saved) {
-      console.warn('⚠️ Saved session is stale (registered=false). Clearing...');
-      await clearSession();
-    }
-    console.warn('⚠️ No valid auth found. Creating new.');
-    const { state: newState, saveCreds: newSaveCreds } = await useMultiFileAuthState(tempDir);
-    state = newState;
-    saveCreds = async () => {
-      if (state.creds?.registered) {
-        await saveSession(state);
-        console.log('💾 Auth state saved to Supabase + local');
-      }
-      await newSaveCreds();
-    };
-  }
-
-  return { state, saveCreds, clear: async () => { await clearSession(); } };
+// =========================
+// 🧠 STABLE HASH
+// =========================
+function createHash(obj) {
+  return JSON.stringify(obj, Object.keys(obj).sort());
 }
 
+// =========================
+// ☁️ SMART BACKUP
+// =========================
+async function backupToSupabase() {
+  try {
+    if (!existsSync(AUTH_DIR)) return;
+
+    const files = await fs.readdir(AUTH_DIR);
+    if (files.length === 0) return;
+
+    const backup = {};
+
+    for (const file of files) {
+      const raw = await fs.readFile(join(AUTH_DIR, file), 'utf-8');
+
+      try {
+        backup[file] = JSON.parse(raw);
+      } catch {
+        backup[file] = raw;
+      }
+    }
+
+    const newHash = createHash(backup);
+
+    if (newHash === lastBackupHash) return;
+
+    lastBackupHash = newHash;
+
+    await saveSession({ files: backup });
+
+    console.log('☁️ Backup saved');
+  } catch (err) {
+    console.error('backup failed:', err.message);
+  }
+}
+
+// =========================
+// ⏳ DEBOUNCE
+// =========================
+function scheduleBackup() {
+  if (backupTimer) clearTimeout(backupTimer);
+
+  backupTimer = setTimeout(() => {
+    backupToSupabase();
+  }, 10000);
+}
+
+// =========================
+// 🔄 RESTORE
+// =========================
+async function restoreFromSupabase() {
+  try {
+    const saved = await getSession();
+
+    if (!saved?.files || Object.keys(saved.files).length === 0) {
+      console.warn('⚠️ No backup found');
+      return false;
+    }
+
+    mkdirSync(AUTH_DIR, { recursive: true });
+
+    for (const [filename, content] of Object.entries(saved.files)) {
+      const data =
+        typeof content === 'object'
+          ? JSON.stringify(content, null, 2)
+          : content;
+
+      await fs.writeFile(join(AUTH_DIR, filename), data, 'utf-8');
+    }
+
+    console.log('✅ Restored session');
+    return true;
+  } catch (err) {
+    console.error('restore failed:', err.message);
+    return false;
+  }
+}
+
+// =========================
+// 📁 ENSURE AUTH
+// =========================
+async function ensureAuthDir() {
+  mkdirSync(AUTH_DIR, { recursive: true });
+
+  const credPath = join(AUTH_DIR, 'creds.json');
+
+  if (!existsSync(credPath)) {
+    console.log('🔍 No local auth → restoring...');
+    await restoreFromSupabase();
+  }
+}
+
+// =========================
+// 🔁 RECONNECT LOGIC
+// =========================
+let reconnectAttempts = 0;
+
+function shouldReconnect(statusCode) {
+  if (statusCode === 401) return false; // logged out
+  return true;
+}
+
+// =========================
+// 🚀 INIT SESSION
+// =========================
 export const initSession = async () => {
   if (isConnecting) return socketInstance;
   isConnecting = true;
 
   try {
-    const { state, saveCreds } = await makeSupabaseAuthState();
-    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1029030078] }));
-    console.log('📡 Using WA version:', version.join('.'));
+    await ensureAuthDir();
+
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+
+    const { version } = await fetchLatestBaileysVersion().catch(() => ({
+      version: [2, 3000, 1029030078],
+    }));
+
+    console.log('📡 WA version:', version.join('.'));
+
+    // 🧹 CLEAN OLD SOCKET
+    if (socketInstance) {
+      try {
+        socketInstance.end();
+      } catch {}
+    }
 
     socketInstance = makeWASocket({
       version,
@@ -70,47 +169,94 @@ export const initSession = async () => {
       browser: Browsers.ubuntu('Chrome'),
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
-      generateHighQualityLinkPreview: true,
+      generateHighQualityLinkPreview: false,
       markOnlineOnConnect: true,
     });
 
-    socketInstance.ev.on('creds.update', saveCreds);
+    // =========================
+    // 💾 SAVE CREDS
+    // =========================
+    socketInstance.ev.on('creds.update', async () => {
+      await saveCreds();
 
+      // only backup when stable
+      if (!isConnecting) {
+        scheduleBackup();
+      }
+    });
+
+    // =========================
+    // 🔌 CONNECTION EVENTS
+    // =========================
     socketInstance.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
+      // 🔳 QR for frontend
       if (qr) {
         socketInstance.qrString = qr;
-        console.log('📷 New QR Code received');
+        console.log('📷 QR updated');
       }
 
+      // ✅ CONNECTED
       if (connection === 'open') {
-        console.log('✅ Connected to WhatsApp');
+        console.log('✅ Connected');
         isConnecting = false;
+        reconnectAttempts = 0;
+
         await saveCreds();
+        scheduleBackup();
       }
 
+      // ❌ DISCONNECTED
       if (connection === 'close') {
         isConnecting = false;
-        const statusCode = (lastDisconnect?.error instanceof Boom)
-          ? lastDisconnect.error.output?.statusCode
-          : lastDisconnect?.error?.statusCode ?? 'unknown';
 
-        console.log(`Connection closed (code: ${statusCode})`);
+        const statusCode =
+          lastDisconnect?.error instanceof Boom
+            ? lastDisconnect.error.output?.statusCode
+            : lastDisconnect?.error?.statusCode ?? 'unknown';
 
+        console.log(`❌ Closed (code: ${statusCode})`);
+
+        // 🔒 LOGGED OUT
         if (statusCode === 401) {
-          console.error('⚠️ Logged out from WhatsApp. Clearing session...');
+          console.log('🔒 Logged out → clearing session');
+
+          try {
+            await fs.rm(AUTH_DIR, { recursive: true, force: true });
+          } catch {}
+
           await clearSession();
+          return;
+        }
+
+        // 🔁 SAFE RECONNECT
+        if (shouldReconnect(statusCode)) {
+          reconnectAttempts++;
+
+          const delayTime = Math.min(10000, reconnectAttempts * 2000);
+
+          console.log(`🔁 Reconnecting in ${delayTime / 1000}s...`);
+
+          if (reconnectTimeout) clearTimeout(reconnectTimeout);
+
+          reconnectTimeout = setTimeout(() => {
+            initSession();
+          }, delayTime);
         }
       }
     });
 
     return socketInstance;
+
   } catch (err) {
-    console.error('❌ initSession failed:', err);
+    console.error('❌ init failed:', err);
     isConnecting = false;
     throw err;
   }
 };
 
+// =========================
+// 📡 GET SOCKET
+// =========================
 export const getSocket = () => socketInstance;
