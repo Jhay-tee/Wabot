@@ -1,48 +1,58 @@
-import { isAdminStatic, normalizeJid } from './utils.js';
+import { normalizeJid, isAdminStatic } from './utils.js';
 
-/**
- * Check if a given user is an admin.
- */
+const metadataCache = new Map();
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getCachedMetadata(sock, groupJid) {
+  const cached = metadataCache.get(groupJid);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+    return cached.data;
+  }
+  try {
+    const metadata = await sock.groupMetadata(groupJid);
+    metadataCache.set(groupJid, { data: metadata, ts: Date.now() });
+    return metadata;
+  } catch (err) {
+    console.error('groupMetadata fetch failed:', err.message);
+    return null;
+  }
+}
+
+export function invalidateGroupCache(groupJid) {
+  if (groupJid) metadataCache.delete(groupJid);
+  else metadataCache.clear();
+}
+
 export const isAdmin = async (sock, groupJid, userJid) => {
   const cleanJid = normalizeJid(userJid);
 
-  // ✅ Always allow static admins (bot owner IDs from .env)
   if (isAdminStatic(cleanJid)) return true;
 
-  // ✅ For groups, check WhatsApp metadata
-  if (groupJid?.endsWith('@g.us')) {
-    try {
-      const metadata = await sock.groupMetadata(groupJid);
-      const participant = metadata.participants.find(
-        p => normalizeJid(p.id) === cleanJid
-      );
+  if (!groupJid?.endsWith('@g.us')) return false;
 
-      return ['admin', 'superadmin'].includes(participant?.admin);
-    } catch (err) {
-      console.error('Admin check failed:', err.message);
-      return false;
-    }
-  }
+  const metadata = await getCachedMetadata(sock, groupJid);
+  if (!metadata) return false;
 
-  return false;
+  const participant = metadata.participants.find(
+    p => normalizeJid(p.id) === cleanJid
+  );
+  return ['admin', 'superadmin'].includes(participant?.admin);
 };
 
-/**
- * Check if the bot itself is an admin in the group.
- */
 export const isBotAdmin = async (sock, groupJid) => {
   if (!groupJid?.endsWith('@g.us')) return false;
-  try {
-    const metadata = await sock.groupMetadata(groupJid);
-    const botJid = normalizeJid(sock.user.id);
 
-    const participant = metadata.participants.find(
-      p => normalizeJid(p.id) === botJid
-    );
+  const metadata = await getCachedMetadata(sock, groupJid);
+  if (!metadata) return false;
 
-    return ['admin', 'superadmin'].includes(participant?.admin);
-  } catch (err) {
-    console.error('Bot admin check failed:', err.message);
-    return false;
-  }
+  const botJid = normalizeJid(sock.user?.id);
+  const participant = metadata.participants.find(
+    p => normalizeJid(p.id) === botJid
+  );
+  return ['admin', 'superadmin'].includes(participant?.admin);
+};
+
+export const getGroupMetadata = async (sock, groupJid) => {
+  if (!groupJid?.endsWith('@g.us')) return null;
+  return getCachedMetadata(sock, groupJid);
 };
