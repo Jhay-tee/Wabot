@@ -1,5 +1,3 @@
-// index.js
-
 import express from 'express';
 import qrcode from 'qrcode-terminal';
 import 'dotenv/config';
@@ -9,7 +7,7 @@ import { startScheduler } from './scheduler.js';
 import { handleCommand } from './commands.js';
 import { checkAntiLink, checkAntiVulgar } from './anti.js';
 import { normalizeJid, extractText } from './utils.js';
-import { isAdmin, isBotAdmin } from './auth.js';
+import { isAdmin, isBotAdmin, getGroupMetadata, invalidateGroupCache } from './auth.js';
 import { Boom } from '@hapi/boom';
 import { clearSession } from './db.js';
 
@@ -20,10 +18,6 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 12;
 const BASE_RECONNECT_DELAY_MS = 10000;
 
-// ────────────────────────────────────────────────
-// Web routes
-// ────────────────────────────────────────────────
-
 app.get('/', (req, res) => {
   const sock = getSocket();
   if (isConnected) {
@@ -31,6 +25,7 @@ app.get('/', (req, res) => {
   } else if (sock?.qrString) {
     res.send(`
       <h1>Scan QR to Link WhatsApp</h1>
+      <p>Open WhatsApp → Linked Devices → Link a Device</p>
       <div id="qrcode"></div>
       <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
       <script>
@@ -40,10 +35,11 @@ app.get('/', (req, res) => {
         QRCode.toCanvas(canvas, qr, { width: 300 }, (err) => {
           if (!err) container.appendChild(canvas);
         });
+        setTimeout(() => location.reload(), 30000);
       </script>
     `);
   } else {
-    res.send('<h1>No QR code active</h1>');
+    res.send('<h1>⏳ Connecting... refresh in a few seconds</h1>');
   }
 });
 
@@ -57,59 +53,52 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ────────────────────────────────────────────────
-// Bot lifecycle
-// ────────────────────────────────────────────────
-
 async function startBot() {
   try {
     console.log('🔄 Starting WhatsApp connection attempt...');
     const sock = await initSession();
 
-    // 🔑 Listen for incoming messages
-    sock.ev.on('messages.upsert', async ({ messages }) => {
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+
       const msg = messages[0];
-      console.log('RAW MESSAGE:', JSON.stringify(msg.message, null, 2));
-      if (!msg.message) return;
-      console.log('RAW MESSAGE:', JSON.stringify(msg.message, null, 2));
+      if (!msg?.message) return;
 
       const groupJid = msg.key.remoteJid;
+
+      // Only handle group messages — silently ignore DMs
+      if (!groupJid?.endsWith('@g.us')) return;
+
       const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
       const text = extractText(msg).trim();
       const cmd = text.startsWith('.') ? text.slice(1).split(/\s+/)[0].toLowerCase() : null;
 
-      // ✅ Check if bot is admin
+      // Fetch group metadata once (cached) for the whole message lifecycle
+      const groupMetadata = await getGroupMetadata(sock, groupJid);
+
+      // Check if bot is admin (cached)
       const botIsAdmin = await isBotAdmin(sock, groupJid);
 
-      // ✅ Allow public commands even if bot isn’t admin
+      // Public commands work even if bot isn't admin
       const publicCommands = ['help', 'menu', 'ping'];
       if (!botIsAdmin && cmd && !publicCommands.includes(cmd)) return;
 
-      // ✅ Check if sender is admin
+      // Check if sender is admin (cached)
       const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
 
-      // Debug logs
-      console.log('Parsed text:', text);
-      console.log('Command:', cmd);
-      console.log('Sender admin?', isAdminFlag, 'Bot admin?', botIsAdmin);
-
-      // Moderation checks (only if bot is admin)
+      // Run moderation only when bot is admin
       if (botIsAdmin) {
         await checkAntiLink(text, isAdminFlag, groupJid, senderJid, sock);
         await checkAntiVulgar(msg, isAdminFlag, groupJid, senderJid, sock);
       }
 
-      // ✅ Handle commands safely
-      let groupMetadata = { id: groupJid, participants: [] };
-      if (groupJid.endsWith('@g.us')) {
-        try {
-          groupMetadata = await sock.groupMetadata(groupJid);
-        } catch (err) {
-          console.error('Failed to fetch group metadata:', err.message);
-        }
-      }
-
+      // Handle commands — pass already-fetched metadata so commands don't re-fetch
       await handleCommand(sock, msg, groupMetadata);
+    });
+
+    // Invalidate group cache when participants change
+    sock.ev.on('group-participants.update', ({ id }) => {
+      invalidateGroupCache(id);
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -167,10 +156,6 @@ function handleReconnect() {
   setTimeout(startBot, delay);
 }
 
-// ────────────────────────────────────────────────
-// Shutdown & error handling
-// ────────────────────────────────────────────────
-
 process.on('SIGINT', async () => {
   console.log('SIGINT received – shutting down');
   const sock = getSocket();
@@ -190,7 +175,6 @@ process.on('unhandledRejection', (reason) => {
   console.error('Unhandled rejection:', reason);
 });
 
-// Start everything
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`));
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server listening on port ${PORT}`));
 startBot();
