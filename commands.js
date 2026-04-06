@@ -1,5 +1,3 @@
-// commands.js
-
 import {
   setGroupSettings,
   addUserStrike,
@@ -14,35 +12,32 @@ import {
   parseTimeString,
   normalizeJid,
 } from './utils.js';
-import { isAdmin } from './auth.js';
+import { isAdmin, getGroupMetadata } from './auth.js';
 
-/**
- * Handle incoming group commands
- */
 export const handleCommand = async (sock, msg, groupMetadata) => {
   const text = extractText(msg).trim();
   if (!text.startsWith('.')) return;
 
-  const [cmd, ...args] = text.slice(1).split(/\s+/);
+  const groupJid = msg.key.remoteJid;
+
+  if (!groupJid?.endsWith('@g.us')) return;
+
+  const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
+  const [rawCmd, ...args] = text.slice(1).split(/\s+/);
+  const cmd = rawCmd.toLowerCase();
   const arg = args.join(' ');
 
-  // ✅ Use remoteJid directly instead of groupMetadata.id
-  const groupJid = msg.key.remoteJid;
-  const senderJid = normalizeJid(msg.key.participant || msg.key.remoteJid);
+  const publicCommands = ['help', 'menu', 'ping'];
 
-  // ✅ Only run in groups
-  if (!groupJid.endsWith('@g.us')) return;
-
-  // Dynamic group admin check
   const isAdminFlag = await isAdmin(sock, groupJid, senderJid);
 
-  // ✅ Allow safe commands for everyone, enforce admin for sensitive ones
-  const publicCommands = ['help', 'menu', 'ping'];
-  if (!isAdminFlag && !publicCommands.includes(cmd.toLowerCase())) {
+  if (!isAdminFlag && !publicCommands.includes(cmd)) {
     return;
   }
 
-  switch (cmd.toLowerCase()) {
+  const meta = groupMetadata || await getGroupMetadata(sock, groupJid);
+
+  switch (cmd) {
     case 'bot':
       if (arg === 'on') {
         await setGroupSettings(groupJid, { bot_active: true });
@@ -50,6 +45,8 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       } else if (arg === 'off') {
         await setGroupSettings(groupJid, { bot_active: false });
         await sock.sendMessage(groupJid, { text: '🤖 Bot has been deactivated' });
+      } else {
+        await sock.sendMessage(groupJid, { text: '⚠️ Usage: .bot on / .bot off' });
       }
       break;
 
@@ -60,6 +57,8 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       } else if (arg === 'off') {
         await setGroupSettings(groupJid, { anti_link: false });
         await sock.sendMessage(groupJid, { text: '🔗 Anti-link disabled' });
+      } else {
+        await sock.sendMessage(groupJid, { text: '⚠️ Usage: .link on / .link off' });
       }
       break;
 
@@ -70,35 +69,45 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       } else if (arg === 'off') {
         await setGroupSettings(groupJid, { vulgar_filter: false });
         await sock.sendMessage(groupJid, { text: '🛑 Vulgar filter disabled' });
+      } else {
+        await sock.sendMessage(groupJid, { text: '⚠️ Usage: .vulgar on / .vulgar off' });
       }
       break;
 
     case 'lock':
       if (!arg) {
-        await sock.groupSettingUpdate(groupJid, { announce: true });
-        await sock.sendMessage(groupJid, { text: '🔒 Group locked immediately' });
+        try {
+          await sock.groupSettingUpdate(groupJid, 'announcement');
+          await sock.sendMessage(groupJid, { text: '🔒 Group locked — only admins can send messages' });
+        } catch (err) {
+          await sock.sendMessage(groupJid, { text: '⚠️ Failed to lock group (make sure I am an admin)' });
+        }
       } else {
         const parsed = parseTimeString(arg);
         if (!parsed) {
-          await sock.sendMessage(groupJid, { text: '⚠️ Please specify a valid time (e.g. 6:30pm)' });
+          await sock.sendMessage(groupJid, { text: '⚠️ Please specify a valid time e.g. .lock 6:30pm' });
         } else {
           await setScheduledLocks(groupJid, parsed.toISOString(), null);
-          await sock.sendMessage(groupJid, { text: `⏰ Auto lock has been set to ${formatTime(parsed)}` });
+          await sock.sendMessage(groupJid, { text: `⏰ Auto lock scheduled for ${formatTime(parsed)}` });
         }
       }
       break;
 
     case 'unlock':
       if (!arg) {
-        await sock.groupSettingUpdate(groupJid, { announce: false });
-        await sock.sendMessage(groupJid, { text: '🔓 Group unlocked immediately' });
+        try {
+          await sock.groupSettingUpdate(groupJid, 'not_announcement');
+          await sock.sendMessage(groupJid, { text: '🔓 Group unlocked — everyone can send messages' });
+        } catch (err) {
+          await sock.sendMessage(groupJid, { text: '⚠️ Failed to unlock group (make sure I am an admin)' });
+        }
       } else {
         const parsed = parseTimeString(arg);
         if (!parsed) {
-          await sock.sendMessage(groupJid, { text: '⚠️ Please specify a valid time (e.g. 6:30am)' });
+          await sock.sendMessage(groupJid, { text: '⚠️ Please specify a valid time e.g. .unlock 6:30am' });
         } else {
           await setScheduledLocks(groupJid, null, parsed.toISOString());
-          await sock.sendMessage(groupJid, { text: `⏰ Auto unlock has been set to ${formatTime(parsed)}` });
+          await sock.sendMessage(groupJid, { text: `⏰ Auto unlock scheduled for ${formatTime(parsed)}` });
         }
       }
       break;
@@ -113,85 +122,86 @@ export const handleCommand = async (sock, msg, groupMetadata) => {
       await sock.sendMessage(groupJid, { text: '🗑️ Scheduled unlock time cleared' });
       break;
 
-    case 'kick':
-      if (!msg.message?.extendedTextMessage?.contextInfo?.participant) {
-        await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user to kick them' });
-        return;
+    case 'kick': {
+      const kickTarget = msg.message?.extendedTextMessage?.contextInfo?.participant;
+      if (!kickTarget) {
+        await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user\'s message to kick them' });
+        break;
       }
-      const kickTarget = msg.message.extendedTextMessage.contextInfo.participant;
       try {
         await sock.groupParticipantsUpdate(groupJid, [kickTarget], 'remove');
-        await sock.sendMessage(groupJid, { text: `👢 User ${kickTarget} has been removed` });
+        await sock.sendMessage(groupJid, { text: `👢 Removed @${kickTarget.split('@')[0]}`, mentions: [kickTarget] });
       } catch (err) {
-        await sock.sendMessage(groupJid, { text: '⚠️ Failed to kick user (bot may not be admin)' });
+        await sock.sendMessage(groupJid, { text: '⚠️ Failed to kick user (make sure I am an admin)' });
       }
       break;
+    }
 
-    case 'delete':
+    case 'delete': {
+      const stanzaId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
+      const participant = msg.message?.extendedTextMessage?.contextInfo?.participant;
+      if (!stanzaId || !participant) {
+        await sock.sendMessage(groupJid, { text: '⚠️ Reply to a message to delete it' });
+        break;
+      }
       try {
-        const stanzaId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
-        const participant = msg.message?.extendedTextMessage?.contextInfo?.participant;
-        if (stanzaId && participant) {
-          await sock.sendMessage(groupJid, {
-            delete: { remoteJid: groupJid, fromMe: false, id: stanzaId, participant },
-          });
-        } else {
-          await sock.sendMessage(groupJid, { text: '⚠️ Reply to a message to delete it' });
-        }
+        await sock.sendMessage(groupJid, {
+          delete: { remoteJid: groupJid, fromMe: false, id: stanzaId, participant },
+        });
       } catch (err) {
-        await sock.sendMessage(groupJid, { text: '⚠️ Failed to delete message (bot may not be admin)' });
+        await sock.sendMessage(groupJid, { text: '⚠️ Failed to delete message (make sure I am an admin)' });
       }
       break;
+    }
 
-    case 'strike':
-      if (!msg.message?.extendedTextMessage?.contextInfo?.participant) {
-        await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user to strike them' });
-        return;
+    case 'strike': {
+      const target = msg.message?.extendedTextMessage?.contextInfo?.participant;
+      if (!target) {
+        await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user\'s message to strike them' });
+        break;
       }
-      const target = msg.message.extendedTextMessage.contextInfo.participant;
       const strikes = await addUserStrike(groupJid, target);
-      await sock.sendMessage(groupJid, { text: `⚠️ Strike added to ${target}. Total strikes: ${strikes}` });
+      await sock.sendMessage(groupJid, {
+        text: `⚠️ Strike issued to @${target.split('@')[0]}. Total: ${strikes ?? '?'}`,
+        mentions: [target],
+      });
       break;
+    }
 
-    case 'resetstrikes':
-      if (!msg.message?.extendedTextMessage?.contextInfo?.participant) {
-        await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user to reset their strikes' });
-        return;
+    case 'resetstrikes': {
+      const resetTarget = msg.message?.extendedTextMessage?.contextInfo?.participant;
+      if (!resetTarget) {
+        await sock.sendMessage(groupJid, { text: '⚠️ Reply to a user\'s message to reset their strikes' });
+        break;
       }
-      const resetTarget = msg.message.extendedTextMessage.contextInfo.participant;
       await resetUserStrikes(groupJid, resetTarget);
-      await sock.sendMessage(groupJid, { text: `✅ Strikes reset for ${resetTarget}` });
+      await sock.sendMessage(groupJid, {
+        text: `✅ Strikes reset for @${resetTarget.split('@')[0]}`,
+        mentions: [resetTarget],
+      });
       break;
+    }
 
-    case 'tagall':
-      const mentions = groupMetadata.participants.map(p => p.id);
+    case 'tagall': {
+      if (!meta) {
+        await sock.sendMessage(groupJid, { text: '⚠️ Could not fetch group members' });
+        break;
+      }
+      const mentions = meta.participants.map(p => p.id);
       const mentionText = mentions.map(m => `@${m.split('@')[0]}`).join(' ');
       await sock.sendMessage(groupJid, { text: mentionText, mentions });
       break;
+    }
 
     case 'help':
     case 'menu':
       await sock.sendMessage(groupJid, {
-        text: `📖 Available Commands:
-- .help / .menu (everyone)
-- .ping (everyone)
-- .bot on/off (admin)
-- .link on/off (admin)
-- .vulgar on/off (admin)
-- .lock [time] (admin)
-- .unlock [time] (admin)
-- .lockclear (admin)
-- .unlockclear (admin)
-- .kick (admin, reply to user)
-- .delete (admin, reply to message)
-- .strike (admin, reply to user)
-- .resetstrikes (admin, reply to user)
-- .tagall (admin)`
+        text: `📖 *Wabot Commands*\n\n*Everyone:*\n• .help / .menu\n• .ping\n\n*Admins only:*\n• .bot on/off\n• .link on/off\n• .vulgar on/off\n• .lock [6:30pm]\n• .unlock [6:30am]\n• .lockclear\n• .unlockclear\n• .kick (reply to user)\n• .delete (reply to message)\n• .strike (reply to user)\n• .resetstrikes (reply to user)\n• .tagall`,
       });
       break;
 
     case 'ping':
-      await sock.sendMessage(groupJid, { text: 'pong!' });
+      await sock.sendMessage(groupJid, { text: '🏓 pong!' });
       break;
 
     default:
