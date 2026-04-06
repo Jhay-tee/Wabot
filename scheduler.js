@@ -16,7 +16,7 @@ export const startScheduler = () => {
       const scheduledLocks = await getScheduledLocks();
 
       if (!scheduledLocks || scheduledLocks.length === 0) {
-        return; // Nothing to process
+        return;
       }
 
       const now = new Date();
@@ -24,32 +24,26 @@ export const startScheduler = () => {
       for (const lock of scheduledLocks) {
         const groupJid = lock.group_jid;
 
-        // ==================== AUTO LOCK ====================
         if (lock.lock_time) {
-          const lockTime = new Date(lock.lock_time); // ISO string → Date
-
+          const lockTime = new Date(lock.lock_time);
           if (lockTime <= now) {
             try {
-              await sock.groupSettingUpdate(groupJid, { announce: true }); // lock group
+              await sock.groupSettingUpdate(groupJid, 'announcement');
               logger.success(`🔒 Auto-locked group: ${groupJid}`);
-
-              await clearUsedLockTime(groupJid); // clear so it doesn’t repeat
+              await clearUsedLockTime(groupJid);
             } catch (err) {
               logger.error(`Failed to auto-lock group ${groupJid}:`, err.message);
             }
           }
         }
 
-        // ==================== AUTO UNLOCK ====================
         if (lock.unlock_time) {
-          const unlockTime = new Date(lock.unlock_time); // ISO string → Date
-
+          const unlockTime = new Date(lock.unlock_time);
           if (unlockTime <= now) {
             try {
-              await sock.groupSettingUpdate(groupJid, { announce: false }); // unlock group
+              await sock.groupSettingUpdate(groupJid, 'not_announcement');
               logger.success(`🔓 Auto-unlocked group: ${groupJid}`);
-
-              await clearUsedUnlockTime(groupJid); // clear so it doesn’t repeat
+              await clearUsedUnlockTime(groupJid);
             } catch (err) {
               logger.error(`Failed to auto-unlock group ${groupJid}:`, err.message);
             }
@@ -59,5 +53,5 @@ export const startScheduler = () => {
     } catch (error) {
       logger.error('Scheduler Error:', error.message);
     }
-  }, 60 * 1000); // Every 1 minute
+  }, 60 * 1000);
 };
