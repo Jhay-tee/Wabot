@@ -4,7 +4,7 @@ import { apiFetch } from "../api/client.js";
 
 export default function Verify() {
   const [params] = useSearchParams();
-  const [state, setState] = useState("loading"); // loading | success | error
+  const [state, setState] = useState("loading");
   const [msg, setMsg] = useState("");
 
   useEffect(() => {
@@ -43,22 +43,24 @@ export default function Verify() {
 
         <div className="auth-card" style={{ alignItems: "center", textAlign: "center", gap: "1.5rem" }}>
           {state === "loading" && <span className="spinner spinner-lg" />}
+
           {state === "success" && (
             <>
               <div style={{ fontSize: "3rem" }}>✅</div>
               <p className="text-muted text-sm">
                 Your email has been confirmed. You can now log in and start deploying bots.
               </p>
-              <Link to="/login" className="btn btn-primary w-full">Sign in to WwaBot</Link>
+              <Link to="/login" className="btn btn-primary w-full">Sign in to WaBot</Link>
             </>
           )}
+
           {state === "error" && (
             <>
               <div style={{ fontSize: "3rem" }}>❌</div>
               {msg && <div className="alert alert-error w-full">{msg}</div>}
               <div className="flex gap-3" style={{ width: "100%" }}>
                 <Link to="/signup" className="btn btn-secondary flex-1">Sign up again</Link>
-                <Link to="/login"  className="btn btn-primary flex-1">Sign in</Link>
+                <Link to="/login"  className="btn btn-primary  flex-1">Sign in</Link>
               </div>
             </>
           )}
