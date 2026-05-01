@@ -205,7 +205,7 @@ function Dashboard({ auth }) {
       </section>
     </div>
   );
-
+}
 
 function Protected({ auth, children }) {
   if (!auth.token) return <Navigate to="/login" replace />;
