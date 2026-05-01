@@ -57,9 +57,14 @@ args = "cd backend && npm run dev"
 waitForPort = 3000
 
 [[ports]]
+localPort = 3000
+externalPort = 3000
+
+[[ports]]
 localPort = 5000
 externalPort = 80
 
-[[ports]]
-localPort = 3000
-externalPort = 3000
+[deployment]
+deploymentTarget = "autoscale"
+run = ["node", "backend/src/index.js"]
+build = ["bash", "-c", "cd frontend && npm install && npm run build && cd ../backend && npm install"]
