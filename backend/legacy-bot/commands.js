@@ -245,4 +245,3 @@ export async function handleCommand(sock, msg) {
       text: '❌ An error occurred while executing the command.' 
     }).catch(() => {});
   }
-}
