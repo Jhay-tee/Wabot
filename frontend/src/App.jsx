@@ -7,6 +7,8 @@ const Login     = lazy(() => import("./pages/Login.jsx"));
 const Signup    = lazy(() => import("./pages/Signup.jsx"));
 const Verify    = lazy(() => import("./pages/Verify.jsx"));
 const Dashboard = lazy(() => import("./pages/Dashboard.jsx"));
+const Docs      = lazy(() => import("./pages/Docs.jsx"));
+const Admin     = lazy(() => import("./pages/Admin.jsx"));
 
 function Loader() {
   return (
@@ -29,15 +31,26 @@ function GuestRoute({ children }) {
   return children;
 }
 
+/* Admin route — must be logged in. The actual superadmin check happens
+   on the server; the page shows an "Access Denied" screen on 403.      */
+function AdminRoute({ children }) {
+  const { token } = useAuth();
+  const location  = useLocation();
+  if (!token) return <Navigate to="/login" state={{ from: location }} replace />;
+  return children;
+}
+
 export default function App() {
   return (
     <Suspense fallback={<Loader />}>
       <Routes>
         <Route path="/"          element={<Landing />} />
+        <Route path="/docs"      element={<Docs />} />
         <Route path="/verify"    element={<Verify />} />
         <Route path="/login"     element={<GuestRoute><Login /></GuestRoute>} />
         <Route path="/signup"    element={<GuestRoute><Signup /></GuestRoute>} />
         <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
+        <Route path="/admin"     element={<AdminRoute><Admin /></AdminRoute>} />
         <Route path="*"          element={<Navigate to="/" replace />} />
       </Routes>
     </Suspense>

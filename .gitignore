@@ -8,7 +8,13 @@ yarn-error.log*
 .env
 .env.local
 .env.*.local
-
+backend/.env
+frontend/.env
+.agents
+.local
+attached_assets
+.replit
+replit.md
 # Logs
 logs
 *.log
@@ -26,11 +32,22 @@ Thumbs.db
 dist/
 build/
 out/
+frontend/dist/
+backend/dist/
 
 # Supabase session/auth snapshots
 *.supabase
 auth_data.json
 session.json
+backend/sessions/
+backend/.vercel/
+frontend/.vercel/
+.vercel/
+
+# Deployment / platform state
+.env.production
+.env.staging
+.turbo/
 
 # IDE/editor files
 .vscode/

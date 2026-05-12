@@ -21,9 +21,13 @@ export const env = {
   isProd:   IS_PROD,
 
   jwtSecret:              requireOrWarn("JWT_SECRET"),
-  appBaseUrl:             get("APP_BASE_URL", "http://localhost:5000"),
-  apiBaseUrl:             get("API_BASE_URL", "http://localhost:3000"),
-  allowedOrigins:         get("ALLOWED_ORIGINS", "http://localhost:5000"),
+  appBaseUrl:             get("APP_BASE_URL",  "http://localhost:5000"),
+  apiBaseUrl:             get("API_BASE_URL",  "http://localhost:3000"),
+  allowedOrigins:         get("ALLOWED_ORIGINS","http://localhost:5000"),
+
+  /* Superadmin — set this to YOUR email in the Replit Secrets panel.
+     Only this email address can access /api/admin/* routes.            */
+  superadminEmail:        get("SUPERADMIN_EMAIL", ""),
 
   supabaseUrl:            requireOrWarn("SUPABASE_URL"),
   supabaseServiceRoleKey: requireOrWarn("SUPABASE_SERVICE_ROLE_KEY"),
@@ -32,12 +36,14 @@ export const env = {
   brevoSenderEmail:  get("BREVO_SENDER_EMAIL"),
   brevoSenderName:   get("BREVO_SENDER_NAME", "WaBot"),
 
-  stripeSecretKey:     get("STRIPE_SECRET_KEY"),
-  stripeWebhookSecret: get("STRIPE_WEBHOOK_SECRET"),
-  stripePriceIdGrowth: get("STRIPE_PRICE_ID_GROWTH"),
+  /* Paystack — payment processing */
+  paystackSecretKey:     get("PAYSTACK_SECRET_KEY"),
+  paystackWebhookSecret: get("PAYSTACK_WEBHOOK_SECRET"),  /* HMAC-SHA512 secret for verifying webhooks */
+  paystackPlanCode:      get("PAYSTACK_PLAN_CODE"),       /* e.g. PLN_xxxxxxxxxx from Paystack dashboard */
 
-  get hasJwt()    { return Boolean(this.jwtSecret); },
-  get hasSupabase(){ return Boolean(this.supabaseUrl && this.supabaseServiceRoleKey); },
-  get hasBrevo()  { return Boolean(this.brevoApiKey && this.brevoSenderEmail); },
-  get hasStripe() { return Boolean(this.stripeSecretKey); },
+  get hasJwt()        { return Boolean(this.jwtSecret); },
+  get hasSupabase()   { return Boolean(this.supabaseUrl && this.supabaseServiceRoleKey); },
+  get hasBrevo()      { return Boolean(this.brevoApiKey && this.brevoSenderEmail); },
+  get hasPaystack()   { return Boolean(this.paystackSecretKey); },
+  get hasSuperadmin() { return Boolean(this.superadminEmail); },
 };

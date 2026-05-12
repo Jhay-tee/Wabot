@@ -1,17 +1,37 @@
-import { Router } from "express";
-import bcrypt from "bcryptjs";
-import crypto from "node:crypto";
+import { Router }  from "express";
+import crypto       from "node:crypto";
 import { supabase } from "../lib/supabase.js";
-import { signAccessToken } from "../utils/jwt.js";
+import { signAccessToken }       from "../utils/jwt.js";
 import { sendVerificationEmail } from "../lib/brevo.js";
-import { env } from "../config/env.js";
-import { isStrongPassword, isValidEmail, normalizeEmail, sanitizeName } from "../utils/validators.js";
+import { env }       from "../config/env.js";
+import {
+  isStrongPassword, isValidEmail,
+  normalizeEmail, sanitizeName
+} from "../utils/validators.js";
 import { requireAuth } from "../middleware/auth.js";
+import { authLimiter } from "../middleware/rateLimiter.js";
 
-const authRouter = Router();
+const router = Router();
+
+const PLAN_KEY_LIMITS = { free: 1, paid: 10 };
+
+function isEmailTakenError(error) {
+  const msg = error?.message?.toLowerCase() ?? "";
+  return (
+    error?.status === 409 ||
+    error?.status === 422 ||
+    error?.code === "23505" ||
+    msg.includes("already registered") ||
+    msg.includes("already exists") ||
+    msg.includes("user already") ||
+    msg.includes("duplicate key") ||
+    msg.includes("users_email_key") ||
+    msg.includes("email")
+  );
+}
 
 /* ── POST /api/auth/signup ───────────────────────────────────── */
-authRouter.post("/signup", async (req, res) => {
+router.post("/signup", authLimiter, async (req, res) => {
   try {
     const { email, password, fullName } = req.body ?? {};
     const normalizedEmail = normalizeEmail(String(email ?? ""));
@@ -19,70 +39,113 @@ authRouter.post("/signup", async (req, res) => {
     if (!isValidEmail(normalizedEmail))
       return res.status(400).json({ error: "Please enter a valid email address." });
     if (!isStrongPassword(String(password ?? "")))
-      return res.status(400).json({ error: "Password must be 8+ chars with uppercase letters and a number." });
+      return res.status(400).json({ error: "Password must be 8+ chars with an uppercase letter and a number." });
+    if (!String(fullName ?? "").trim())
+      return res.status(400).json({ error: "Full name is required." });
 
-    const { data: existing } = await supabase
-      .from("users").select("id").eq("email", normalizedEmail).maybeSingle();
-    if (existing) return res.status(409).json({ error: "An account with this email already exists." });
-
-    const [passwordHash, verificationToken] = await Promise.all([
-      bcrypt.hash(String(password), 12),
-      Promise.resolve(crypto.randomBytes(32).toString("hex"))
-    ]);
-
-    const { data: user, error } = await supabase
+    const { data: existingUser, error: existingUserError } = await supabase
       .from("users")
-      .insert({
-        email:              normalizedEmail,
-        password_hash:      passwordHash,
-        full_name:          sanitizeName(String(fullName ?? "")),
-        email_verified:     false,
-        plan_tier:          "free",
-        verification_token: verificationToken
-      })
-      .select("id,email").single();
+      .select("id")
+      .eq("email", normalizedEmail)
+      .maybeSingle();
 
-    if (error) return res.status(500).json({ error: "Could not create account. Please try again." });
-
-    const verifyUrl = `${env.appBaseUrl}/verify?token=${verificationToken}`;
-    if (env.hasBrevo) {
-      try { await sendVerificationEmail(user.email, verifyUrl); } catch {}
-    } else {
-      console.log(`[dev] Verification URL for ${user.email}: ${verifyUrl}`);
+    if (existingUserError) {
+      console.error({ existingUserError }, "Signup email precheck failed");
+      return res.status(500).json({ error: "Could not create account. Please try again." });
     }
 
-    return res.status(201).json({ message: "Account created. Check your email to verify before logging in." });
-  } catch {
-    return res.status(500).json({ error: "Could not create account. Please try again." });
+    if (existingUser) {
+      return res.status(409).json({ error: "Email already taken." });
+    }
+
+    /* Create user in Supabase Auth — password is stored and managed by Supabase.
+       email_confirm: true skips Supabase's own email; we send our own via Brevo. */
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+      email:         normalizedEmail,
+      password:      String(password),
+      email_confirm: true,
+    });
+
+    if (authError) {
+      if (isEmailTakenError(authError)) {
+        return res.status(409).json({ error: "Email already taken." });
+      }
+      console.error({ authError }, "Auth createUser failed");
+      return res.status(500).json({ error: authError.message || "Could not create account. Please try again." });
+    }
+
+    const authUser = authData.user;
+    const verificationToken = crypto.randomBytes(32).toString("hex");
+
+    /* Insert matching public profile row (id matches auth.users id) */
+    const { error: dbError } = await supabase
+      .from("users")
+      .insert({
+        id:                 authUser.id,
+        email:              normalizedEmail,
+        full_name:          sanitizeName(String(fullName)),
+        email_verified:     false,
+        plan_tier:          "free",
+        verification_token: verificationToken,
+      });
+
+    if (dbError) {
+      /* Roll back the Supabase Auth user to keep data consistent */
+      await supabase.auth.admin.deleteUser(authUser.id).catch(() => {});
+      if (isEmailTakenError(dbError)) {
+        return res.status(409).json({ error: "Email already taken." });
+      }
+      console.error({ dbError }, "Profile insert failed");
+      return res.status(500).json({ error: "Could not create account. Please try again." });
+    }
+
+    /* Send verification email via Brevo */
+    const verifyUrl = `${env.appBaseUrl}/verify?token=${verificationToken}`;
+    if (env.hasBrevo) {
+      sendVerificationEmail(normalizedEmail, verifyUrl).catch((err) =>
+        console.error({ err }, "Verification email failed")
+      );
+    } else {
+      console.log(`[dev] Verify URL for ${normalizedEmail}: ${verifyUrl}`);
+    }
+
+    return res.status(201).json({
+      message: "Account created! Check your email to verify before logging in.",
+    });
+  } catch (err) {
+    console.error({ err }, "Signup failed");
+    return res.status(500).json({
+      error: err?.message || "Could not create account. Please try again.",
+    });
   }
 });
 
 /* ── GET /api/auth/verify?token=... ─────────────────────────── */
-authRouter.get("/verify", async (req, res) => {
+router.get("/verify", async (req, res) => {
   try {
     const token = String(req.query.token ?? "");
-    if (token.length < 20) return res.status(400).json({ error: "Missing or invalid verification token." });
+    if (token.length !== 64) return res.status(400).json({ error: "Invalid verification token." });
 
-    const { data: user, error: lookupErr } = await supabase
-      .from("users").select("id,email_verified").eq("verification_token", token).maybeSingle();
+    const { data: user } = await supabase
+      .from("users").select("id, email_verified").eq("verification_token", token).maybeSingle();
 
-    if (lookupErr || !user) return res.status(400).json({ error: "Invalid or expired verification link." });
-    if (user.email_verified) return res.json({ message: "Already verified." });
+    if (!user) return res.status(400).json({ error: "Invalid or expired verification link." });
+    if (user.email_verified) return res.json({ message: "Already verified. You can log in." });
 
     const { error } = await supabase
       .from("users")
-      .update({ email_verified: true, verification_token: null, updated_at: new Date().toISOString() })
+      .update({ email_verified: true, verification_token: null })
       .eq("id", user.id);
 
-    if (error) return res.status(500).json({ error: "Could not verify account. Please try again." });
-    return res.json({ message: "Email verified successfully. You can now log in." });
+    if (error) return res.status(500).json({ error: "Verification failed. Please try again." });
+    return res.json({ message: "Email verified. You can now log in." });
   } catch {
-    return res.status(500).json({ error: "Could not verify account." });
+    return res.status(500).json({ error: "Verification failed." });
   }
 });
 
 /* ── POST /api/auth/login ────────────────────────────────────── */
-authRouter.post("/login", async (req, res) => {
+router.post("/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body ?? {};
     const normalizedEmail = normalizeEmail(String(email ?? ""));
@@ -90,15 +153,29 @@ authRouter.post("/login", async (req, res) => {
     if (!isValidEmail(normalizedEmail) || typeof password !== "string")
       return res.status(400).json({ error: "Invalid credentials." });
 
-    const { data: user, error } = await supabase
+    /* Verify credentials via Supabase Auth */
+    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+      email:    normalizedEmail,
+      password: String(password),
+    });
+
+    if (authError || !authData?.user) {
+      return res.status(401).json({ error: "Invalid email or password." });
+    }
+
+    /* Fetch public profile */
+    const { data: user } = await supabase
       .from("users")
-      .select("id,email,password_hash,full_name,email_verified,plan_tier")
-      .eq("email", normalizedEmail).maybeSingle();
+      .select("id, email, full_name, email_verified, plan_tier")
+      .eq("id", authData.user.id)
+      .maybeSingle();
 
-    if (error || !user) return res.status(401).json({ error: "Invalid email or password." });
+    if (!user) return res.status(401).json({ error: "Invalid email or password." });
 
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: "Invalid email or password." });
+    if (!user.email_verified)
+      return res.status(403).json({
+        error: "Please verify your email before logging in. Check your inbox for the verification link.",
+      });
 
     const token = signAccessToken({ sub: user.id, email: user.email, plan: user.plan_tier });
     return res.json({
@@ -108,30 +185,35 @@ authRouter.post("/login", async (req, res) => {
         email:         user.email,
         fullName:      user.full_name,
         emailVerified: user.email_verified,
-        planTier:      user.plan_tier
-      }
+        planTier:      user.plan_tier,
+      },
     });
-  } catch {
+  } catch (err) {
+    console.error({ err }, "Login failed");
     return res.status(500).json({ error: "Could not log in. Please try again." });
   }
 });
 
 /* ── GET /api/auth/me ────────────────────────────────────────── */
-authRouter.get("/me", requireAuth, async (req, res) => {
+router.get("/me", requireAuth, async (req, res) => {
   try {
-    const { data: user, error } = await supabase
+    const { data: user } = await supabase
       .from("users")
-      .select("id,email,full_name,email_verified,plan_tier,created_at")
-      .eq("id", req.user.sub).single();
+      .select("id, email, full_name, email_verified, plan_tier, created_at, messages_this_month, billing_period_start")
+      .eq("id", req.user.sub)
+      .single();
 
-    if (error || !user) return res.status(404).json({ error: "User not found." });
+    if (!user) return res.status(404).json({ error: "User not found." });
     return res.json({
-      id:            user.id,
-      email:         user.email,
-      fullName:      user.full_name,
-      emailVerified: user.email_verified,
-      planTier:      user.plan_tier,
-      createdAt:     user.created_at
+      id:                  user.id,
+      email:               user.email,
+      fullName:            user.full_name,
+      emailVerified:       user.email_verified,
+      planTier:            user.plan_tier,
+      createdAt:           user.created_at,
+      messagesThisMonth:   user.messages_this_month,
+      billingPeriodStart:  user.billing_period_start,
+      isSuperAdmin:        user.email?.toLowerCase() === env.superadminEmail?.toLowerCase() && Boolean(env.superadminEmail),
     });
   } catch {
     return res.status(500).json({ error: "Could not fetch user." });
@@ -139,22 +221,23 @@ authRouter.get("/me", requireAuth, async (req, res) => {
 });
 
 /* ── PATCH /api/auth/me ──────────────────────────────────────── */
-authRouter.patch("/me", requireAuth, async (req, res) => {
+router.patch("/me", requireAuth, async (req, res) => {
   try {
     const { fullName } = req.body ?? {};
-    if (!fullName || String(fullName).trim().length < 1)
+    if (!String(fullName ?? "").trim())
       return res.status(400).json({ error: "Name cannot be empty." });
 
     const { data: user, error } = await supabase
       .from("users")
-      .update({ full_name: sanitizeName(String(fullName)), updated_at: new Date().toISOString() })
+      .update({ full_name: sanitizeName(String(fullName)) })
       .eq("id", req.user.sub)
-      .select("id,email,full_name,email_verified,plan_tier").single();
+      .select("id, email, full_name, email_verified, plan_tier")
+      .single();
 
     if (error) return res.status(500).json({ error: "Could not update profile." });
     return res.json({
       id: user.id, email: user.email, fullName: user.full_name,
-      emailVerified: user.email_verified, planTier: user.plan_tier
+      emailVerified: user.email_verified, planTier: user.plan_tier,
     });
   } catch {
     return res.status(500).json({ error: "Could not update profile." });
@@ -162,24 +245,24 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
 });
 
 /* ── POST /api/auth/password ─────────────────────────────────── */
-authRouter.post("/password", requireAuth, async (req, res) => {
+router.post("/password", requireAuth, authLimiter, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body ?? {};
-
     if (!isStrongPassword(String(newPassword ?? "")))
-      return res.status(400).json({ error: "New password must be 8+ chars with uppercase letters and a number." });
+      return res.status(400).json({ error: "New password must be 8+ chars with uppercase and number." });
 
-    const { data: user } = await supabase
-      .from("users").select("password_hash").eq("id", req.user.sub).single();
+    /* Verify current password via Supabase Auth */
+    const { error: verifyError } = await supabase.auth.signInWithPassword({
+      email:    req.user.email,
+      password: String(currentPassword ?? ""),
+    });
 
-    const valid = await bcrypt.compare(String(currentPassword ?? ""), user.password_hash);
-    if (!valid) return res.status(401).json({ error: "Current password is incorrect." });
+    if (verifyError) return res.status(401).json({ error: "Current password is incorrect." });
 
-    const newHash = await bcrypt.hash(String(newPassword), 12);
-    const { error } = await supabase
-      .from("users")
-      .update({ password_hash: newHash, updated_at: new Date().toISOString() })
-      .eq("id", req.user.sub);
+    /* Update the password in Supabase Auth */
+    const { error } = await supabase.auth.admin.updateUserById(req.user.sub, {
+      password: String(newPassword),
+    });
 
     if (error) return res.status(500).json({ error: "Could not update password." });
     return res.json({ message: "Password updated successfully." });
@@ -189,57 +272,120 @@ authRouter.post("/password", requireAuth, async (req, res) => {
 });
 
 /* ── GET /api/auth/apikeys ───────────────────────────────────── */
-authRouter.get("/apikeys", requireAuth, async (req, res) => {
-  const { data: user } = await supabase
-    .from("users").select("settings").eq("id", req.user.sub).single();
-  const keys = (user?.settings?.apiKeys ?? []).map(({ id, name, prefix, createdAt }) => ({ id, name, prefix, createdAt }));
-  return res.json({ keys });
+router.get("/apikeys", requireAuth, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from("users").select("plan_tier").eq("id", req.user.sub).single();
+
+    const { data: keys } = await supabase
+      .from("api_keys")
+      .select("id, name, key_prefix, last_used, created_at")
+      .eq("user_id", req.user.sub)
+      .order("created_at", { ascending: false });
+
+    const plan    = user?.plan_tier ?? "free";
+    const maxKeys = PLAN_KEY_LIMITS[plan] ?? 1;
+
+    return res.json({
+      keys:    keys ?? [],
+      maxKeys,
+      plan,
+      rateLimits: {
+        callsPerMinute:   plan === "paid" ? 300 : 30,
+        messagesPerMonth: plan === "paid" ? 100_000 : 1_000,
+      },
+    });
+  } catch {
+    return res.status(500).json({ error: "Could not fetch API keys." });
+  }
 });
 
 /* ── POST /api/auth/apikeys ──────────────────────────────────── */
-authRouter.post("/apikeys", requireAuth, async (req, res) => {
-  const name = String(req.body?.name ?? "").trim() || "My API Key";
-  const rawKey = `wbk_${crypto.randomBytes(24).toString("hex")}`;
-  const keyHash = crypto.createHash("sha256").update(rawKey).digest("hex");
-  const prefix = rawKey.slice(0, 12);
-  const newEntry = { id: crypto.randomUUID(), name, prefix, keyHash, createdAt: new Date().toISOString() };
+router.post("/apikeys", requireAuth, async (req, res) => {
+  try {
+    const name = sanitizeName(String(req.body?.name ?? "").trim() || "My Key", 60);
 
-  const { data: user } = await supabase
-    .from("users").select("settings").eq("id", req.user.sub).single();
+    const [{ data: user }, { count }] = await Promise.all([
+      supabase.from("users").select("plan_tier").eq("id", req.user.sub).single(),
+      supabase.from("api_keys").select("*", { count: "exact", head: true }).eq("user_id", req.user.sub),
+    ]);
 
-  const existing = user?.settings?.apiKeys ?? [];
-  if (existing.length >= 10)
-    return res.status(400).json({ error: "Maximum of 10 API keys per account." });
+    const plan    = user?.plan_tier ?? "free";
+    const maxKeys = PLAN_KEY_LIMITS[plan] ?? 1;
 
-  const { error } = await supabase
-    .from("users")
-    .update({ settings: { ...(user?.settings ?? {}), apiKeys: [...existing, newEntry] } })
-    .eq("id", req.user.sub);
+    if ((count ?? 0) >= maxKeys) {
+      return res.status(400).json({
+        error: `${plan === "paid" ? "Pro" : "Free"} plan allows up to ${maxKeys} API key${maxKeys === 1 ? "" : "s"}.${plan !== "paid" ? " Upgrade to Pro for up to 10 keys." : ""}`,
+      });
+    }
 
-  if (error) {
-    if (error.code === "42703")
-      return res.status(422).json({ error: "The settings column is not in the database schema. Run the latest migration." });
+    const rawKey    = `wbk_${crypto.randomBytes(24).toString("hex")}`;
+    const keyHash   = crypto.createHash("sha256").update(rawKey).digest("hex");
+    const keyPrefix = rawKey.slice(0, 12);
+
+    const { data: entry, error } = await supabase
+      .from("api_keys")
+      .insert({ user_id: req.user.sub, name, key_hash: keyHash, key_prefix: keyPrefix })
+      .select("id, name, key_prefix, created_at")
+      .single();
+
+    if (error) return res.status(500).json({ error: "Could not create API key." });
+
+    return res.status(201).json({
+      key:   rawKey,
+      entry: { id: entry.id, name: entry.name, key_prefix: entry.key_prefix, created_at: entry.created_at },
+    });
+  } catch {
     return res.status(500).json({ error: "Could not create API key." });
   }
+});
 
-  return res.status(201).json({ key: rawKey, entry: { id: newEntry.id, name, prefix, createdAt: newEntry.createdAt } });
+/* ── POST /api/auth/apikeys/:keyId/rotate ─────────────────────── */
+router.post("/apikeys/:keyId/rotate", requireAuth, async (req, res) => {
+  try {
+    const { data: existing } = await supabase
+      .from("api_keys")
+      .select("id, name, user_id")
+      .eq("id", req.params.keyId)
+      .eq("user_id", req.user.sub)
+      .maybeSingle();
+
+    if (!existing) return res.status(404).json({ error: "API key not found." });
+
+    const rawKey    = `wbk_${crypto.randomBytes(24).toString("hex")}`;
+    const keyHash   = crypto.createHash("sha256").update(rawKey).digest("hex");
+    const keyPrefix = rawKey.slice(0, 12);
+
+    const { data: updated, error } = await supabase
+      .from("api_keys")
+      .update({ key_hash: keyHash, key_prefix: keyPrefix, last_used: null })
+      .eq("id", req.params.keyId)
+      .eq("user_id", req.user.sub)
+      .select("id, name, key_prefix, created_at")
+      .single();
+
+    if (error) return res.status(500).json({ error: "Could not rotate API key." });
+
+    return res.json({ key: rawKey, entry: updated });
+  } catch {
+    return res.status(500).json({ error: "Could not rotate API key." });
+  }
 });
 
 /* ── DELETE /api/auth/apikeys/:keyId ─────────────────────────── */
-authRouter.delete("/apikeys/:keyId", requireAuth, async (req, res) => {
-  const { data: user } = await supabase
-    .from("users").select("settings").eq("id", req.user.sub).single();
+router.delete("/apikeys/:keyId", requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from("api_keys")
+      .delete()
+      .eq("id", req.params.keyId)
+      .eq("user_id", req.user.sub);
 
-  const existing = user?.settings?.apiKeys ?? [];
-  const filtered = existing.filter((k) => k.id !== req.params.keyId);
-  if (filtered.length === existing.length)
-    return res.status(404).json({ error: "API key not found." });
-
-  await supabase.from("users")
-    .update({ settings: { ...(user?.settings ?? {}), apiKeys: filtered } })
-    .eq("id", req.user.sub);
-
-  return res.status(204).send();
+    if (error) return res.status(500).json({ error: "Could not delete API key." });
+    return res.status(204).send();
+  } catch {
+    return res.status(500).json({ error: "Could not delete API key." });
+  }
 });
 
-export default authRouter;
+export default router;
