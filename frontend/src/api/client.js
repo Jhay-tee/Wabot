@@ -2,13 +2,19 @@ function trimTrailingSlash(value) {
   return value.replace(/\/+$/, "");
 }
 
+function normalizeApiBase(value) {
+  const trimmed = value?.trim();
+  if (!trimmed) return "/api";
+
+  const base = trimTrailingSlash(trimmed);
+  return base.endsWith("/api") ? base : `${base}/api`;
+}
+
 const ENV_BASE = typeof import.meta !== "undefined"
   ? import.meta.env.VITE_API_BASE_URL
   : "";
 
-const BASE = ENV_BASE?.trim()
-  ? trimTrailingSlash(ENV_BASE.trim())
-  : "/api";
+export const BASE = normalizeApiBase(ENV_BASE);
 
 export class ApiError extends Error {
   constructor(message, status) {

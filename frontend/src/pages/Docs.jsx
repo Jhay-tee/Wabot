@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { BASE } from "../api/client.js";
 
 const SECTIONS = [
   { id: "overview", label: "Overview" },
@@ -17,15 +18,6 @@ const RATE_LIMITS = [
   { plan: "Free", calls: "30 calls/min", messages: "1,000 messages/month", keys: "1 API key" },
   { plan: "Pro", calls: "300 calls/min", messages: "100,000 messages/month", keys: "10 API keys" },
 ];
-
-function trimTrailingSlash(value) {
-  return value.replace(/\/+$/, "");
-}
-
-function resolveApiBase() {
-  const raw = import.meta.env.VITE_API_BASE_URL?.trim();
-  return raw ? trimTrailingSlash(raw) : "/api";
-}
 
 function CodeBlock({ code }) {
   const [copied, setCopied] = useState(false);
@@ -87,7 +79,7 @@ function Section({ id, title, children }) {
 }
 
 export default function Docs() {
-  const apiBase = useMemo(resolveApiBase, []);
+  const apiBase = useMemo(() => BASE, []);
   const searchBase = apiBase.startsWith("http")
     ? apiBase
     : "Backend URL from `VITE_API_BASE_URL`";
@@ -296,7 +288,7 @@ Authorization: Bearer wbk_YOUR_API_KEY`,
             <Section id="overview" title="Overview">
               <p>Base path: <code>{apiBase}/v1</code>. All developer endpoints live under `/api/v1` on the backend.</p>
               <p>Authentication accepts either a dashboard JWT for first-party usage or a generated API key that starts with <code>wbk_</code>.</p>
-              <p>The frontend and backend can live on different servers. In production, set <code>VITE_API_BASE_URL</code> to your backend origin with <code>/api</code> appended.</p>
+              <p>The frontend and backend can live on different servers. In production, set <code>VITE_API_BASE_URL</code> to your backend origin. If you omit <code>/api</code>, the frontend adds it automatically.</p>
             </Section>
 
             <Section id="auth" title="Authentication">

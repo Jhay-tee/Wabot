@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { BASE } from "../api/client.js";
 
 const FEATURES = [
   { icon: "⚡", title: "Deploy in 60 seconds",  desc: "Name your bot, scan the QR code, and you're live instantly. No coding required." },
@@ -25,7 +26,7 @@ const TERMINAL_LINES = [
 ];
 
 const CODE_SNIPPET = `// Send a WhatsApp message via WaBot API
-const res = await fetch("https://api.wabot.app/api/v1/messages/send", {
+const res = await fetch("${BASE}/v1/messages/send", {
   method: "POST",
   headers: {
     "Authorization": "Bearer wbk_YOUR_API_KEY",

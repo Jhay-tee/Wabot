@@ -21,6 +21,38 @@ const __dirname     = path.dirname(fileURLToPath(import.meta.url));
 const FRONTEND_DIST = path.resolve(__dirname, "../../frontend/dist");
 const IS_PROD       = env.isProd;
 
+function normalizeOrigin(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedOrigin(origin, allowedOrigins) {
+  const normalizedOrigin = normalizeOrigin(origin);
+  if (!normalizedOrigin) return false;
+
+  return allowedOrigins.some((entry) => {
+    if (!entry) return false;
+    if (entry === "*") return true;
+
+    const normalizedEntry = normalizeOrigin(entry);
+    if (normalizedEntry) return normalizedOrigin === normalizedEntry;
+
+    try {
+      const hostname = new URL(normalizedOrigin).hostname;
+      if (entry.startsWith("*.")) {
+        const suffix = entry.slice(2).toLowerCase();
+        return hostname === suffix || hostname.endsWith(`.${suffix}`);
+      }
+      return hostname === entry.toLowerCase();
+    } catch {
+      return false;
+    }
+  });
+}
+
 /* ── App ──────────────────────────────────────────────────────── */
 const app = express();
 app.set("trust proxy", 1);
@@ -50,8 +82,7 @@ const allowedOrigins = env.allowedOrigins.split(",").map((o) => o.trim()).filter
 app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
-    if (allowedOrigins.includes("*")) return cb(null, true);
-    if (allowedOrigins.some((o) => origin === o || origin.endsWith(o.replace(/^https?:\/\//, "")))) {
+    if (isAllowedOrigin(origin, allowedOrigins)) {
       return cb(null, true);
     }
     if (!IS_PROD && (

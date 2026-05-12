@@ -1,8 +1,4 @@
-import { apiFetch } from "./client.js";
-
-function trimTrailingSlash(value) {
-  return value.replace(/\/+$/, "");
-}
+import { apiFetch, BASE } from "./client.js";
 
 export const botsApi = {
   /* Dashboard data */
@@ -17,11 +13,7 @@ export const botsApi = {
   qr:              (id)                     => apiFetch(`/bots/${id}/qr`),
   groups:          (id)                     => apiFetch(`/bots/${id}/groups`),
   eventsUrl:       (id, token) => {
-    /* Must use the full backend origin so SSE works in split-deploy (e.g. Vercel + Render).
-       VITE_API_BASE_URL already ends with /api (e.g. https://api.onrender.com/api). */
-    const rawBase = import.meta.env.VITE_API_BASE_URL?.trim();
-    const base = rawBase ? trimTrailingSlash(rawBase) : "/api";
-    return `${base}/bots/${id}/events?token=${encodeURIComponent(token || "")}`;
+    return `${BASE}/bots/${id}/events?token=${encodeURIComponent(token || "")}`;
   },
 
   /* Send DM from dashboard */

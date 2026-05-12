@@ -276,7 +276,7 @@ High-level deployment layout:
 
 - deploy `frontend/` to Vercel
 - deploy `backend/` to Render or another Node host
-- set `VITE_API_BASE_URL` to your backend URL ending in `/api`
+- set `VITE_API_BASE_URL` to your backend URL; `/api` is optional because the frontend normalizes it automatically
 - set backend environment variables for Supabase, Brevo, and optionally Paystack
 
 ## Environment Variables

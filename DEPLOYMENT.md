@@ -54,10 +54,10 @@ Deploy the `frontend/` folder as a Vite app.
 Set:
 
 ```env
-VITE_API_BASE_URL=https://your-backend-domain.onrender.com/api
+VITE_API_BASE_URL=https://your-backend-domain.onrender.com
 ```
 
-That variable is required for split deployment so browser requests, docs examples, and SSE all target the backend correctly.
+That variable is required for split deployment so browser requests, docs examples, and SSE all target the backend correctly. Adding `/api` is also fine; the frontend normalizes either form.
 
 ## 4. Paystack
 

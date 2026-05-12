@@ -137,7 +137,7 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
       {upgradeError  && <Alert type="error">{upgradeError}</Alert>}
       {manageErr     && <Alert type="error">{manageErr}</Alert>}
       {cancelErr     && <Alert type="error">{cancelErr}</Alert>}
-      {cancelSuccess && <Alert type="success">Subscription cancelled. Your Pro access continues until the end of the current billing period.</Alert>}
+      {cancelSuccess && <Alert type="success">Subscription cancelled. Your account has been moved back to the Free plan.</Alert>}
       {!billingConfigured && (
         <Alert type="warning">
           Pro billing is not configured on this deployment yet. Add `PAYSTACK_SECRET_KEY`, `PAYSTACK_PLAN_CODE`, and `PAYSTACK_WEBHOOK_SECRET` on the backend to enable upgrades.
@@ -251,7 +251,7 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
                   <div style={{ fontSize: "0.875rem", color: "var(--text2)" }}>
-                    <strong>Are you sure?</strong> Cancelling will downgrade your account to Free immediately.
+                    <strong>Are you sure?</strong> Cancelling stops renewal and downgrades your account to Free right away.
                   </div>
                   <div style={{ display: "flex", gap: "0.5rem" }}>
                     <button
