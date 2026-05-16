@@ -395,7 +395,7 @@ export class BotInstance {
       if (await this._handleCommand(jid, body)) return;
       if (await this._handleKeywordTrigger(jid, body)) return;
       if (await this._handleSalesAgent(jid, body)) return;
-      if (await this._handleAiResponse(jid, body)) return;
+      if (await this._handleAiResponse(jid, body, extra, true)) return;
       return; /* No auto-reply fallback in groups */
     }
 
@@ -408,7 +408,7 @@ export class BotInstance {
     if (await this._handleCommand(jid, body)) return;
     if (await this._handleKeywordTrigger(jid, body)) return;
     if (await this._handleSalesAgent(jid, body)) return;
-    if (await this._handleAiResponse(jid, body)) return;
+    if (await this._handleAiResponse(jid, body, extra, false)) return;
 
     /* Standard auto-reply */
     if (this.config.auto_reply_enabled && this.config.auto_reply_message && this.socket) {
@@ -1004,10 +1004,40 @@ export class BotInstance {
   }
 
   /* ── AI response (Pro only) ───────────────────────────────── */
+  /*
+   * trigger_mode (ai_config):
+   *   "all"     — respond to every message (DM default, group opt-in)
+   *   "mention" — respond only when bot is tagged/mentioned (group default)
+   *   "keyword" — respond only when body starts with ai_config.trigger_prefix
+   *               (default "@bot") — works in both DMs and groups
+   *
+   * In groups the default is "mention" to prevent flooding.
+   * In DMs the default is "all" (preserves existing behaviour).
+   */
 
-  async _handleAiResponse(jid, body) {
+  async _handleAiResponse(jid, body, extra = {}, isGroup = false) {
     const ai = this.config.ai_config ?? {};
     if (!ai.enabled || !ai.encrypted_key || this.config.plan_tier !== "paid") return false;
+    if (!body?.trim()) return false;
+
+    /* ── Determine trigger mode ───────────────────────────── */
+    const triggerMode = ai.trigger_mode ?? (isGroup ? "mention" : "all");
+
+    if (triggerMode === "mention") {
+      /* Check if bot JID appears in the mentionedJid list */
+      const botJid      = normalizeJid(this.socket?.user?.id ?? "");
+      const mentioned   = Array.isArray(extra?.mentionedJid) ? extra.mentionedJid : [];
+      const botMentioned = mentioned.some((m) => normalizeJid(m) === botJid
+        || normalizeJid(m).split("@")[0] === botJid.split("@")[0]);
+      if (!botMentioned) return false;
+    } else if (triggerMode === "keyword") {
+      const prefix = (ai.trigger_prefix ?? "@bot").toLowerCase().trim();
+      if (!body.toLowerCase().trimStart().startsWith(prefix)) return false;
+      /* Strip the prefix from the message body before sending to AI */
+      body = body.slice(body.toLowerCase().indexOf(prefix) + prefix.length).trim();
+      if (!body) return false;
+    }
+    /* "all" mode falls through with no extra check */
 
     try {
       const apiKey = decryptApiKey(ai.encrypted_key, env.jwtSecret);

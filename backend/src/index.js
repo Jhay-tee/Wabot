@@ -166,6 +166,14 @@ app.use((err, _req, res, _next) => {
   });
 });
 
+/* ── Process-level safety net (prevent cold-start crashes) ─────── */
+process.on("uncaughtException", (err) => {
+  logger.error({ err }, "Uncaught exception — process continuing");
+});
+process.on("unhandledRejection", (reason) => {
+  logger.error({ reason }, "Unhandled promise rejection — process continuing");
+});
+
 /* ── Start ────────────────────────────────────────────────────── */
 const PORT = Number(process.env.PORT || env.port || 3000);
 

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext.jsx";
+import { useTheme } from "../context/ThemeContext.jsx";
 import { useDashboard } from "../hooks/useDashboard.js";
 import { billingApi } from "../api/billing.js";
 import { PageSpinner } from "../components/ui/Spinner.jsx";
@@ -30,6 +31,8 @@ export default function Dashboard() {
 
   const [tab, setTab] = useState("overview");
   const [showVerifyModal, setShowVerifyModal] = useState(false);
+
+  const { theme, toggle: toggleTheme } = useTheme();
 
   const [upgrading, setUpgrading] = useState(false);
   const [upgradeError, setUpgradeError] = useState("");
@@ -183,6 +186,14 @@ export default function Dashboard() {
             ☰
           </button>
           <h1 className="dash-page-title">{TABS.find((t) => t.id === tab)?.label ?? "Dashboard"}</h1>
+          <button
+            className="btn-theme"
+            onClick={toggleTheme}
+            title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            aria-label="Toggle theme"
+          >
+            {theme === "dark" ? "☀️" : "🌙"}
+          </button>
         </header>
 
         <div className="dash-content">

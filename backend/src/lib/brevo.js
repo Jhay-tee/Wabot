@@ -8,6 +8,7 @@ export async function sendVerificationEmail(toEmail, verifyUrl) {
 
   const response = await fetch("https://api.brevo.com/v3/smtp/email", {
     method: "POST",
+    signal: AbortSignal.timeout(15_000),
     headers: { "Content-Type": "application/json", "api-key": env.brevoApiKey },
     body: JSON.stringify({
       sender: { name: env.brevoSenderName, email: env.brevoSenderEmail },

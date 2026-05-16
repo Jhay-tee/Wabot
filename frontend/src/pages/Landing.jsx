@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import { BASE } from "../api/client.js";
+import { useTheme } from "../context/ThemeContext.jsx";
 
 const FEATURES = [
   { icon: "⚡", title: "Deploy in 60 seconds",  desc: "Name your bot, scan the QR code, and you're live instantly. No coding required." },
@@ -49,6 +50,8 @@ const DEV_FEATURES = [
 ];
 
 export default function Landing() {
+  const { theme, toggle: toggleTheme } = useTheme();
+
   return (
     <div className="landing">
       <nav className="land-nav">
@@ -63,6 +66,14 @@ export default function Landing() {
           <Link to="/docs"    className="land-nav-link" style={{ color: "var(--accent)" }}>Docs</Link>
         </div>
         <div className="land-nav-actions">
+          <button
+            className="btn-theme"
+            onClick={toggleTheme}
+            title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            aria-label="Toggle theme"
+          >
+            {theme === "dark" ? "☀️" : "🌙"}
+          </button>
           <Link to="/login"  className="btn btn-ghost btn-sm">Sign in</Link>
           <Link to="/signup" className="btn btn-primary btn-sm">Get started free</Link>
         </div>
