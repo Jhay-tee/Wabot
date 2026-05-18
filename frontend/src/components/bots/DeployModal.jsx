@@ -9,13 +9,13 @@ const BOT_TYPES = [
     id:    "dm",
     icon:  "💬",
     label: "DM Bot",
-    desc:  "Responds to direct (1-on-1) WhatsApp messages. Perfect for customer support, sales, and personal bots."
+    desc:  "Responds to direct (1-on-1) WhatsApp messages."
   },
   {
     id:    "group",
     icon:  "👥",
     label: "Group Bot",
-    desc:  "Responds inside WhatsApp group chats. Ideal for community management, announcements, and group commands."
+    desc:  "Responds inside WhatsApp group chats."
   }
 ];
 
@@ -23,22 +23,17 @@ const WARNINGS = [
   {
     icon: "⚠️",
     title: "Unofficial automation",
-    desc: "WaBot uses the Baileys library which is not officially supported by WhatsApp. Your account may be flagged or banned for using automation."
+    desc: "WaBot uses Baileys which is not officially supported by WhatsApp."
   },
   {
     icon: "🚫",
     title: "Risk of account ban",
-    desc: "WhatsApp actively detects and bans accounts using unofficial clients. Use a dedicated number — never your personal or primary business number."
+    desc: "Use a dedicated number — never your personal or primary business number."
   },
   {
     icon: "👤",
     title: "You are responsible",
-    desc: "You are solely responsible for how this bot is used. WaBot is not liable for bans, data loss, or any consequences of using WhatsApp automation."
-  },
-  {
-    icon: "💼",
-    title: "Business use",
-    desc: "For official, high-volume WhatsApp business messaging, consider the official WhatsApp Business API (Meta) which is ban-safe and compliant."
+    desc: "You are solely responsible for how this bot is used."
   }
 ];
 
@@ -48,29 +43,31 @@ const POLL_MS       = 8_000;
 const TIMEOUT_MS    = 10 * 60_000;
 
 export function DeployModal({ user, onClose, onDeployed }) {
-  const [step,         setStep]         = useState("warning");
-  const [accepted,     setAccepted]     = useState(false);
-  const [name,         setName]         = useState("");
-  const [desc,         setDesc]         = useState("");
-  const [botType,      setBotType]      = useState("dm");
-  const [loading,      setLoading]      = useState(false);
-  const [error,        setError]        = useState("");
-  const [qrUrl,        setQrUrl]        = useState(null);
-  const [countdown,    setCountdown]    = useState(QR_LIFE_S);
-  const [qrExpired,    setQrExpired]    = useState(false);
-  const [method,       setMethod]       = useState("qr");
-  const [pairCode,     setPairCode]     = useState(null);
+  const [step, setStep] = useState("warning");
+  const [accepted, setAccepted] = useState(false);
+  const [name, setName] = useState("");
+  const [desc, setDesc] = useState("");
+  const [botType, setBotType] = useState("dm");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [qrUrl, setQrUrl] = useState(null);
+  const [countdown, setCountdown] = useState(QR_LIFE_S);
+  const [qrExpired, setQrExpired] = useState(false);
+  const [method, setMethod] = useState("qr");
+  const [pairCode, setPairCode] = useState(null);
   const [pairExpiresAt, setPairExpiresAt] = useState(null);
-  const [phoneInput,   setPhoneInput]   = useState("");
+  const [phoneInput, setPhoneInput] = useState("");
   const [showMethodSelect, setShowMethodSelect] = useState(false);
+  const [connectionStep, setConnectionStep] = useState("waiting"); // waiting, showing
 
-  const esRef          = useRef(null);
-  const timeoutRef     = useRef(null);
-  const pollRef        = useRef(null);
-  const firstPollRef   = useRef(null);
-  const cdRef          = useRef(null);
-  const connectedRef   = useRef(false);
-  const botIdRef       = useRef(null);
+  const esRef = useRef(null);
+  const timeoutRef = useRef(null);
+  const pollRef = useRef(null);
+  const firstPollRef = useRef(null);
+  const cdRef = useRef(null);
+  const connectedRef = useRef(false);
+  const botIdRef = useRef(null);
+  const codeReceivedRef = useRef(false);
 
   useEffect(() => () => {
     esRef.current?.close();
@@ -133,34 +130,47 @@ export function DeployModal({ user, onClose, onDeployed }) {
 
   const connectSse = useCallback((botId, onConn) => {
     const token = localStorage.getItem("wabot_token") ?? "";
-    const es    = new EventSource(botsApi.eventsUrl(botId, token));
+    const es = new EventSource(botsApi.eventsUrl(botId, token));
     esRef.current = es;
 
     es.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
-        if (msg.type === "qr")     markQr(msg.qrUrl);
+        console.log("[SSE] Received:", msg); // DEBUG LOG
+        
+        if (msg.type === "qr") {
+          markQr(msg.qrUrl);
+        }
         if (msg.type === "pair_code") {
-          if (typeof msg.code === "string") setPairCode(msg.code);
-          else if (msg.code && typeof msg.code === "object") {
+          console.log("[SSE] Pairing code received:", msg.code);
+          codeReceivedRef.current = true;
+          if (typeof msg.code === "string") {
+            setPairCode(msg.code);
+          } else if (msg.code && typeof msg.code === "object") {
             setPairCode(msg.code.code ?? null);
             setPairExpiresAt(msg.code.expiresAt ?? null);
           }
+          setConnectionStep("showing");
         }
         if (msg.type === "status") {
           if (msg.status === "connected") onConn(es);
         }
-      } catch {}
+      } catch (err) {
+        console.error("[SSE] Parse error:", err);
+      }
     };
-    es.onerror = () => {};
+
+    es.onerror = (err) => {
+      console.error("[SSE] Error:", err);
+    };
 
     timeoutRef.current = setTimeout(() => {
-      if (!connectedRef.current) {
+      if (!connectedRef.current && !codeReceivedRef.current) {
         es.close();
         clearTimeout(firstPollRef.current);
         clearInterval(pollRef.current);
         clearInterval(cdRef.current);
-        setError("Connection timed out (10 min). Please try deploying again.");
+        setError("Connection timed out (10 min). Please try again.");
         setStep("form");
         setShowMethodSelect(false);
       }
@@ -177,6 +187,10 @@ export function DeployModal({ user, onClose, onDeployed }) {
   const deployWithMethod = async () => {
     setLoading(true);
     setError("");
+    codeReceivedRef.current = false;
+    setPairCode(null);
+    setConnectionStep("waiting");
+    
     try {
       const data = await botsApi.deploy({ 
         botName: name.trim(), 
@@ -187,9 +201,12 @@ export function DeployModal({ user, onClose, onDeployed }) {
       });
       const botId = data.bot.id;
       
+      // Check if pairing code is in the immediate response
       if (data.pairing?.code) {
+        console.log("[Deploy] Pairing code from response:", data.pairing.code);
         setPairCode(data.pairing.code);
         if (data.pairing.expiresAt) setPairExpiresAt(data.pairing.expiresAt);
+        setConnectionStep("showing");
       }
       
       connectedRef.current = false;
@@ -200,13 +217,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
       connectSse(botId, markConnected);
       startPolling(botId);
       
-      if (method === "code" && !pairCode && phoneInput) {
-        try {
-          const resp = await botsApi.createPairingCode(botId, phoneInput.replace(/[^0-9]/g, ''));
-          setPairCode(resp.code);
-          setPairExpiresAt(resp.expiresAt);
-        } catch (e) {}
-      }
     } catch (err) {
       setError(err.message);
       setShowMethodSelect(true);
@@ -235,10 +245,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
           <div>
             <div style={{ fontSize: "2rem", textAlign: "center" }}>⚠️</div>
             <h3 style={{ color: "var(--warning)", textAlign: "center", marginBottom: "0.5rem" }}>Before you deploy</h3>
-            <p style={{ fontSize: "0.875rem", color: "var(--text2)", textAlign: "center", marginBottom: "1rem" }}>
-              Please read and acknowledge the following
-            </p>
-
             <div style={{ display: "flex", flexDirection: "column", gap: "0.625rem", maxHeight: "280px", overflowY: "auto", marginBottom: "1rem" }}>
               {WARNINGS.map((w) => (
                 <div key={w.title} style={{
@@ -273,12 +279,11 @@ export function DeployModal({ user, onClose, onDeployed }) {
             }}>
               <input type="checkbox" checked={accepted} onChange={(e) => setAccepted(e.target.checked)} style={{ marginTop: "2px", flexShrink: 0 }} />
               <span style={{ fontSize: "0.73rem", color: "var(--text2)", lineHeight: 1.4 }}>
-                I understand that WhatsApp automation is unofficial and may result in my account being banned.
-                I accept full responsibility.
+                I understand the risks and accept responsibility.
               </span>
             </label>
 
-            <div style={{ display: "flex", gap: "0.75rem", flexDirection: "row", flexWrap: "wrap" }}>
+            <div style={{ display: "flex", gap: "0.75rem" }}>
               <button className="btn btn-secondary" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
               <button className="btn btn-primary" disabled={!accepted} onClick={() => setStep("form")} style={{ flex: 1 }}>Continue →</button>
             </div>
@@ -338,13 +343,13 @@ export function DeployModal({ user, onClose, onDeployed }) {
             
             <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem", marginBottom: "1rem" }}>
               <button className={method === "qr" ? "btn btn-primary" : "btn btn-secondary"} onClick={() => setMethod("qr")} style={{ width: "100%", padding: "0.875rem" }}>📱 QR Code</button>
-              <button className={method === "code" ? "btn btn-primary" : "btn btn-secondary"} onClick={() => setMethod("code")} style={{ width: "100%", padding: "0.875rem" }}>🔢 Pairing Code (mobile)</button>
+              <button className={method === "code" ? "btn btn-primary" : "btn btn-secondary"} onClick={() => setMethod("code")} style={{ width: "100%", padding: "0.875rem" }}>🔢 Pairing Code</button>
             </div>
 
             {method === "code" && (
               <div style={{ marginBottom: "1rem" }}>
-                <label className="field-label">Phone number (international format)</label>
-                <input className="input" placeholder="e.g. 628123456789" value={phoneInput} onChange={(e) => setPhoneInput(e.target.value)} />
+                <label className="field-label">Phone number</label>
+                <input className="input" placeholder="e.g., 628123456789" value={phoneInput} onChange={(e) => setPhoneInput(e.target.value)} />
                 <div style={{ fontSize: "0.7rem", color: "var(--text3)", marginTop: "0.25rem" }}>
                   No + sign, no spaces. Just numbers with country code.
                 </div>
@@ -362,11 +367,11 @@ export function DeployModal({ user, onClose, onDeployed }) {
           </div>
         )}
 
-        {/* Step 2: Connection Screen (QR or Pairing Code) */}
+        {/* Step 2: Connection Screen */}
         {step === "connecting" && (
           <div>
             <div style={{ fontSize: "2rem", textAlign: "center" }}>{method === "qr" ? "📱" : "🔢"}</div>
-            <h3 style={{ textAlign: "center", marginBottom: "1rem", fontSize: "1rem" }}>{method === "qr" ? "Scan QR Code" : "Enter Pairing Code"}</h3>
+            <h3 style={{ textAlign: "center", marginBottom: "1rem" }}>{method === "qr" ? "Scan QR Code" : "Enter Pairing Code"}</h3>
 
             {method === "code" ? (
               <div style={{ textAlign: "center" }}>
@@ -377,7 +382,7 @@ export function DeployModal({ user, onClose, onDeployed }) {
                       fontWeight: "bold", 
                       letterSpacing: "0.3rem",
                       background: "linear-gradient(135deg, var(--accent) 0%, #c084fc 100%)",
-                      padding: "0.75rem",
+                      padding: "1rem",
                       borderRadius: "var(--radius-xl)",
                       fontFamily: "monospace",
                       color: "white",
@@ -396,9 +401,9 @@ export function DeployModal({ user, onClose, onDeployed }) {
                     }}>
                       <p style={{ fontWeight: "bold", marginBottom: "0.5rem", fontSize: "0.8rem" }}>📋 Instructions:</p>
                       <ol style={{ marginLeft: "1rem", color: "var(--text2)", lineHeight: "1.6", fontSize: "0.7rem" }}>
-                        <li>Open WhatsApp on your <strong>phone</strong></li>
-                        <li>Go to <strong>Settings</strong> → <strong>Linked Devices</strong></li>
-                        <li>Tap <strong>Link with phone number</strong></li>
+                        <li>Open WhatsApp on your phone</li>
+                        <li>Go to Settings → Linked Devices</li>
+                        <li>Tap "Link with phone number"</li>
                         <li>Enter the 8-digit code above</li>
                       </ol>
                     </div>
@@ -412,7 +417,8 @@ export function DeployModal({ user, onClose, onDeployed }) {
                 ) : (
                   <div style={{ padding: "1rem", textAlign: "center" }}>
                     <Spinner size="lg" />
-                    <p style={{ marginTop: "0.5rem", color: "var(--text2)", fontSize: "0.8rem" }}>Generating pairing code...</p>
+                    <p style={{ marginTop: "0.5rem", color: "var(--text2)", fontSize: "0.8rem" }}>Waiting for pairing code...</p>
+                    <p style={{ marginTop: "0.25rem", color: "var(--text3)", fontSize: "0.7rem" }}>This may take a few seconds</p>
                   </div>
                 )}
               </div>

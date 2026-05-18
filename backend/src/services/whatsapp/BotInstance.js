@@ -191,8 +191,8 @@ export class BotInstance {
     this._usageFlushInFlight  = false;
     this._logFlushInFlight    = false;
     this._onQR     = new Set();
-  this._onStatus = new Set();
-  this._onPair   = new Set();
+    this._onStatus = new Set();
+    this._onPair   = new Set();
     this._pendingUsage = { messagesThisMonth: 0, totalMessages: 0, lastActivity: null };
     this._pendingLogs  = [];
 
@@ -1301,7 +1301,7 @@ export class BotInstance {
     if (this._flushTimer) return;
     this._flushTimer = setTimeout(() => {
       this._flushTimer = null;
-      this._flushPendingUsage().catch(() => {});
+      this._flushPendingUsage();
     }, 5000);
   }
 
@@ -1322,15 +1322,22 @@ export class BotInstance {
         await supabase.from("bots").update(patch).eq("id", this.botId);
       }
       if (pending.totalMessages > 0) {
-        await supabase.rpc("increment_bot_messages_by", {
-          bid: this.botId,
-          amount: pending.totalMessages
-        }).catch(async () => {
+        try {
+          await supabase.rpc("increment_bot_messages_by", {
+            bid: this.botId,
+            amount: pending.totalMessages
+          });
+        } catch {
+          // Fallback if RPC doesn't exist
           for (let i = 0; i < pending.totalMessages; i += 1) {
-            await supabase.rpc("increment_bot_messages", { bid: this.botId }).catch(() => {});
+            try {
+              await supabase.rpc("increment_bot_messages", { bid: this.botId });
+            } catch {}
           }
-        });
+        }
       }
+    } catch (err) {
+      logger.warn({ botId: this.botId, error: err.message }, "Failed to flush pending usage");
     } finally {
       this._usageFlushInFlight = false;
     }
@@ -1338,13 +1345,13 @@ export class BotInstance {
 
   _scheduleLogFlush() {
     if (this._pendingLogs.length >= 20) {
-      this._flushLogs().catch(() => {});
+      this._flushLogs();
       return;
     }
     if (this._logFlushTimer) return;
     this._logFlushTimer = setTimeout(() => {
       this._logFlushTimer = null;
-      this._flushLogs().catch(() => {});
+      this._flushLogs();
     }, 2000);
   }
 
@@ -1354,15 +1361,41 @@ export class BotInstance {
     const batch = this._pendingLogs.splice(0, this._pendingLogs.length);
     try {
       await supabase.from("bot_activity").insert(batch);
-    } catch {}
+    } catch (err) {
+      logger.warn({ botId: this.botId, error: err.message }, "Failed to insert activity logs");
+    }
     this._logFlushInFlight = false;
   }
 
   async _setStatus(status) {
     if (this.status === status) return;
+    
+    const oldStatus = this.status;
     this.status = status;
-    for (const cb of this._onStatus) cb(status);
-    await supabase.from("bots").update({ status, updated_at: new Date().toISOString() }).eq("id", this.botId).catch(() => {});
+    
+    // Notify all status listeners
+    for (const cb of this._onStatus) {
+      try { cb(status); } catch (e) {}
+    }
+    
+    // Update database - use try/catch instead of .catch()
+    try {
+      await supabase
+        .from("bots")
+        .update({ 
+          status, 
+          updated_at: new Date().toISOString() 
+        })
+        .eq("id", this.botId);
+    } catch (err) {
+      // Log error but don't crash the bot
+      logger.warn({ 
+        botId: this.botId, 
+        oldStatus, 
+        newStatus: status, 
+        error: err.message 
+      }, "Failed to update bot status in database");
+    }
   }
 
   async _log(eventType, details, metadata = {}) {

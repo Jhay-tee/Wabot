@@ -10,6 +10,7 @@ const FEATURES = [
   { label: "API keys",            free: "1",       pro: "10"       },
   { label: "Message templates",   free: "10",      pro: "200"      },
   { label: "QR deployment",       free: "✓",       pro: "✓"        },
+  { label: "Pairing code",        free: "✓",       pro: "✓"        },
   { label: "Webhooks",            free: "✓",       pro: "✓"        },
   { label: "Auto-reply",          free: "✓",       pro: "✓"        },
   { label: "AI integration",      free: "—",       pro: "✓"        },
@@ -33,7 +34,6 @@ const STATUS_INFO = {
 
 export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, managing }) {
   const isPro = user?.plan_tier === "paid";
-  const canUseProFromSubscription = (status) => status === "active";
 
   const [sub,           setSub]           = useState(null);
   const [subLoading,    setSubLoading]    = useState(false);
@@ -66,7 +66,7 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
       await onManage();
     } catch (err) {
       if (err?.status === 503) {
-        setBillingPopupMsg(err.message || "Billing is not confirmed on this server.");
+        setBillingPopupMsg("Payment processing is temporarily unavailable. Please try again later.");
         setShowBillingPopup(true);
         return;
       }
@@ -76,7 +76,7 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
 
   const handleUpgrade = async () => {
     if (!billingConfigured) {
-      setBillingPopupMsg("Pro features aren't available yet on this deployment. Please continue using the Free plan for now.");
+      setBillingPopupMsg("Pro plan upgrades are temporarily unavailable. Please check back later.");
       setShowBillingPopup(true);
       return;
     }
@@ -84,10 +84,9 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
       await onUpgrade();
     } catch (err) {
       if (err?.status === 503) {
-        setBillingPopupMsg(err.message || "Billing is not confirmed on this server.");
+        setBillingPopupMsg("Payment processing is temporarily unavailable. Please try again later.");
         setShowBillingPopup(true);
       }
-      /* Non-503 errors: already shown via the upgradeError prop set by Dashboard */
     }
   };
 
@@ -119,14 +118,14 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
         <div className="modal-backdrop" onClick={() => setShowBillingPopup(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 520 }}>
             <div className="section-heading" style={{ marginBottom: "0.75rem" }}>
-              <span>Billing not confirmed</span>
+              <span>Pro Plan Unavailable</span>
             </div>
             <p style={{ color: "var(--text2)", lineHeight: 1.6, marginBottom: "1rem" }}>
-              {billingPopupMsg || "Billing is not confirmed on this server."}
+              {billingPopupMsg || "Pro plan upgrades are not available right now. Please try again later."}
             </p>
             <div style={{ display: "flex", justifyContent: "flex-end" }}>
               <button className="btn btn-primary" onClick={() => setShowBillingPopup(false)}>
-                OK
+                Got it
               </button>
             </div>
           </div>
@@ -139,9 +138,10 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
       {manageErr     && <Alert type="error">{manageErr}</Alert>}
       {cancelErr     && <Alert type="error">{cancelErr}</Alert>}
       {cancelSuccess && <Alert type="success">Subscription cancelled. Your account has been moved back to the Free plan.</Alert>}
+      
       {!billingConfigured && (
-        <Alert type="warning">
-          Pro billing is not configured on this deployment yet. Add `PAYSTACK_SECRET_KEY`, `PAYSTACK_PLAN_CODE`, and `PAYSTACK_WEBHOOK_SECRET` on the backend to enable upgrades.
+        <Alert type="info">
+          🚧 Pro plan upgrades are coming soon. You can continue using all Free features.
         </Alert>
       )}
 
@@ -211,7 +211,7 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
         <div className="upgrade-banner">
           <div>
             <div style={{ fontWeight: 700, marginBottom: "0.25rem" }}>
-              WaBot Pro — ₦1,500 / month
+              WaBot Pro — Upgrade for more
             </div>
             <div className="text-sm text-muted">
               50 bots · 100,000 messages/month · 10 API keys · AI · Broadcast · Priority support
@@ -232,11 +232,11 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
                 Manage your subscription
               </div>
               <div style={{ fontSize: "0.8rem", color: "var(--text2)" }}>
-                Update your payment method or view your subscription details on Paystack.
+                Update your payment method or view your subscription details.
               </div>
             </div>
             <button className="btn btn-secondary btn-sm" onClick={handleManage} disabled={managing}>
-              {managing ? <Spinner size="sm" /> : "Open on Paystack ↗"}
+              {managing ? <Spinner size="sm" /> : "Manage ↗"}
             </button>
           </div>
 
@@ -281,13 +281,13 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
           <span>Plan comparison</span>
         </div>
         <div className="table-wrap">
-          <table>
+          <table className="admin-table">
             <thead>
               <tr>
                 <th style={{ width: "50%" }}>Feature</th>
                 <th style={{ textAlign: "center" }}>Free</th>
                 <th style={{ textAlign: "center", color: isPro ? "var(--success)" : "var(--accent)" }}>
-                  Pro · ₦1,500/mo
+                  Pro
                 </th>
               </tr>
             </thead>
@@ -310,7 +310,7 @@ export function Billing({ user, onUpgrade, upgrading, upgradeError, onManage, ma
 
       {isPro && (
         <div style={{ fontSize: "0.775rem", color: "var(--text3)", textAlign: "center" }}>
-          Subscriptions are billed monthly via Paystack. Cancellations take effect immediately.
+          Subscriptions are billed monthly. Cancellations take effect immediately.
           Monthly message limits reset automatically each billing cycle.
         </div>
       )}
