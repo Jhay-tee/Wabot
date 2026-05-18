@@ -145,7 +145,7 @@ router.get("/dashboard", async (req, res) => {
       .select("id, email, full_name, email_verified, plan_tier, created_at, messages_this_month, billing_period_start")
       .eq("id", userId).single(),
     supabase.from("bots")
-      .select("id, bot_name, description, status, bot_type, messages_count, messages_this_month, auto_reply_enabled, webhook_url, keyword_triggers, sales_agent_config, commands_config, ai_config, group_management_config, website_url, catalog_unavail_msg, created_at, last_activity")
+      .select("id, bot_name, description, status, bot_type, messages_count, messages_this_month, auto_reply_enabled, webhook_url, keyword_triggers, sales_agent_config, commands_config, ai_config, group_management_config, created_at")
       .eq("user_id", userId)
       .order("created_at", { ascending: false }),
     supabase.from("bot_activity")
@@ -260,6 +260,7 @@ router.post("/deploy", deployLimiter, async (req, res) => {
   }
 
   let pairingCode = null;
+  let pairingExpiresAt = null;
   try {
     // Start the instance
     await botManager.deploy(bot.id, userId, { plan_tier: plan, bot_type: botType });
@@ -272,6 +273,7 @@ router.post("/deploy", deployLimiter, async (req, res) => {
       try {
         // Use retry logic for pairing code request
         pairingCode = await requestPairingCodeWithRetry(bot.id, phone);
+        pairingExpiresAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
       } catch (err) {
         logger.warn({ err, botId: bot.id, phone }, "Could not request pairing code during deploy");
       }
@@ -287,7 +289,7 @@ router.post("/deploy", deployLimiter, async (req, res) => {
   }).catch(() => {});
 
   const payload = { bot };
-  if (pairingCode) payload.pairing = { code: pairingCode };
+  if (pairingCode) payload.pairing = { code: pairingCode, expiresAt: pairingExpiresAt };
   return res.status(201).json(payload);
 });
 
@@ -373,7 +375,8 @@ router.post("/:id/request-pairing", async (req, res) => {
 
   try {
     const code = await requestPairingCodeWithRetry(id, phone);
-    return res.json({ ok: true, code });
+    const expiresAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+    return res.json({ ok: true, code, expiresAt });
   } catch (err) {
     return res.status(500).json({ error: err?.message ?? "Could not request pairing code." });
   }
@@ -530,7 +533,7 @@ router.patch("/:id", async (req, res) => {
 
   const { data: updated, error } = await supabase
     .from("bots").update(updates).eq("id", id)
-    .select("id, bot_name, description, status, bot_type, auto_reply_enabled, auto_reply_message, webhook_url, webhook_secret, keyword_triggers, sales_agent_config, commands_config, ai_config, group_management_config, website_url, catalog_unavail_msg, messages_count, messages_this_month, created_at")
+    .select("id, bot_name, description, status, bot_type, auto_reply_enabled, auto_reply_message, webhook_url, webhook_secret, keyword_triggers, sales_agent_config, commands_config, ai_config, group_management_config, website_url, catalog_unavail_msg, created_at")
     .single();
 
   if (error) return res.status(500).json({ error: "Could not update bot." });
