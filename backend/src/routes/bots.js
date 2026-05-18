@@ -8,6 +8,7 @@ import { supabase }      from "../lib/supabase.js";
 import { requireAuth }   from "../middleware/auth.js";
 import { deployLimiter } from "../middleware/rateLimiter.js";
 import { botManager }    from "../services/whatsapp/BotManager.js";
+import { logger }        from "../utils/logger.js";
 import { dashboardRealtime } from "../services/realtime/DashboardRealtime.js";
 import { AI_PROVIDERS, encryptApiKey } from "../services/ai/AiService.js";
 import { env }           from "../config/env.js";
@@ -231,15 +232,37 @@ router.post("/deploy", deployLimiter, async (req, res) => {
     return res.status(500).json({ error: "Could not create bot. Please try again." });
   }
 
-  botManager.deploy(bot.id, userId, { plan_tier: plan, bot_type: botType }).catch(() => {});
+  let pairingCode = null;
+  try {
+    // Start the instance and wait for the socket to be created so pairing can be requested.
+    const instance = await botManager.deploy(bot.id, userId, { plan_tier: plan, bot_type: botType });
+
+    // If the frontend asked for phone+code pairing during deploy, kick off the native pairing code flow.
+    const method = String(req.body?.method ?? "").toLowerCase();
+    const phone = String(req.body?.phone ?? "").trim();
+    if (method === "code" && phone) {
+      try {
+        pairingCode = await botManager.requestPairingCode(bot.id, phone);
+      } catch (err) {
+        logger.warn({ err, botId: bot.id, phone }, "Could not request pairing code during deploy");
+      }
+    }
+  } catch (err) {
+    // Deploy/start failed — log and continue. The bot row was created so frontend can still show the record.
+    logger.error({ err, botId: bot.id }, "botManager.deploy failed during deploy route");
+  }
 
   await supabase.from("bot_activity").insert({
     user_id: userId, bot_id: bot.id, event_type: "deploy_started",
     details: `Bot "${botName}" (${botType}) deployed — waiting for QR scan`
   }).catch(() => {});
 
-  return res.status(201).json({ bot });
+  const payload = { bot };
+  if (pairingCode) payload.pairing = { code: pairingCode };
+  return res.status(201).json(payload);
 });
+
+/* pairing code endpoints were removed in favor of native Baileys pairing */
 
 /* ── GET /api/bots/:id/events (SSE) ─────────────────────────── */
 router.get("/:id/events", async (req, res) => {
@@ -312,7 +335,30 @@ router.post("/:id/reconnect", async (req, res) => {
   }
 });
 
+/* ── POST /api/bots/:id/request-pairing ───────────────────── */
+router.post("/:id/request-pairing", async (req, res) => {
+  const userId = req.user.sub;
+  const { id } = req.params;
+  const phone = String(req.body?.phone ?? "").trim();
+
+  const { data: bot } = await supabase.from("bots").select("id, user_id").eq("id", id).maybeSingle();
+  if (!bot || bot.user_id !== userId) return res.status(404).json({ error: "Bot not found." });
+
+  try {
+    const code = await botManager.requestPairingCode(id, phone);
+    return res.json({ ok: true, code });
+  } catch (err) {
+    return res.status(500).json({ error: err?.message ?? "Could not request pairing code." });
+  }
+});
+
 /* ── POST /api/bots/:id/send ─────────────────────────────────── */
+/* 
+ * Dashboard manual message send.
+ * - Updates monthly counter (counts toward user's plan limit)
+ * - Does NOT save message content to database (persist: false)
+ * - Returns 429 if monthly limit reached
+ */
 router.post("/:id/send", async (req, res) => {
   const userId = req.user.sub;
   const { id } = req.params;
@@ -335,13 +381,42 @@ router.post("/:id/send", async (req, res) => {
     .from("bots").select("id, user_id, status").eq("id", id).maybeSingle();
   if (!bot || bot.user_id !== userId) return res.status(404).json({ error: "Bot not found." });
 
+  // Check monthly limit before sending
+  const { data: user } = await supabase
+    .from("users")
+    .select("messages_this_month, plan_tier")
+    .eq("id", userId)
+    .single();
+
+  const limit = user?.plan_tier === "paid" ? 100_000 : 1_000;
+  const currentUsage = user?.messages_this_month ?? 0;
+
+  if (currentUsage >= limit) {
+    return res.status(429).json({ 
+      error: `Monthly message limit reached (${limit.toLocaleString()} messages). Upgrade to Pro for 100,000 messages/month.`,
+      code: "MONTHLY_LIMIT_REACHED",
+      used: currentUsage,
+      limit: limit
+    });
+  }
+
   try {
-  await botManager.sendMessage(id, to, message, { persist: false });
-    // Do not persist manual dashboard sends to Supabase (user requested direct send without DB insert)
+    // Allow dashboard to send either text or media.
+    let payload = message;
+    if (req.body?.media && typeof req.body.media === "object") {
+      payload = { media: req.body.media };
+    }
+    
+    // Use countOnly: true to update counter but NOT save message content
+    await botManager.sendMessage(id, to, payload, { persist: false, countOnly: true });
+    
     return res.json({ ok: true, message: "Message sent." });
   } catch (err) {
-    // If message sending fails, do not insert a DB record. Return error to client.
-    return res.status(409).json({ error: err.message });
+    // Check if it's a rate limit error from BotManager
+    if (err.message?.includes("Monthly message limit reached")) {
+      return res.status(429).json({ error: err.message });
+    }
+    return res.status(409).json({ error: err?.message ?? "Message send failed." });
   }
 });
 

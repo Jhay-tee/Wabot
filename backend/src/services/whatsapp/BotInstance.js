@@ -191,7 +191,8 @@ export class BotInstance {
     this._usageFlushInFlight  = false;
     this._logFlushInFlight    = false;
     this._onQR     = new Set();
-    this._onStatus = new Set();
+  this._onStatus = new Set();
+  this._onPair   = new Set();
     this._pendingUsage = { messagesThisMonth: 0, totalMessages: 0, lastActivity: null };
     this._pendingLogs  = [];
 
@@ -211,8 +212,30 @@ export class BotInstance {
   }
 
   onQR(cb)     { this._onQR.add(cb);     return () => this._onQR.delete(cb); }
+  onPairCode(cb) { this._onPair.add(cb); return () => this._onPair.delete(cb); }
   onStatus(cb) { this._onStatus.add(cb); return () => this._onStatus.delete(cb); }
   updateConfig(patch) { this.config = { ...this.config, ...patch }; }
+
+  /* ── Helper: Increment user's monthly counter in DB ───────── */
+  async _incrementUserMonthlyCounter() {
+    try {
+      await supabase.rpc("increment_user_messages", { uid: this.userId });
+    } catch (err) {
+      // Fallback if RPC doesn't exist
+      const { data: user } = await supabase
+        .from("users")
+        .select("messages_this_month")
+        .eq("id", this.userId)
+        .single();
+      
+      if (user) {
+        await supabase
+          .from("users")
+          .update({ messages_this_month: (user.messages_this_month ?? 0) + 1 })
+          .eq("id", this.userId);
+      }
+    }
+  }
 
   /* ── Start / stop ─────────────────────────────────────────── */
 
@@ -246,6 +269,11 @@ export class BotInstance {
       this.socket.ev.on("connection.update", (update) =>
         this._onConnectionUpdate(update));
 
+      // expose requestPairingCode if available on socket
+      if (this.socket.requestPairingCode) {
+        // nothing to do now — method will be called when requested
+      }
+
       this.socket.ev.on("messages.upsert", (upsert) =>
         this._onMessages(upsert));
 
@@ -275,7 +303,29 @@ export class BotInstance {
     if (this.status !== "connected") throw new Error("Bot is not connected. Check bot status and try again.");
     const jid = to.replace(/[^0-9]/g, "") + "@s.whatsapp.net";
     await this._queue.send(async () => {
-      await this.socket.sendMessage(jid, { text });
+      try {
+        // Support sending a plain text string or an object describing media
+        if (typeof text === "string") {
+          await this.socket.sendMessage(jid, { text });
+        } else if (text && typeof text === "object" && text.media) {
+          const m = text.media;
+          // Expect media: { type: 'image'|'video'|'document', url, caption, fileName }
+          if (m.type === "image") {
+            await this.socket.sendMessage(jid, { image: { url: m.url }, caption: m.caption ?? undefined });
+          } else if (m.type === "video") {
+            await this.socket.sendMessage(jid, { video: { url: m.url }, caption: m.caption ?? undefined });
+          } else if (m.type === "document") {
+            await this.socket.sendMessage(jid, { document: { url: m.url }, fileName: m.fileName ?? undefined, mimetype: m.mimetype ?? undefined, caption: m.caption ?? undefined });
+          } else {
+            throw new Error("Unsupported media type");
+          }
+        } else {
+          throw new Error("Invalid message payload");
+        }
+      } catch (err) {
+        logger.error({ err, botId: this.botId, to }, "sendMessage failed");
+        throw err;
+      }
     });
     if (options.persist !== false) {
       this._queueUsage({ totalMessages: 1, lastActivity: new Date().toISOString() });
@@ -286,6 +336,12 @@ export class BotInstance {
   /* ── Connection update ────────────────────────────────────── */
 
   async _onConnectionUpdate({ connection, lastDisconnect, qr }) {
+    // Clear any outstanding pair codes on open
+    if (connection === "open") {
+      try {
+        for (const cb of this._onPair) cb(null);
+      } catch {}
+    }
     if (qr) {
       try {
         this.qrCode = await QRCode.toDataURL(qr);
@@ -334,6 +390,20 @@ export class BotInstance {
       if (!this._destroyed) {
         this._scheduleReconnect();
       }
+    }
+  }
+
+  async requestPairingCode(phone) {
+    if (!this.socket) throw new Error("Bot socket not started.");
+    if (!this.socket.requestPairingCode) throw new Error("Pairing not supported by this Baileys version.");
+    try {
+      const code = await this.socket.requestPairingCode(phone);
+      this._lastPairingCode = code; // Store for SSE clients
+      for (const cb of this._onPair) cb(code);
+      return code;
+    } catch (err) {
+      logger.error({ err, botId: this.botId }, "requestPairingCode failed");
+      throw err;
     }
   }
 
@@ -451,15 +521,27 @@ export class BotInstance {
     /* ── Extract message body ──────────────────────────────── */
     const { text: body, type: msgType, extra } = extractMessageBody(msg);
 
-    /* ── Plan message limit ─────────────────────────────────── */
+    /* ── Plan message limit check (incoming messages count toward limit) ── */
     const limit = PLAN_MSG_LIMITS[this.config.plan_tier] ?? PLAN_MSG_LIMITS.free;
-    if ((this.config.messages_this_month ?? 0) >= limit) {
-      logger.warn({ botId: this.botId }, "Monthly message limit reached");
-      return;
+    
+    // Fetch current usage from DB to ensure accuracy across multiple bots
+    const { data: user } = await supabase
+      .from("users")
+      .select("messages_this_month, plan_tier")
+      .eq("id", this.userId)
+      .single();
+    
+    const currentUsage = user?.messages_this_month ?? 0;
+    
+    if (currentUsage >= limit) {
+      logger.warn({ botId: this.botId, userId: this.userId, usage: currentUsage, limit }, "Monthly message limit reached — dropping incoming message");
+      return; // Silently drop the message, don't process or reply
     }
 
-    /* ── Increment counters ─────────────────────────────────── */
+    /* ── Increment counter for this incoming message (since it will trigger an outgoing reply) ── */
+    await this._incrementUserMonthlyCounter();
     this.config.messages_this_month = (this.config.messages_this_month ?? 0) + 1;
+    
     this._queueUsage({
       messagesThisMonth: 1,
       totalMessages: 1,

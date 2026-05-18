@@ -16,6 +16,7 @@ import botRouter       from "./routes/bots.js";
 import billingRouter   from "./routes/billing.js";
 import v1Router        from "./routes/v1.js";
 import adminRouter     from "./routes/admin.js";
+import { supabase }    from "./lib/supabase.js";
 
 const __dirname     = path.dirname(fileURLToPath(import.meta.url));
 const FRONTEND_DIST = path.resolve(__dirname, "../../frontend/dist");
@@ -174,6 +175,80 @@ process.on("unhandledRejection", (reason) => {
   logger.error({ reason }, "Unhandled promise rejection — process continuing");
 });
 
+/* ── Monthly counter reset job ───────────────────────────────── */
+async function resetMonthlyCounters() {
+  try {
+    const now = new Date();
+    const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    
+    const { data: users, error } = await supabase
+      .from("users")
+      .select("id, billing_period_start, messages_this_month, plan_tier")
+      .lt("billing_period_start", firstOfMonth.toISOString());
+    
+    if (error) {
+      logger.error({ error }, "Failed to fetch users for monthly reset");
+      return;
+    }
+    
+    if (!users || users.length === 0) return;
+    
+    let resetCount = 0;
+    for (const user of users) {
+      const { error: updateError } = await supabase
+        .from("users")
+        .update({ 
+          messages_this_month: 0, 
+          billing_period_start: now.toISOString() 
+        })
+        .eq("id", user.id);
+      
+      if (updateError) {
+        logger.error({ userId: user.id, error: updateError }, "Failed to reset monthly counter");
+      } else {
+        resetCount++;
+        logger.info({ userId: user.id, plan: user.plan_tier, oldCount: user.messages_this_month }, "Monthly message counter reset");
+      }
+    }
+    
+    if (resetCount > 0) {
+      logger.info({ resetCount }, "Monthly counters reset successfully");
+    }
+  } catch (err) {
+    logger.error({ err }, "Monthly reset job failed");
+  }
+}
+
+/* ── Graceful shutdown ───────────────────────────────────────── */
+async function gracefulShutdown(signal) {
+  logger.info(`${signal} received — starting graceful shutdown`);
+  
+  // Stop all bot instances
+  const stopPromises = [];
+  for (const [botId, instance] of botManager.instances) {
+    logger.info({ botId }, "Stopping bot instance");
+    stopPromises.push(instance.stop().catch(err => 
+      logger.error({ err, botId }, "Error stopping bot during shutdown")
+    ));
+  }
+  
+  await Promise.all(stopPromises);
+  
+  // Close SSE connections
+  for (const [botId, clients] of botManager.sseClients) {
+    for (const res of clients) {
+      try { res.end(); } catch {}
+    }
+    botManager.sseClients.delete(botId);
+  }
+  
+  logger.info("Graceful shutdown complete");
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
 /* ── Start ────────────────────────────────────────────────────── */
 const PORT = Number(process.env.PORT || env.port || 3000);
 
@@ -181,17 +256,27 @@ app.listen(PORT, "0.0.0.0", async () => {
   logger.info(`✓ WaBot API ready on port ${PORT} [${env.nodeEnv}]`);
   logger.info(`✓ CORS origins: ${allowedOrigins.join(", ") || "(all in dev)"}`);
   logger.info(`✓ Superadmin: ${env.hasSuperadmin ? "configured" : "NOT SET — /api/admin disabled"}`);
+  logger.info(`✓ Pairing codes: ${env.hasSupabase ? "enabled (Baileys native)" : "disabled — Supabase required"}`);
 
   if (env.hasSupabase) {
     try {
       await dashboardRealtime.initialize();
       logger.info("✓ Dashboard realtime initialized");
       await botManager.initialize();
-      logger.info("✓ BotManager initialized");
+      logger.info("✓ BotManager initialized — bots will auto-reconnect with saved sessions");
+      
+      // Run monthly counter reset on startup
+      await resetMonthlyCounters();
+      logger.info("✓ Monthly counter reset job completed on startup");
+      
+      // Schedule to run every hour to catch month transitions
+      setInterval(resetMonthlyCounters, 60 * 60 * 1000);
+      logger.info("✓ Monthly counter reset scheduled (every hour)");
+      
     } catch (err) {
       logger.error({ err }, "Startup initialization failed");
     }
   } else {
-    logger.warn("Supabase not configured — BotManager skipped");
+    logger.warn("Supabase not configured — BotManager and pairing codes skipped");
   }
 });

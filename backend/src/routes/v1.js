@@ -58,8 +58,8 @@ async function getOwnedBot(userId, botId) {
 }
 
 async function getUserPlan(userId) {
-  const { data } = await supabase.from("users").select("plan_tier, messages_this_month").eq("id", userId).single();
-  return data ?? { plan_tier: "free", messages_this_month: 0 };
+  const { data } = await supabase.from("users").select("plan_tier, messages_this_month, billing_period_start").eq("id", userId).single();
+  return data ?? { plan_tier: "free", messages_this_month: 0, billing_period_start: new Date().toISOString() };
 }
 
 /** Apply {{variable}} substitution to a template string */
@@ -135,17 +135,48 @@ function buildMessageFromPreset(body = {}) {
   return String(body?.message ?? "").trim();
 }
 
-/** Enforce monthly message limit — returns error string or null */
+/** 
+ * Enforce monthly message limit — automatically resets counter if billing period has passed
+ * Returns error object or null if within limits
+ */
 async function checkMonthlyLimit(userId) {
-  const u = await getUserPlan(userId);
-  const limit = PLAN_LIMITS[u.plan_tier]?.messages_per_month ?? 1_000;
-  if ((u.messages_this_month ?? 0) >= limit) {
+  // Fetch user with billing period
+  const { data: user, error } = await supabase
+    .from("users")
+    .select("plan_tier, messages_this_month, billing_period_start")
+    .eq("id", userId)
+    .single();
+  
+  if (error || !user) {
+    return { error: "Could not verify user plan." };
+  }
+  
+  const now = new Date();
+  const lastReset = new Date(user.billing_period_start);
+  const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  
+  // Auto-reset if billing period is from previous month
+  if (lastReset < currentMonthStart) {
+    await supabase
+      .from("users")
+      .update({ 
+        messages_this_month: 0, 
+        billing_period_start: now.toISOString() 
+      })
+      .eq("id", userId);
+    user.messages_this_month = 0;
+  }
+  
+  const limit = PLAN_LIMITS[user.plan_tier]?.messages_per_month ?? 1_000;
+  if ((user.messages_this_month ?? 0) >= limit) {
+    const nextReset = new Date(now.getFullYear(), now.getMonth() + 1, 1);
     return {
-      error:   `Monthly message limit reached (${limit.toLocaleString()} messages). Resets on the 1st of next month.`,
+      error:   `Monthly message limit reached (${limit.toLocaleString()} messages). Resets on ${nextReset.toLocaleDateString()}.`,
       code:    "MONTHLY_LIMIT_REACHED",
-      used:    u.messages_this_month,
+      used:    user.messages_this_month,
       limit,
-      upgrade: u.plan_tier !== "paid" ? "Upgrade to Pro for 100,000 messages/month." : null
+      nextResetDate: nextReset.toISOString(),
+      upgrade: user.plan_tier !== "paid" ? "Upgrade to Pro for 100,000 messages/month." : null
     };
   }
   return null;
@@ -184,17 +215,10 @@ async function sendBotMessageViaApi(req, res, messageOverride) {
   if (!message)              return res.status(400).json({ error: "`message` or `template` is required." });
   if (message.length > 4096) return res.status(400).json({ error: "Message too long (max 4096 chars)." });
 
-  const userPlan  = await getUserPlan(userId);
-  const planKey   = userPlan.plan_tier ?? "free";
-  const planLimit = PLAN_LIMITS[planKey]?.messages_per_month ?? 1_000;
-  if ((userPlan.messages_this_month ?? 0) >= planLimit) {
-    return res.status(429).json({
-      error:   `Monthly message limit reached (${planLimit.toLocaleString()} messages). Resets on the 1st of next month.`,
-      code:    "MONTHLY_LIMIT_REACHED",
-      used:    userPlan.messages_this_month,
-      limit:   planLimit,
-      upgrade: planKey !== "paid" ? "Upgrade to Pro for 100,000 messages/month." : null
-    });
+  // Check monthly limit with auto-reset
+  const limitCheck = await checkMonthlyLimit(userId);
+  if (limitCheck) {
+    return res.status(429).json(limitCheck);
   }
 
   const bot = await getOwnedBot(userId, bot_id);
@@ -207,10 +231,30 @@ async function sendBotMessageViaApi(req, res, messageOverride) {
   try {
     await inst.sendMessage(to, message);
 
-    const newCount = (userPlan.messages_this_month ?? 0) + 1;
-    await supabase.rpc("increment_user_messages", { uid: userId }).catch(() =>
-      supabase.from("users").update({ messages_this_month: newCount }).eq("id", userId)
-    );
+    // Increment counter
+    await supabase.rpc("increment_user_messages", { uid: userId }).catch(async () => {
+      const { data: user } = await supabase
+        .from("users")
+        .select("messages_this_month")
+        .eq("id", userId)
+        .single();
+      if (user) {
+        await supabase
+          .from("users")
+          .update({ messages_this_month: (user.messages_this_month ?? 0) + 1 })
+          .eq("id", userId);
+      }
+    });
+
+    // Get updated usage
+    const { data: updatedUser } = await supabase
+      .from("users")
+      .select("messages_this_month")
+      .eq("id", userId)
+      .single();
+    const newCount = updatedUser?.messages_this_month ?? 0;
+    const planKey = (await getUserPlan(userId)).plan_tier ?? "free";
+    const planLimit = PLAN_LIMITS[planKey]?.messages_per_month ?? 1_000;
 
     await supabase.from("bot_activity").insert({
       user_id: userId, bot_id,
@@ -236,11 +280,14 @@ async function sendBotMessageViaApi(req, res, messageOverride) {
 router.get("/me", async (req, res) => {
   const { data: user } = await supabase
     .from("users")
-    .select("id, email, full_name, plan_tier, messages_this_month, created_at")
+    .select("id, email, full_name, plan_tier, messages_this_month, created_at, billing_period_start")
     .eq("id", req.user.sub).single();
   if (!user) return res.status(404).json({ error: "User not found." });
 
   const limits = PLAN_LIMITS[user.plan_tier] ?? PLAN_LIMITS.free;
+  const now = new Date();
+  const nextReset = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  
   return res.json({
     user: {
       id:                user.id,
@@ -249,6 +296,7 @@ router.get("/me", async (req, res) => {
       planTier:          user.plan_tier,
       messagesThisMonth: user.messages_this_month ?? 0,
       createdAt:         user.created_at,
+      nextResetDate:     nextReset.toISOString(),
       limits,
       rateLimits: { callsPerMinute: user.plan_tier === "paid" ? 300 : 30 }
     }
@@ -629,7 +677,12 @@ router.post("/messages/broadcast", async (req, res) => {
   if (!message)              return res.status(400).json({ error: "`message` or `template` is required." });
   if (message.length > 4096) return res.status(400).json({ error: "Message too long (max 4096)." });
 
-  /* Monthly limit — check if we have room for all recipients */
+  // Check monthly limit with auto-reset
+  const limitCheck = await checkMonthlyLimit(userId);
+  if (limitCheck) {
+    return res.status(429).json(limitCheck);
+  }
+
   const monthLimit   = PLAN_LIMITS.paid.messages_per_month;
   const used         = u.messages_this_month ?? 0;
   const available    = monthLimit - used;
@@ -685,43 +738,58 @@ router.get("/conversations", async (req, res) => {
   const bot_id = req.query.bot_id;
   const offset = Math.max(0, Number(req.query.offset) || 0);
 
-  let q = supabase
-    .from("bot_activity")
-    .select("id, bot_id, event_type, details, metadata, created_at")
-    .eq("user_id", req.user.sub)
-    .in("event_type", ["message_received", "api_message_sent", "broadcast_sent"])
-    .order("created_at", { ascending: false })
-    .limit(limit)
-    .offset(offset);
-  if (bot_id) q = q.eq("bot_id", bot_id);
-
-  const { data, error } = await q;
-  if (error) return res.status(500).json({ error: "Could not fetch conversations." });
-  const rows = data ?? [];
-
-  // Fetch persisted read markers (optional) to mark unread state
+  // We store inbound messages as bot_activity entries with event_type=message_received
+  // For conversations view, dedupe by contact (phone or group) and return the latest message per contact.
   try {
-    const ids = rows.map((r) => r.id).filter(Boolean);
-    if (ids.length > 0) {
-      const { data: reads } = await supabase
-        .from("conversation_reads")
-        .select("bot_activity_id")
-        .eq("user_id", req.user.sub)
-        .in("bot_activity_id", ids);
+    let q = supabase
+      .from("bot_activity")
+      .select("id, bot_id, event_type, details, metadata, created_at")
+      .eq("user_id", req.user.sub)
+      .eq("event_type", "message_received")
+      .order("created_at", { ascending: false })
+      .limit(1000);
+    if (bot_id) q = q.eq("bot_id", bot_id);
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: "Could not fetch conversations." });
 
-      const readSet = new Set((reads ?? []).map((r) => r.bot_activity_id));
-      for (const r of rows) {
-        r.unread = !readSet.has(r.id);
-      }
-    } else {
-      for (const r of rows) r.unread = true;
+    const rows = data ?? [];
+
+    // Build a map keyed by conversation id (metadata.from or details parsed) to dedupe
+    const convMap = new Map();
+    for (const r of rows) {
+      // Attempt to find a stable conversation key
+      const meta = r.metadata || {};
+      const key = meta.conversation_id || meta.from || (r.details || "") || `${r.bot_id}:${r.id}`;
+      if (!convMap.has(key)) convMap.set(key, r);
     }
-  } catch (e) {
-    // If read tracking fails, default to showing items as unread
-    for (const r of rows) r.unread = true;
-  }
 
-  return res.json({ conversations: rows, count: rows.length, offset });
+    const conversations = [...convMap.values()].slice(offset, offset + limit).map((r) => ({
+      id: r.id,
+      bot_id: r.bot_id,
+      preview: (r.metadata?.body ?? r.details ?? "").slice(0, 200),
+      metadata: r.metadata ?? {},
+      created_at: r.created_at,
+      unread: true
+    }));
+
+    // Fetch read markers by bot_activity id to mark unread state
+    try {
+      const ids = conversations.map((c) => c.id).filter(Boolean);
+      if (ids.length > 0) {
+        const { data: reads } = await supabase
+          .from("conversation_reads")
+          .select("bot_activity_id")
+          .eq("user_id", req.user.sub)
+          .in("bot_activity_id", ids);
+        const readSet = new Set((reads ?? []).map((r) => r.bot_activity_id));
+        for (const c of conversations) c.unread = !readSet.has(c.id);
+      }
+    } catch (e) { /* ignore read fetch errors — default unread true */ }
+
+    return res.json({ conversations, count: conversations.length, offset });
+  } catch (err) {
+    return res.status(500).json({ error: "Internal error fetching conversations." });
+  }
 });
 
 
@@ -733,7 +801,7 @@ router.post("/conversations/mark-read", async (req, res) => {
 
   const toInsert = ids.map((aid) => ({ user_id: userId, bot_activity_id: aid }));
   try {
-    // Upsert to avoid duplicates
+    // Upsert to avoid duplicates — Supabase will ignore conflicts if constrained
     await supabase.from("conversation_reads").insert(toInsert).select().catch(() => {});
     return res.json({ ok: true, marked: ids.length });
   } catch (err) {
