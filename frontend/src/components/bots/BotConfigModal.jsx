@@ -153,6 +153,13 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
     startQrCountdown();
   }, [startQrCountdown]);
 
+  const receivePairingCode = useCallback((code, expiresAt) => {
+    setPairingCode(code);
+    setPairingExpiresAt(expiresAt);
+    setQrMethod("code");  // Switch to pairing code display
+    setQrUrl(null);       // Clear QR code
+  }, []);
+
   /* SSE + HTTP polling fallback for QR tab */
   useEffect(() => {
     if (tab !== "qr") {
@@ -171,10 +178,9 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
         const d = JSON.parse(e.data);
         if (d.type === "qr")     receiveQr(d.qrUrl);
         if (d.type === "pair_code") {
-          if (typeof d.code === "string") setPairingCode(d.code);
+          if (typeof d.code === "string") receivePairingCode(d.code, d.expiresAt ?? null);
           else if (d.code && typeof d.code === "object") {
-            setPairingCode(d.code.code ?? null);
-            setPairingExpiresAt(d.code.expiresAt ?? null);
+            receivePairingCode(d.code.code ?? null, d.code.expiresAt ?? null);
           }
         }
         if (d.type === "status") setBot((b) => ({ ...b, status: d.status }));
@@ -202,7 +208,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       clearInterval(qrPollRef.current);
       clearInterval(qrCdRef.current);
     };
-  }, [tab, bot.id, receiveQr]);
+  }, [tab, bot.id, receiveQr, receivePairingCode]);
 
   /* ── Pairing code functions ───────────────────────────────── */
   const requestNewPairingCode = () => {
@@ -564,7 +570,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                 const matchType = t.matchType ?? (t.exact_match ? "exact" : "contains");
                 const enabled   = t.enabled !== false;
                 return (
-                  <div key={t.id ?? i} style={{ background: "var(--bg)", border: `1px solid ${enabled ? "var(--border)" : "rgba(244,63,94,0.2)"}`, borderRadius: "var(--radius)", padding: "0.875rem", marginBottom: "0.5rem", display: "flex", flexDirection: "column", gap: "0.5rem", opacity: enabled ? 1 : 0.6 }}>
+                  <div key={t.id ?? i} style={{ background: "var(--bg)", border: `1px solid ${enabled ? "var(--border)" : "rgba(244,63,94,0.2)"}`, borderRadius: "var(--radius)", padding: "0.875rem", marginBottom: "0.5rem", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
                     <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", flexWrap: "wrap" }}>
                       <input className="input" style={{ flex: 2, minWidth: "100px" }} placeholder="Keyword / pattern"
                         value={t.keyword} onChange={(e) => setTrigger(i, "keyword", e.target.value)} />
@@ -772,7 +778,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                     />
                     <button type="button"
                       onClick={() => setAiKeyVisible((v) => !v)}
-                      style={{ position: "absolute", right: "0.75rem", top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: "var(--text3)", fontSize: "0.875rem" }}>
+                      style={{ position: "absolute", right: "0.75rem", top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: "var(--text3)", fontSize: "1.2rem" }}>
                       {aiKeyVisible ? "🙈" : "👁"}
                     </button>
                   </div>
@@ -869,7 +875,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                     )}
                   </label>
                   <textarea className="input" rows={4} style={{ resize: "vertical" }}
-                    placeholder={`You are a helpful WhatsApp assistant for [your business name]. Be friendly and concise. Answer in 1-3 sentences. If asked about products you don't know about, say you'll check and get back to them.`}
+                    placeholder={`You are a helpful WhatsApp assistant for [your business name]. Be friendly and concise. Answer in 1-3 sentences. If asked about products you don't know about, say you don't have info about that.`}
                     value={form.ai_config.system_prompt ?? ""}
                     onChange={setAi("system_prompt")} />
                   <span className="field-hint">Instructions for the AI. Include your business name, tone, and what the bot should/shouldn't do.</span>
@@ -1008,7 +1014,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                     </div>
                     <div style={{ display: "flex", flexWrap: "wrap", gap: "0.35rem" }}>
                       {(gmc.anti_vulgar?.words ?? []).map((w) => (
-                        <span key={w} style={{ background: "rgba(244,63,94,0.12)", border: "1px solid rgba(244,63,94,0.3)", color: "var(--error)", borderRadius: "20px", padding: "0.15rem 0.6rem", fontSize: "0.8rem", display: "flex", alignItems: "center", gap: "0.35rem" }}>
+                        <span key={w} style={{ background: "rgba(244,63,94,0.12)", border: "1px solid rgba(244,63,94,0.3)", color: "var(--error)", borderRadius: "20px", padding: "0.15rem 0.6rem", fontSize: "0.8rem" }}>
                           {w}
                           <button onClick={() => removeVulgarWord(w)} style={{ background: "none", border: "none", cursor: "pointer", color: "inherit", padding: 0, lineHeight: 1 }}>×</button>
                         </span>
