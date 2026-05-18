@@ -50,10 +50,16 @@ export function BotCard({ bot, onConfigure, onShowQr, onSendDM, onDelete, deleti
       </div>
 
       <div className="bot-card-actions" onClick={(e) => e.stopPropagation()}>
-        {(bot.status === "awaiting_qr_scan" || bot.status === "connecting") && (
+        {(bot.status === "awaiting_qr_scan" || bot.status === "connecting" || bot.status === "reconnecting") && (
           <button className="btn btn-secondary btn-sm" style={{ flex: 1 }}
             onClick={() => onShowQr(bot)}>
             Show QR
+          </button>
+        )}
+        {(bot.status === "disconnected" || bot.status === "failed" || bot.status === "qr_timeout" || bot.status === "error") && (
+          <button className="btn btn-secondary btn-sm" style={{ flex: 1 }}
+            onClick={() => onConfigure({ ...bot, _openQr: true })}>
+            Reconnect
           </button>
         )}
         {bot.status === "connected" && onSendDM && (

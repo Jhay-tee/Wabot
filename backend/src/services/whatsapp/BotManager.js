@@ -78,6 +78,46 @@ class BotManager {
 
   async deploy(botId, userId, config = {}) { return this._create(botId, userId, config); }
 
+  /**
+   * Reconnect a bot that is disconnected / failed / timed-out.
+   * Fetches the latest config from DB and starts a fresh instance.
+   */
+  async reconnect(botId, userId) {
+    const { data: bot } = await supabase
+      .from("bots")
+      .select(`id, user_id,
+        plan_tier:users!inner(plan_tier),
+        auto_reply_enabled, auto_reply_message,
+        webhook_url, webhook_secret,
+        messages_this_month, bot_type,
+        keyword_triggers, sales_agent_config,
+        commands_config, ai_config,
+        group_management_config,
+        website_url, catalog_unavail_msg`)
+      .eq("id", botId)
+      .maybeSingle();
+
+    if (!bot || bot.user_id !== userId) throw new Error("Bot not found.");
+
+    const planTier = bot.plan_tier?.plan_tier ?? bot.plan_tier ?? "free";
+    await this._create(botId, userId, {
+      plan_tier:               planTier,
+      bot_type:                bot.bot_type            ?? "dm",
+      auto_reply_enabled:      bot.auto_reply_enabled,
+      auto_reply_message:      bot.auto_reply_message,
+      webhook_url:             bot.webhook_url,
+      webhook_secret:          bot.webhook_secret,
+      messages_this_month:     bot.messages_this_month ?? 0,
+      keyword_triggers:        bot.keyword_triggers    ?? [],
+      sales_agent_config:      bot.sales_agent_config  ?? {},
+      commands_config:         bot.commands_config     ?? {},
+      ai_config:               bot.ai_config           ?? {},
+      group_management_config: bot.group_management_config ?? {},
+      website_url:             bot.website_url,
+      catalog_unavail_msg:     bot.catalog_unavail_msg
+    });
+  }
+
   async remove(botId) {
     const inst = this.instances.get(botId);
     if (inst) { await inst.stop(); this.instances.delete(botId); }

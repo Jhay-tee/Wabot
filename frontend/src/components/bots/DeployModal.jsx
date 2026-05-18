@@ -19,15 +19,36 @@ const BOT_TYPES = [
   }
 ];
 
-/* QR codes rotate every ~20 s; poll every 12 s as SSE backup */
-const POLL_MS      = 12_000;
-/* 10-minute total window — user may need time to find Linked Devices */
-const TIMEOUT_MS   = 10 * 60_000;
-/* Countdown per QR code (approximate) */
-const QR_LIFE_S    = 20;
+const WARNINGS = [
+  {
+    icon: "⚠️",
+    title: "Unofficial automation",
+    desc: "WaBot uses the Baileys library which is not officially supported by WhatsApp. Your account may be flagged or banned for using automation."
+  },
+  {
+    icon: "🚫",
+    title: "Risk of account ban",
+    desc: "WhatsApp actively detects and bans accounts using unofficial clients. Use a dedicated number — never your personal or primary business number."
+  },
+  {
+    icon: "👤",
+    title: "You are responsible",
+    desc: "You are solely responsible for how this bot is used. WaBot is not liable for bans, data loss, or any consequences of using WhatsApp automation."
+  },
+  {
+    icon: "💼",
+    title: "Business use",
+    desc: "For official, high-volume WhatsApp business messaging, consider the official WhatsApp Business API (Meta) which is ban-safe and compliant."
+  }
+];
+
+const POLL_MS    = 12_000;
+const TIMEOUT_MS = 10 * 60_000;
+const QR_LIFE_S  = 20;
 
 export function DeployModal({ user, onClose, onDeployed }) {
-  const [step,         setStep]         = useState("form");
+  const [step,         setStep]         = useState("warning");
+  const [accepted,     setAccepted]     = useState(false);
   const [name,         setName]         = useState("");
   const [desc,         setDesc]         = useState("");
   const [botType,      setBotType]      = useState("dm");
@@ -43,7 +64,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
   const cdRef        = useRef(null);
   const connectedRef = useRef(false);
 
-  /* Cleanup on unmount */
   useEffect(() => () => {
     esRef.current?.close();
     clearTimeout(timeoutRef.current);
@@ -51,7 +71,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
     clearInterval(cdRef.current);
   }, []);
 
-  /* Restart the QR countdown whenever a fresh QR arrives */
   const startCountdown = useCallback(() => {
     clearInterval(cdRef.current);
     setCountdown(QR_LIFE_S);
@@ -77,7 +96,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
     onDeployed();
   }, [onDeployed]);
 
-  /* HTTP polling — fires every 12 s as fallback when SSE is slow/dropped */
   const startPoll = useCallback((botId) => {
     clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
@@ -86,7 +104,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
         const data = await botsApi.qr(botId);
         if (data?.qrCodeDataUrl) markQr(data.qrCodeDataUrl);
       } catch {
-        /* 404 = no QR yet (bot reconnecting) — show reconnecting state */
         setReconnecting(true);
       }
     }, POLL_MS);
@@ -102,14 +119,13 @@ export function DeployModal({ user, onClose, onDeployed }) {
         const msg = JSON.parse(e.data);
         if (msg.type === "qr")     markQr(msg.qrUrl);
         if (msg.type === "status") {
-          if (msg.status === "connected") markConnected(es);
-          if (msg.status === "connecting") setReconnecting(true);
+          if (msg.status === "connected")    markConnected(es);
+          if (msg.status === "connecting" || msg.status === "reconnecting") setReconnecting(true);
         }
       } catch {}
     };
-    es.onerror = () => {}; /* HTTP poll covers SSE drops */
+    es.onerror = () => {};
 
-    /* Hard timeout — give up after 10 minutes */
     timeoutRef.current = setTimeout(() => {
       if (!connectedRef.current) {
         es.close();
@@ -138,7 +154,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
     }
   };
 
-  /* Email verification gate */
   if (!user?.emailVerified && !user?.email_verified) {
     return (
       <Modal onClose={onClose}>
@@ -153,13 +168,88 @@ export function DeployModal({ user, onClose, onDeployed }) {
   return (
     <Modal onClose={onClose}>
 
+      {/* ── Step 0: Warning ── */}
+      {step === "warning" && (
+        <>
+          <div style={{ fontSize: "2rem" }}>⚠️</div>
+          <h3 style={{ color: "var(--warning)" }}>Before you deploy</h3>
+          <p style={{ fontSize: "0.875rem", color: "var(--text2)", marginBottom: "0.25rem" }}>
+            Please read and acknowledge the following before deploying a WhatsApp bot.
+          </p>
+
+          <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: "0.625rem" }}>
+            {WARNINGS.map((w) => (
+              <div
+                key={w.title}
+                style={{
+                  background: "var(--warning-bg)",
+                  border: "1px solid rgba(245,158,11,0.2)",
+                  borderRadius: "var(--radius)",
+                  padding: "0.75rem 1rem",
+                  display: "flex",
+                  gap: "0.75rem",
+                  alignItems: "flex-start"
+                }}
+              >
+                <span style={{ fontSize: "1.1rem", flexShrink: 0 }}>{w.icon}</span>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: "0.8125rem", color: "var(--text)", marginBottom: "0.2rem" }}>
+                    {w.title}
+                  </div>
+                  <div style={{ fontSize: "0.775rem", color: "var(--text2)", lineHeight: 1.5 }}>
+                    {w.desc}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <label style={{
+            width: "100%",
+            display: "flex",
+            alignItems: "flex-start",
+            gap: "0.75rem",
+            padding: "0.875rem",
+            background: "var(--bg2)",
+            border: `1.5px solid ${accepted ? "var(--accent)" : "var(--border)"}`,
+            borderRadius: "var(--radius)",
+            cursor: "pointer",
+            transition: "border-color 0.14s ease"
+          }}>
+            <input
+              type="checkbox"
+              checked={accepted}
+              onChange={(e) => setAccepted(e.target.checked)}
+              style={{ marginTop: "2px", accentColor: "var(--accent)", width: "16px", height: "16px", flexShrink: 0 }}
+            />
+            <span style={{ fontSize: "0.8125rem", color: "var(--text2)", lineHeight: 1.5 }}>
+              I understand that WhatsApp automation is unofficial and may result in my account being banned.
+              I accept full responsibility for how this bot is used, and I will not use it to send spam.
+            </span>
+          </label>
+
+          <div style={{ width: "100%", display: "flex", gap: "0.75rem" }}>
+            <button className="btn btn-secondary" style={{ flex: 1 }} onClick={onClose}>
+              Cancel
+            </button>
+            <button
+              className="btn btn-primary"
+              style={{ flex: 1 }}
+              disabled={!accepted}
+              onClick={() => setStep("form")}
+            >
+              I understand — Continue
+            </button>
+          </div>
+        </>
+      )}
+
       {/* ── Step 1: form ── */}
       {step === "form" && (
         <>
           <div style={{ fontSize: "2rem" }}>🚀</div>
           <h3>Deploy a new bot</h3>
 
-          {/* Bot type grid — stacks to 1 col on very small screens via CSS class */}
           <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: "0.5rem", marginBottom: "0.25rem" }}>
             <div style={{ fontSize: "0.875rem", fontWeight: 500, color: "var(--text2)" }}>Bot type</div>
             <div className="deploy-type-grid">
@@ -220,7 +310,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
           <h3>Scan to connect</h3>
 
           {reconnecting && !qrUrl ? (
-            /* Bot is reconnecting — no QR available yet */
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.75rem", padding: "1.5rem" }}>
               <Spinner size="lg" />
               <span style={{ fontSize: "0.8125rem", color: "var(--text2)", textAlign: "center" }}>
@@ -228,7 +317,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
               </span>
             </div>
           ) : qrUrl ? (
-            /* QR code is ready */
             <>
               <p style={{ fontSize: "0.875rem", color: "var(--text2)", textAlign: "center" }}>
                 Open WhatsApp → Linked Devices → Link a Device, then scan:
@@ -245,7 +333,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
               </div>
             </>
           ) : (
-            /* Waiting for very first QR */
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.75rem", padding: "1.5rem" }}>
               <Spinner size="lg" />
               <span style={{ fontSize: "0.8125rem", color: "var(--text2)" }}>Generating QR code…</span>

@@ -102,10 +102,12 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   const [bulkPaste,     setBulkPaste]     = useState("");
   const [showBulk,      setShowBulk]      = useState(false);
 
-  const [saving,      setSaving]      = useState(false);
-  const [msg,         setMsg]         = useState({ text: "", ok: false });
-  const [qrUrl,       setQrUrl]       = useState(null);
-  const [adminGroups, setAdminGroups] = useState(null);
+  const [saving,        setSaving]        = useState(false);
+  const [msg,           setMsg]           = useState({ text: "", ok: false });
+  const [qrUrl,         setQrUrl]         = useState(null);
+  const [reconnecting,  setReconnecting]  = useState(false);
+  const [reconnectMsg,  setReconnectMsg]  = useState("");
+  const [adminGroups,   setAdminGroups]   = useState(null);
   const [vulgarInput, setVulgarInput] = useState("");
   const esRef     = useRef(null);
   const qrPollRef = useRef(null);
@@ -1017,6 +1019,45 @@ Reply with any command to get started.`}
                   This bot is linked to WhatsApp and active.
                 </div>
               </div>
+            ) : (bot.status === "disconnected" || bot.status === "failed" || bot.status === "qr_timeout" || bot.status === "error") && !qrUrl ? (
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "1rem", padding: "1.5rem", textAlign: "center" }}>
+                <div style={{ fontSize: "2.5rem" }}>
+                  {bot.status === "failed" ? "❌" : "🔌"}
+                </div>
+                <div style={{ fontWeight: 700, color: "var(--text)" }}>
+                  {bot.status === "failed" ? "Bot failed to reconnect" : "Bot is disconnected"}
+                </div>
+                <div style={{ fontSize: "0.8125rem", color: "var(--text2)", maxWidth: "320px", lineHeight: 1.5 }}>
+                  {bot.status === "failed"
+                    ? "Maximum reconnect attempts reached. Click Reconnect to start a fresh session and scan a new QR code."
+                    : bot.status === "qr_timeout"
+                    ? "QR code was not scanned within 2 minutes. Click Reconnect to generate a new one."
+                    : "The WhatsApp session has ended. Click Reconnect to start a new session."}
+                </div>
+                {reconnectMsg && (
+                  <Alert type={reconnectMsg.startsWith("✓") ? "success" : "error"}>{reconnectMsg}</Alert>
+                )}
+                <button
+                  className="btn btn-primary"
+                  style={{ minWidth: "160px" }}
+                  disabled={reconnecting}
+                  onClick={async () => {
+                    setReconnecting(true);
+                    setReconnectMsg("");
+                    try {
+                      await botsApi.reconnect(bot.id);
+                      setReconnectMsg("✓ Reconnect initiated — a QR code will appear shortly.");
+                      setBot((b) => ({ ...b, status: "connecting" }));
+                    } catch (err) {
+                      setReconnectMsg(err.message ?? "Reconnect failed. Please try again.");
+                    } finally {
+                      setReconnecting(false);
+                    }
+                  }}
+                >
+                  {reconnecting ? <><Spinner size="sm" /> Reconnecting…</> : "Reconnect"}
+                </button>
+              </div>
             ) : qrUrl ? (
               <>
                 <p style={{ fontSize: "0.875rem", color: "var(--text2)", textAlign: "center" }}>
@@ -1028,7 +1069,11 @@ Reply with any command to get started.`}
             ) : (
               <div style={{ padding: "2rem", display: "flex", flexDirection: "column", alignItems: "center", gap: "0.75rem" }}>
                 <Spinner size="lg" />
-                <span style={{ fontSize: "0.8125rem", color: "var(--text2)" }}>Waiting for QR code…</span>
+                <span style={{ fontSize: "0.8125rem", color: "var(--text2)" }}>
+                  {bot.status === "connecting" || bot.status === "reconnecting"
+                    ? "Reconnecting to WhatsApp…"
+                    : "Waiting for QR code…"}
+                </span>
               </div>
             )}
           </div>

@@ -24,6 +24,7 @@ import makeWASocket, {
 import { Boom }          from "@hapi/boom";
 import QRCode            from "qrcode";
 import { createSupabaseAuthState, clearSupabaseSession } from "./SupabaseStore.js";
+import { MessageQueue }  from "./MessageQueue.js";
 import { supabase }      from "../../lib/supabase.js";
 import { logger }        from "../../utils/logger.js";
 import { env }           from "../../config/env.js";
@@ -55,6 +56,12 @@ const LINK_REGEX = /(https?:\/\/[^\s]+|www\.[^\s]+\.[a-z]{2,}|chat\.whatsapp\.co
 
 /* ── Group metadata cache TTL (ms) ─────────────────────────── */
 const META_CACHE_TTL = 2 * 60 * 1000; // 2 minutes
+
+/* ── Reconnect / QR lifecycle constants ─────────────────────── */
+const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_BASE_MS      = 2_000;
+const RECONNECT_MAX_MS       = 30_000;
+const QR_TIMEOUT_MS          = 2 * 60_000; // 2 minutes — then stop to avoid ban
 
 /* ── Normalise device-scoped JID to plain user JID ─────────── */
 function normalizeJid(jid = "") {
@@ -174,12 +181,15 @@ export class BotInstance {
     this.socket  = null;
     this.status  = "connecting";
     this.qrCode  = null;
-    this._destroyed      = false;
-    this._reconnectTimer = null;
-    this._flushTimer     = null;
-    this._logFlushTimer  = null;
-    this._usageFlushInFlight = false;
-    this._logFlushInFlight   = false;
+    this._destroyed           = false;
+    this._reconnectTimer      = null;
+    this._reconnectAttempts   = 0;
+    this._qrTimeoutTimer      = null;
+    this._queue               = new MessageQueue(botId);
+    this._flushTimer          = null;
+    this._logFlushTimer       = null;
+    this._usageFlushInFlight  = false;
+    this._logFlushInFlight    = false;
     this._onQR     = new Set();
     this._onStatus = new Set();
     this._pendingUsage = { messagesThisMonth: 0, totalMessages: 0, lastActivity: null };
@@ -244,13 +254,15 @@ export class BotInstance {
 
     } catch (err) {
       logger.error({ err, botId: this.botId }, "BotInstance.start failed");
-      await this._setStatus("error");
+      if (!this._destroyed) this._scheduleReconnect();
     }
   }
 
   async stop() {
     this._destroyed = true;
     clearTimeout(this._reconnectTimer);
+    clearTimeout(this._qrTimeoutTimer);
+    this._queue.destroy();
     await this._flushPendingUsage();
     await this._flushLogs();
     try { this.socket?.end(undefined); } catch {}
@@ -262,7 +274,9 @@ export class BotInstance {
     if (!this.socket) throw new Error("Bot is not connected.");
     if (this.status !== "connected") throw new Error("Bot is not connected. Check bot status and try again.");
     const jid = to.replace(/[^0-9]/g, "") + "@s.whatsapp.net";
-    await this.socket.sendMessage(jid, { text });
+    await this._queue.send(async () => {
+      await this.socket.sendMessage(jid, { text });
+    });
     this._queueUsage({ totalMessages: 1, lastActivity: new Date().toISOString() });
     await this._log("dm_sent", `Message sent to ${to}`);
   }
@@ -275,22 +289,27 @@ export class BotInstance {
         this.qrCode = await QRCode.toDataURL(qr);
         for (const cb of this._onQR) cb(this.qrCode);
         await this._setStatus("awaiting_qr_scan");
-      } catch {}
+        this._startQrTimeout();
+      } catch (err) {
+        logger.error({ err, botId: this.botId }, "QR generation failed");
+      }
     }
 
     if (connection === "open") {
+      this._clearQrTimeout();
+      this._reconnectAttempts = 0;
       this.qrCode = null;
       await this._setStatus("connected");
       await this._log("bot_connected", "WhatsApp connection established");
     }
 
     if (connection === "close") {
-      const code   = (lastDisconnect?.error instanceof Boom)
+      this._clearQrTimeout();
+      const code = (lastDisconnect?.error instanceof Boom)
         ? lastDisconnect.error.output?.statusCode
         : undefined;
-      const reason = DisconnectReason;
 
-      if (code === reason.loggedOut || code === reason.forbidden) {
+      if (code === DisconnectReason.loggedOut || code === DisconnectReason.forbidden) {
         await clearSupabaseSession(this.botId);
         await this._setStatus("disconnected");
         await this._log("bot_disconnected", "Logged out — QR scan required to reconnect");
@@ -298,10 +317,71 @@ export class BotInstance {
       }
 
       if (!this._destroyed) {
-        await this._setStatus("connecting");
-        await this._log("bot_disconnected", `Closed (code ${code ?? "?"}) — reconnecting in 5s`);
-        this._reconnectTimer = setTimeout(() => { if (!this._destroyed) this.start(); }, 5_000);
+        this._scheduleReconnect();
       }
+    }
+  }
+
+  /* ── Exponential backoff reconnect ────────────────────────── */
+
+  _scheduleReconnect() {
+    if (this._destroyed) return;
+    this._reconnectAttempts++;
+
+    if (this._reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      logger.error(
+        { botId: this.botId, attempts: this._reconnectAttempts },
+        "Max reconnect attempts reached — marking bot as failed"
+      );
+      this._setStatus("failed").catch(() => {});
+      this._log(
+        "bot_error",
+        `Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Open bot settings → QR tab to manually reconnect.`
+      ).catch(() => {});
+      return;
+    }
+
+    const jitter  = Math.random() * 1_000;
+    const backoff = RECONNECT_BASE_MS * Math.pow(2, this._reconnectAttempts - 1);
+    const delayMs = Math.min(RECONNECT_MAX_MS, backoff) + jitter;
+
+    logger.info(
+      { botId: this.botId, attempt: this._reconnectAttempts, max: MAX_RECONNECT_ATTEMPTS, delayMs: Math.round(delayMs) },
+      "Scheduling reconnect with exponential backoff"
+    );
+
+    this._setStatus("connecting").catch(() => {});
+    this._log(
+      "bot_reconnecting",
+      `Reconnect attempt ${this._reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} — retrying in ${(delayMs / 1000).toFixed(1)}s`
+    ).catch(() => {});
+
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = setTimeout(() => {
+      if (!this._destroyed) this.start();
+    }, delayMs);
+  }
+
+  /* ── QR timeout — halt after 2 min to prevent ban signals ── */
+
+  _startQrTimeout() {
+    this._clearQrTimeout();
+    this._qrTimeoutTimer = setTimeout(async () => {
+      if (this._destroyed || this.status !== "awaiting_qr_scan") return;
+      logger.warn({ botId: this.botId }, "QR scan timeout (2 min) — stopping socket");
+      try { this.socket?.end(undefined); } catch {}
+      await this._setStatus("disconnected").catch(() => {});
+      await this._log(
+        "bot_qr_timeout",
+        "QR code was not scanned within 2 minutes. Open bot settings → QR tab and click Reconnect to try again."
+      ).catch(() => {});
+    }, QR_TIMEOUT_MS);
+  }
+
+  _clearQrTimeout() {
+    if (this._qrTimeoutTimer) {
+      clearTimeout(this._qrTimeoutTimer);
+      this._qrTimeoutTimer = null;
     }
   }
 

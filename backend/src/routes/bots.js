@@ -283,6 +283,28 @@ router.get("/:id/qr", async (req, res) => {
   return res.json({ qrCodeDataUrl: qrCode });
 });
 
+/* ── POST /api/bots/:id/reconnect ───────────────────────────── */
+router.post("/:id/reconnect", async (req, res) => {
+  const userId = req.user.sub;
+  const { id } = req.params;
+
+  const { data: bot } = await supabase
+    .from("bots").select("id, user_id, status").eq("id", id).maybeSingle();
+  if (!bot || bot.user_id !== userId) return res.status(404).json({ error: "Bot not found." });
+
+  const RECONNECTABLE = ["disconnected", "failed", "error", "qr_timeout"];
+  if (!RECONNECTABLE.includes(bot.status)) {
+    return res.status(409).json({ error: `Bot cannot be reconnected from status "${bot.status}". It is already ${bot.status}.` });
+  }
+
+  try {
+    await botManager.reconnect(id, userId);
+    return res.json({ ok: true, message: "Reconnect initiated. A new QR code will appear shortly." });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 /* ── POST /api/bots/:id/send ─────────────────────────────────── */
 router.post("/:id/send", async (req, res) => {
   const userId = req.user.sub;

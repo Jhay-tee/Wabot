@@ -16,6 +16,9 @@ export const botsApi = {
     return `${BASE}/bots/${id}/events?token=${encodeURIComponent(token || "")}`;
   },
 
+  /* Reconnect a disconnected / failed bot */
+  reconnect:       (id)                     => apiFetch(`/bots/${id}/reconnect`, { method: "POST" }),
+
   /* Send DM from dashboard */
   sendDM:          (id, payload)            => apiFetch(`/bots/${id}/send`,      { method: "POST",   body: JSON.stringify(payload) }),
 
