@@ -6,6 +6,40 @@ export function BotCard({ bot, onConfigure, onShowQr, onSendDM, onDelete, deleti
   const hasSalesAgent = bot.sales_agent_config?.enabled;
   const hasKeywords   = Array.isArray(bot.keyword_triggers) && bot.keyword_triggers.length > 0;
 
+  // Determine if bot needs reconnection (disconnected or failed states)
+  const needsReconnect = [
+    "disconnected", 
+    "failed", 
+    "qr_timeout", 
+    "error",
+    "connecting",
+    "awaiting_qr_scan"
+  ].includes(bot.status);
+
+  // Bot is ready to send messages
+  const canSendDM = bot.status === "connected";
+
+  // Show appropriate action text based on status
+  const getReconnectText = () => {
+    switch (bot.status) {
+      case "connecting":
+      case "reconnecting":
+        return "Connecting...";
+      case "awaiting_qr_scan":
+        return "Show QR";
+      case "disconnected":
+        return "Reconnect";
+      case "failed":
+        return "Reconnect";
+      case "qr_timeout":
+        return "QR Expired";
+      case "error":
+        return "Error - Reconnect";
+      default:
+        return "Connect";
+    }
+  };
+
   return (
     <div className="bot-card" onClick={() => onConfigure(bot)}>
       <div className="bot-card-top">
@@ -50,30 +84,44 @@ export function BotCard({ bot, onConfigure, onShowQr, onSendDM, onDelete, deleti
       </div>
 
       <div className="bot-card-actions" onClick={(e) => e.stopPropagation()}>
-        {(bot.status === "awaiting_qr_scan" || bot.status === "connecting" || bot.status === "reconnecting") && (
-          <button className="btn btn-secondary btn-sm" style={{ flex: 1 }}
-            onClick={() => onShowQr(bot)}>
-            Show QR
+        {/* Show QR / Reconnect button - opens config with QR/pairing tab */}
+        {needsReconnect && (
+          <button 
+            className="btn btn-secondary btn-sm" 
+            style={{ flex: 1 }}
+            onClick={() => onConfigure({ ...bot, _openQr: true })}
+            disabled={bot.status === "connecting" || bot.status === "reconnecting"}
+          >
+            {bot.status === "connecting" || bot.status === "reconnecting" ? (
+              <><Spinner size="sm" /> Connecting...</>
+            ) : (
+              getReconnectText()
+            )}
           </button>
         )}
-        {(bot.status === "disconnected" || bot.status === "failed" || bot.status === "qr_timeout" || bot.status === "error") && (
-          <button className="btn btn-secondary btn-sm" style={{ flex: 1 }}
-            onClick={() => onConfigure({ ...bot, _openQr: true })}>
-            Reconnect
-          </button>
-        )}
-        {bot.status === "connected" && onSendDM && (
-          <button className="btn btn-success btn-sm" style={{ flex: 1 }}
+
+        {/* Send DM button */}
+        {canSendDM && onSendDM && (
+          <button 
+            className="btn btn-success btn-sm" 
+            style={{ flex: 1 }}
             onClick={() => onSendDM(bot)}
             title="Send a direct WhatsApp message">
             💬 DM
           </button>
         )}
-        <button className="btn btn-secondary btn-sm" style={{ flex: 1 }}
+
+        {/* Configure button */}
+        <button 
+          className="btn btn-secondary btn-sm" 
+          style={{ flex: 1 }}
           onClick={() => onConfigure(bot)}>
           Configure
         </button>
-        <button className="btn btn-danger btn-sm"
+
+        {/* Delete button */}
+        <button 
+          className="btn btn-danger btn-sm"
           disabled={deleting === bot.id}
           onClick={(e) => { e.stopPropagation(); onDelete(bot); }}>
           {deleting === bot.id ? <Spinner size="sm" /> : "Delete"}

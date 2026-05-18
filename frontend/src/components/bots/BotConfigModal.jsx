@@ -61,7 +61,7 @@ function buildTabs(isPro, botType) {
   if (botType === "dm" || botType === "all") {
     tabs.push({ id: "dmhelp", label: "👋 DM Help" });
   }
-  tabs.push({ id: "qr", label: "QR Code" });
+  tabs.push({ id: "qr", label: "QR / Pairing" });
   return tabs;
 }
 
@@ -95,12 +95,20 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
         }
   });
 
-  /* AI key state — separate from form to handle sensitivity */
+  /* AI key state */
   const [aiKeyInput,    setAiKeyInput]    = useState("");
   const [aiKeySensitive,setAiKeySensitive]= useState(form.ai_config.is_sensitive ?? false);
   const [aiKeyVisible,  setAiKeyVisible]  = useState(false);
   const [bulkPaste,     setBulkPaste]     = useState("");
   const [showBulk,      setShowBulk]      = useState(false);
+
+  /* QR / Pairing code state */
+  const [qrMethod, setQrMethod] = useState("qr");
+  const [pairingCode, setPairingCode] = useState(null);
+  const [pairingExpiresAt, setPairingExpiresAt] = useState(null);
+  const [showPhoneInput, setShowPhoneInput] = useState(false);
+  const [phoneNumberInput, setPhoneNumberInput] = useState("");
+  const [generatingCode, setGeneratingCode] = useState(false);
 
   const [saving,        setSaving]        = useState(false);
   const [msg,           setMsg]           = useState({ text: "", ok: false });
@@ -155,7 +163,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       return;
     }
 
-    /* SSE for instant QR / status updates */
     const token = localStorage.getItem("wabot_token") ?? "";
     const es    = new EventSource(botsApi.eventsUrl(bot.id, token));
     esRef.current = es;
@@ -163,12 +170,18 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       try {
         const d = JSON.parse(e.data);
         if (d.type === "qr")     receiveQr(d.qrUrl);
+        if (d.type === "pair_code") {
+          if (typeof d.code === "string") setPairingCode(d.code);
+          else if (d.code && typeof d.code === "object") {
+            setPairingCode(d.code.code ?? null);
+            setPairingExpiresAt(d.code.expiresAt ?? null);
+          }
+        }
         if (d.type === "status") setBot((b) => ({ ...b, status: d.status }));
       } catch {}
     };
     es.onerror = () => {};
 
-    /* Immediate first poll after 3 s (bot needs time to start) */
     qrFirstRef.current = setTimeout(async () => {
       try {
         const data = await botsApi.qr(bot.id);
@@ -176,7 +189,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       } catch {}
     }, 3_000);
 
-    /* Ongoing poll every 8 s as SSE fallback */
     qrPollRef.current = setInterval(async () => {
       try {
         const data = await botsApi.qr(bot.id);
@@ -191,6 +203,49 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       clearInterval(qrCdRef.current);
     };
   }, [tab, bot.id, receiveQr]);
+
+  /* ── Pairing code functions ───────────────────────────────── */
+  const requestNewPairingCode = () => {
+    setShowPhoneInput(true);
+    setPhoneNumberInput("");
+  };
+
+  const generateNewPairingCode = async () => {
+    if (!phoneNumberInput) return;
+    setGeneratingCode(true);
+    setShowPhoneInput(false);
+    try {
+      const resp = await botsApi.createPairingCode(bot.id, phoneNumberInput.replace(/[^\d]/g, ''));
+      setPairingCode(resp.code);
+      setPairingExpiresAt(resp.expiresAt);
+      setQrMethod("code");
+      setMsg({ text: "Pairing code generated successfully!", ok: true });
+      setTimeout(() => setMsg({ text: "", ok: false }), 3000);
+    } catch (err) {
+      setMsg({ text: err.message || "Could not generate pairing code", ok: false });
+    } finally {
+      setGeneratingCode(false);
+    }
+  };
+
+  const refreshPairingCode = async () => {
+    if (!phoneNumberInput) {
+      setShowPhoneInput(true);
+      return;
+    }
+    setGeneratingCode(true);
+    try {
+      const resp = await botsApi.createPairingCode(bot.id, phoneNumberInput.replace(/[^\d]/g, ''));
+      setPairingCode(resp.code);
+      setPairingExpiresAt(resp.expiresAt);
+      setMsg({ text: "Pairing code refreshed!", ok: true });
+      setTimeout(() => setMsg({ text: "", ok: false }), 2000);
+    } catch (err) {
+      setMsg({ text: err.message || "Could not refresh pairing code", ok: false });
+    } finally {
+      setGeneratingCode(false);
+    }
+  };
 
   /* ── Generic setters ─────────────────────────────────────── */
   const set = (k) => (e) =>
@@ -312,7 +367,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
     try {
       const payload = { ...form };
 
-      /* Attach AI key only if user entered a new one */
       if (aiKeyInput.trim()) {
         payload.ai_config = {
           ...form.ai_config,
@@ -323,7 +377,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
 
       const { bot: updated } = await botsApi.patch(bot.id, payload);
       setBot(updated);
-      setAiKeyInput("");   /* clear key field after saving */
+      setAiKeyInput("");
       setMsg({ text: "Saved successfully.", ok: true });
       onSaved(updated);
     } catch (err) {
@@ -507,7 +561,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                 </div>
               )}
               {form.keyword_triggers.map((t, i) => {
-                /* Normalise: support legacy exact_match boolean */
                 const matchType = t.matchType ?? (t.exact_match ? "exact" : "contains");
                 const enabled   = t.enabled !== false;
                 return (
@@ -524,8 +577,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                         <option value="ends_with">Ends with</option>
                         <option value="regex">Regex</option>
                       </select>
-                      <label style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: "0.78rem", color: "var(--text2)", cursor: "pointer", flexShrink: 0 }}
-                        title="Toggle this trigger on/off without deleting it">
+                      <label style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: "0.78rem", color: "var(--text2)", cursor: "pointer", flexShrink: 0 }}>
                         <input type="checkbox" checked={enabled}
                           onChange={(e) => setTrigger(i, "enabled", e.target.checked)} />
                         On
@@ -651,7 +703,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
           return (
             <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
 
-              {/* Master AI toggle */}
               <div className="toggle-row">
                 <div>
                   <div className="toggle-label">Enable AI responses</div>
@@ -664,8 +715,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
               </div>
 
               {form.ai_config.enabled && (<>
-
-                {/* Provider selection */}
                 <div className="field">
                   <label className="field-label">AI Provider</label>
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "0.5rem" }}>
@@ -688,7 +737,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                   </div>
                 </div>
 
-                {/* Model */}
                 <div className="field">
                   <label className="field-label">Model</label>
                   <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
@@ -703,7 +751,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                   </div>
                 </div>
 
-                {/* API Key */}
                 <div className="field">
                   <label className="field-label">
                     API Key
@@ -738,7 +785,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                   </label>
                 </div>
 
-                {/* ── DM channel ─────────────────────────────────── */}
                 {hasDm && (
                   <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
                     <div className="toggle-row" style={{ marginBottom: 0 }}>
@@ -772,7 +818,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                   </div>
                 )}
 
-                {/* ── Group channel ───────────────────────────────── */}
                 {hasGroup && (
                   <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
                     <div className="toggle-row" style={{ marginBottom: 0 }}>
@@ -816,7 +861,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                   </div>
                 )}
 
-                {/* Shared system prompt */}
                 <div className="field">
                   <label className="field-label">
                     System prompt
@@ -843,7 +887,6 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
         {tab === "group" && (
           <div style={{ display: "flex", flexDirection: "column", gap: "1.125rem" }}>
 
-            {/* Admin groups stat */}
             <div style={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem 1rem", display: "flex", alignItems: "center", gap: "0.75rem" }}>
               <div style={{ fontSize: "1.5rem" }}>👑</div>
               <div>
@@ -1000,7 +1043,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
           </div>
         )}
 
-        {/* ── DM Help (auto-help on first DM) ── */}
+        {/* ── DM Help ── */}
         {tab === "dmhelp" && (
           <div style={{ display: "flex", flexDirection: "column", gap: "1.125rem" }}>
             <div className="toggle-row">
@@ -1045,9 +1088,33 @@ Reply with any command to get started.`}
           </div>
         )}
 
-        {/* ── QR ── */}
+        {/* ── QR / Pairing Code Tab (UPDATED WITH BOTH METHODS) ── */}
         {tab === "qr" && (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "1rem" }}>
+            
+            {/* Method selector - only show when bot is not connected */}
+            {(bot.status === "disconnected" || bot.status === "failed" || bot.status === "qr_timeout" || bot.status === "error" || bot.status === "connecting") && (
+              <div style={{ width: "100%", marginBottom: "0.5rem" }}>
+                <div style={{ display: "flex", gap: "0.5rem", justifyContent: "center" }}>
+                  <button 
+                    className={`btn ${qrMethod === "qr" ? "btn-primary" : "btn-secondary"}`}
+                    onClick={() => setQrMethod("qr")}
+                    style={{ flex: 1 }}
+                  >
+                    📱 QR Code
+                  </button>
+                  <button 
+                    className={`btn ${qrMethod === "code" ? "btn-primary" : "btn-secondary"}`}
+                    onClick={() => setQrMethod("code")}
+                    style={{ flex: 1 }}
+                  >
+                    🔢 Pairing Code
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Bot is already connected */}
             {bot.status === "connected" ? (
               <div style={{ textAlign: "center", padding: "1.5rem" }}>
                 <div style={{ fontSize: "2.5rem", marginBottom: "0.75rem" }}>✅</div>
@@ -1055,6 +1122,95 @@ Reply with any command to get started.`}
                 <div style={{ fontSize: "0.875rem", color: "var(--text2)", marginTop: "0.375rem" }}>
                   This bot is linked to WhatsApp and active.
                 </div>
+                <div style={{ fontSize: "0.75rem", color: "var(--text3)", marginTop: "0.5rem" }}>
+                  To reconnect with a new number, delete this bot and create a new one.
+                </div>
+              </div>
+            ) : qrMethod === "code" ? (
+              // SHOW PAIRING CODE PROMINENTLY
+              <div style={{ textAlign: "center", width: "100%" }}>
+                {pairingCode ? (
+                  <>
+                    <div style={{ 
+                      fontSize: "2.5rem", 
+                      fontWeight: "bold", 
+                      letterSpacing: "0.5rem",
+                      background: "linear-gradient(135deg, var(--accent) 0%, #c084fc 100%)",
+                      padding: "1.5rem",
+                      borderRadius: "var(--radius-xl)",
+                      fontFamily: "monospace",
+                      color: "white",
+                      textShadow: "0 2px 4px rgba(0,0,0,0.2)",
+                      marginBottom: "1rem"
+                    }}>
+                      {pairingCode}
+                    </div>
+                    
+                    <div style={{ 
+                      background: "var(--accent-dim)", 
+                      padding: "1rem", 
+                      borderRadius: "var(--radius)",
+                      marginBottom: "1rem",
+                      textAlign: "left"
+                    }}>
+                      <p style={{ fontWeight: "bold", marginBottom: "0.5rem" }}>📋 Instructions:</p>
+                      <ol style={{ marginLeft: "1.25rem", color: "var(--text2)", lineHeight: "1.8" }}>
+                        <li>Open WhatsApp on your <strong>phone</strong></li>
+                        <li>Go to <strong>Settings</strong> (iOS) or <strong>three-dot menu</strong> (Android)</li>
+                        <li>Tap <strong>Linked Devices</strong></li>
+                        <li>Tap <strong>Link with phone number</strong></li>
+                        <li>Enter this code: <strong style={{ color: "var(--accent)", fontSize: "1.1rem" }}>{pairingCode}</strong></li>
+                      </ol>
+                    </div>
+
+                    {pairingExpiresAt && (
+                      <p style={{ fontSize: "0.875rem", color: "var(--text3)" }}>
+                        ⏱ Code expires: {new Date(pairingExpiresAt).toLocaleTimeString()}
+                      </p>
+                    )}
+                    
+                    <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem", justifyContent: "center", flexWrap: "wrap" }}>
+                      <button className="btn btn-secondary" onClick={refreshPairingCode} disabled={generatingCode}>
+                        {generatingCode ? <Spinner size="sm" /> : "⟳ Refresh Code"}
+                      </button>
+                      <button className="btn btn-primary" onClick={requestNewPairingCode}>
+                        📱 New Code
+                      </button>
+                    </div>
+                  </>
+                ) : showPhoneInput ? (
+                  <div style={{ width: "100%", marginTop: "1rem" }}>
+                    <p style={{ marginBottom: "0.5rem", color: "var(--text2)" }}>Enter phone number to generate pairing code:</p>
+                    <input 
+                      className="input" 
+                      placeholder="e.g., 628123456789" 
+                      value={phoneNumberInput}
+                      onChange={(e) => setPhoneNumberInput(e.target.value)}
+                      style={{ marginBottom: "0.5rem" }}
+                    />
+                    <div style={{ display: "flex", gap: "0.5rem" }}>
+                      <button 
+                        className="btn btn-secondary" 
+                        onClick={() => setShowPhoneInput(false)}
+                        style={{ flex: 1 }}
+                      >
+                        Cancel
+                      </button>
+                      <button 
+                        className="btn btn-primary" 
+                        onClick={generateNewPairingCode}
+                        disabled={!phoneNumberInput || generatingCode}
+                        style={{ flex: 1 }}
+                      >
+                        {generatingCode ? <Spinner size="sm" /> : "Generate Code"}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button className="btn btn-primary" onClick={requestNewPairingCode}>
+                    Generate Pairing Code
+                  </button>
+                )}
               </div>
             ) : (bot.status === "disconnected" || bot.status === "failed" || bot.status === "qr_timeout" || bot.status === "error") && !qrUrl ? (
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "1rem", padding: "1.5rem", textAlign: "center" }}>
@@ -1066,7 +1222,7 @@ Reply with any command to get started.`}
                 </div>
                 <div style={{ fontSize: "0.8125rem", color: "var(--text2)", maxWidth: "320px", lineHeight: 1.5 }}>
                   {bot.status === "failed"
-                    ? "Maximum reconnect attempts reached. Click Reconnect to start a fresh session and scan a new QR code."
+                    ? "Maximum reconnect attempts reached. Click Reconnect to start a fresh session."
                     : bot.status === "qr_timeout"
                     ? "QR code was not scanned within 2 minutes. Click Reconnect to generate a new one."
                     : "The WhatsApp session has ended. Click Reconnect to start a new session."}
@@ -1083,8 +1239,7 @@ Reply with any command to get started.`}
                     setReconnectMsg("");
                     try {
                       await botsApi.reconnect(bot.id);
-                      setReconnectMsg("✓ Reconnect initiated — a QR code will appear shortly.");
-                      // Do not set status locally — wait for server SSE to update real status
+                      setReconnectMsg("✓ Reconnect initiated — a QR/pairing code will appear shortly.");
                     } catch (err) {
                       setReconnectMsg(err.message ?? "Reconnect failed. Please try again.");
                     } finally {
@@ -1096,12 +1251,12 @@ Reply with any command to get started.`}
                 </button>
               </div>
             ) : qrUrl ? (
+              // Show QR code
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.625rem", width: "100%" }}>
                 <p style={{ fontSize: "0.8125rem", color: "var(--text2)", textAlign: "center", margin: 0 }}>
                   Open WhatsApp → <strong>Linked Devices</strong> → <strong>Link a Device</strong>, then scan:
                 </p>
 
-                {/* QR image + refreshing overlay */}
                 <div style={{ position: "relative", display: "inline-block" }}>
                   <div
                     className="qr-wrap"
@@ -1134,7 +1289,6 @@ Reply with any command to get started.`}
                   )}
                 </div>
 
-                {/* Countdown */}
                 <div style={{ fontSize: "0.75rem", color: "var(--text3)", textAlign: "center" }}>
                   {qrExpired ? (
                     <span style={{ color: "var(--warning)" }}>⟳ Waiting for new QR code from WhatsApp…</span>
@@ -1163,8 +1317,8 @@ Reply with any command to get started.`}
                 <div style={{ textAlign: "center" }}>
                   <div style={{ fontSize: "0.875rem", color: "var(--text2)", fontWeight: 600 }}>
                     {bot.status === "connecting" || bot.status === "reconnecting"
-                      ? "Reconnecting to WhatsApp…"
-                      : "Generating QR code…"}
+                      ? "Connecting to WhatsApp…"
+                      : "Generating connection code…"}
                   </div>
                   <div style={{ fontSize: "0.75rem", color: "var(--text3)", marginTop: "0.25rem" }}>
                     This takes a few seconds. The code will appear here automatically.
@@ -1174,6 +1328,7 @@ Reply with any command to get started.`}
             )}
           </div>
         )}
+
       </div>
 
       {tab !== "qr" && (

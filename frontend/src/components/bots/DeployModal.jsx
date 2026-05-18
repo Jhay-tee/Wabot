@@ -42,13 +42,9 @@ const WARNINGS = [
   }
 ];
 
-/* Baileys rotates QR codes roughly every 60 seconds */
 const QR_LIFE_S    = 60;
-/* First HTTP poll: give the bot ~3 s to start and emit a QR */
 const FIRST_POLL_MS = 3_000;
-/* Ongoing poll interval as SSE fallback */
 const POLL_MS       = 8_000;
-/* How long to wait for a scan before the modal gives up */
 const TIMEOUT_MS    = 10 * 60_000;
 
 export function DeployModal({ user, onClose, onDeployed }) {
@@ -61,12 +57,13 @@ export function DeployModal({ user, onClose, onDeployed }) {
   const [error,        setError]        = useState("");
   const [qrUrl,        setQrUrl]        = useState(null);
   const [countdown,    setCountdown]    = useState(QR_LIFE_S);
-  const [qrExpired,    setQrExpired]    = useState(false);  /* true when countdown hits 0 */
-  const [method, setMethod] = useState("qr"); // qr | code
-  const [pairCode, setPairCode] = useState(null);
+  const [qrExpired,    setQrExpired]    = useState(false);
+  const [method,       setMethod]       = useState("qr");
+  const [pairCode,     setPairCode]     = useState(null);
   const [pairExpiresAt, setPairExpiresAt] = useState(null);
-  const [phoneInput, setPhoneInput] = useState("");
-  const [claiming, setClaiming] = useState(false);
+  const [phoneInput,   setPhoneInput]   = useState("");
+  const [showMethodSelect, setShowMethodSelect] = useState(false);
+  const [deployCompleted, setDeployCompleted] = useState(false);
 
   const esRef          = useRef(null);
   const timeoutRef     = useRef(null);
@@ -101,36 +98,35 @@ export function DeployModal({ user, onClose, onDeployed }) {
     }, 1000);
   }, []);
 
-  /* ── called when any QR url arrives ─────────────────────────── */
   const markQr = useCallback((url) => {
     setQrUrl(url);
     setQrExpired(false);
     startCountdown();
   }, [startCountdown]);
 
-  /* ── called when connected status arrives ────────────────────── */
   const markConnected = useCallback((es) => {
     if (connectedRef.current) return;
     connectedRef.current = true;
+    setDeployCompleted(true);
     clearTimeout(timeoutRef.current);
     clearTimeout(firstPollRef.current);
     clearInterval(pollRef.current);
     clearInterval(cdRef.current);
-    // close SSE and notify parent that deployment completed
     try { es?.close(); } catch (e) {}
-    // give parent a chance to refresh state, then close this modal
-    try { onDeployed(); } catch (e) {}
-    try { onClose(); } catch (e) {}
+    // Close modal immediately after successful connection
+    setTimeout(() => {
+      try { onDeployed(); } catch (e) {}
+      try { onClose(); } catch (e) {}
+    }, 1000);
   }, [onDeployed, onClose]);
 
-  /* ── HTTP polling (SSE fallback + initial fetch) ─────────────── */
   const doPoll = useCallback(async () => {
     if (connectedRef.current) return;
     try {
       const data = await botsApi.qr(botIdRef.current);
       if (data?.qrCodeDataUrl) markQr(data.qrCodeDataUrl);
     } catch {
-      /* 404 = QR not ready yet — silently ignore */
+      // ignore
     }
   }, [markQr]);
 
@@ -138,15 +134,10 @@ export function DeployModal({ user, onClose, onDeployed }) {
     botIdRef.current = botId;
     clearTimeout(firstPollRef.current);
     clearInterval(pollRef.current);
-
-    /* First poll after bot has had time to start */
     firstPollRef.current = setTimeout(doPoll, FIRST_POLL_MS);
-
-    /* Ongoing interval as SSE fallback */
     pollRef.current = setInterval(doPoll, POLL_MS);
   }, [doPoll]);
 
-  /* ── SSE connection ──────────────────────────────────────────── */
   const connectSse = useCallback((botId, onConn) => {
     const token = localStorage.getItem("wabot_token") ?? "";
     const es    = new EventSource(botsApi.eventsUrl(botId, token));
@@ -157,7 +148,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
         const msg = JSON.parse(e.data);
         if (msg.type === "qr")     markQr(msg.qrUrl);
         if (msg.type === "pair_code") {
-          // pair code may be a string or an object
           if (typeof msg.code === "string") setPairCode(msg.code);
           else if (msg.code && typeof msg.code === "object") {
             setPairCode(msg.code.code ?? null);
@@ -169,64 +159,84 @@ export function DeployModal({ user, onClose, onDeployed }) {
         }
       } catch {}
     };
-
-    /* SSE errors are non-fatal — EventSource auto-reconnects,
-       and the HTTP poll ensures we don't miss QR rotations. */
     es.onerror = () => {};
 
-    /* Overall timeout: 10 min with no successful scan */
     timeoutRef.current = setTimeout(() => {
       if (!connectedRef.current) {
         es.close();
         clearTimeout(firstPollRef.current);
         clearInterval(pollRef.current);
         clearInterval(cdRef.current);
-        setError("Connection timed out (10 min). The QR window has closed. Please try deploying again.");
+        setError("Connection timed out (10 min). Please try deploying again.");
         setStep("form");
+        setShowMethodSelect(false);
       }
     }, TIMEOUT_MS);
   }, [markQr]);
 
-  /* ── Deploy form submit ──────────────────────────────────────── */
-  const deploy = async (e) => {
+  const handleFormSubmit = (e) => {
     e.preventDefault();
     if (!name.trim()) return setError("Bot name is required.");
-    setError(""); setLoading(true);
+    setError("");
+    setShowMethodSelect(true);
+  };
+
+  const deployWithMethod = async () => {
+    setLoading(true);
+    setError("");
     try {
-      const data = await botsApi.deploy({ botName: name.trim(), description: desc.trim(), botType, method });
+      const data = await botsApi.deploy({ 
+        botName: name.trim(), 
+        description: desc.trim(), 
+        botType, 
+        method,
+        phone: method === "code" ? phoneInput.replace(/[^0-9]/g, '') : undefined
+      });
       const botId = data.bot.id;
-      // If backend returned a pairing code from deploy, show it immediately
+      
       if (data.pairing?.code) {
         setPairCode(data.pairing.code);
         if (data.pairing.expiresAt) setPairExpiresAt(data.pairing.expiresAt);
-        setMethod("code");
       }
+      
       connectedRef.current = false;
       setQrUrl(null);
       setQrExpired(false);
-      // Show connection method choice (QR or pairing code)
-      setStep("qr");
-      // Start SSE for live updates regardless of method
+      setDeployCompleted(false);
+      // Move to connection screen (will show QR or pairing code)
+      setStep("connecting");
+      
       connectSse(botId, markConnected);
       startPolling(botId);
-      // If pairing code chosen, pre-create a pairing code (only if not returned by deploy)
-      if (method === "code" && !pairCode) {
+      
+      if (method === "code" && !pairCode && phoneInput) {
         try {
-          const resp = await botsApi.createPairingCode(botId, phoneInput);
+          const resp = await botsApi.createPairingCode(botId, phoneInput.replace(/[^0-9]/g, ''));
           setPairCode(resp.code);
           setPairExpiresAt(resp.expiresAt);
         } catch (e) {
-          // ignore — user can still use QR
+          // ignore
         }
       }
     } catch (err) {
       setError(err.message);
+      setShowMethodSelect(true);
     } finally {
       setLoading(false);
     }
   };
 
-  /* ── Email gate ──────────────────────────────────────────────── */
+  const refreshPairingCode = async () => {
+    if (!botIdRef.current) return;
+    try {
+      const resp = await botsApi.createPairingCode(botIdRef.current, phoneInput.replace(/[^0-9]/g, ''));
+      setPairCode(resp.code);
+      setPairExpiresAt(resp.expiresAt);
+    } catch (e) {
+      setError(e.message || "Could not refresh pairing code.");
+    }
+  };
+
   if (!user?.emailVerified && !user?.email_verified) {
     return (
       <Modal onClose={onClose}>
@@ -252,18 +262,15 @@ export function DeployModal({ user, onClose, onDeployed }) {
 
           <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: "0.625rem" }}>
             {WARNINGS.map((w) => (
-              <div
-                key={w.title}
-                style={{
-                  background: "var(--warning-bg)",
-                  border: "1px solid rgba(245,158,11,0.2)",
-                  borderRadius: "var(--radius)",
-                  padding: "0.75rem 1rem",
-                  display: "flex",
-                  gap: "0.75rem",
-                  alignItems: "flex-start"
-                }}
-              >
+              <div key={w.title} style={{
+                background: "var(--warning-bg)",
+                border: "1px solid rgba(245,158,11,0.2)",
+                borderRadius: "var(--radius)",
+                padding: "0.75rem 1rem",
+                display: "flex",
+                gap: "0.75rem",
+                alignItems: "flex-start"
+              }}>
                 <span style={{ fontSize: "1.1rem", flexShrink: 0 }}>{w.icon}</span>
                 <div>
                   <div style={{ fontWeight: 600, fontSize: "0.8125rem", color: "var(--text)", marginBottom: "0.2rem" }}>
@@ -287,7 +294,6 @@ export function DeployModal({ user, onClose, onDeployed }) {
             border: `1.5px solid ${accepted ? "var(--accent)" : "var(--border)"}`,
             borderRadius: "var(--radius)",
             cursor: "pointer",
-            transition: "border-color 0.14s ease"
           }}>
             <input
               type="checkbox"
@@ -302,24 +308,16 @@ export function DeployModal({ user, onClose, onDeployed }) {
           </label>
 
           <div style={{ width: "100%", display: "flex", gap: "0.75rem" }}>
-            <button className="btn btn-secondary" style={{ flex: 1 }} onClick={onClose}>
-              Cancel
-            </button>
-            <button
-              className="btn btn-primary"
-              type="button"
-              disabled={!accepted}
-              onClick={() => setStep("form")}
-              style={{ flex: 1, touchAction: "manipulation" }}
-            >
+            <button className="btn btn-secondary" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" type="button" disabled={!accepted} onClick={() => setStep("form")} style={{ flex: 1 }}>
               I understand — Continue
             </button>
           </div>
         </>
       )}
 
-      {/* ── Step 1: Form ─────────────────────────────────────── */}
-      {step === "form" && (
+      {/* ── Step 1: Form (Bot details) ───────────────────────── */}
+      {step === "form" && !showMethodSelect && (
         <>
           <div style={{ fontSize: "2rem" }}>🚀</div>
           <h3>Deploy a new bot</h3>
@@ -328,20 +326,14 @@ export function DeployModal({ user, onClose, onDeployed }) {
             <div style={{ fontSize: "0.875rem", fontWeight: 500, color: "var(--text2)" }}>Bot type</div>
             <div className="deploy-type-grid">
               {BOT_TYPES.map((t) => (
-                <button
-                  key={t.id}
-                  type="button"
-                  onClick={() => setBotType(t.id)}
-                  style={{
-                    padding: "0.875rem",
-                    borderRadius: "var(--radius)",
-                    border: `1.5px solid ${botType === t.id ? "var(--accent)" : "var(--border)"}`,
-                    background: botType === t.id ? "var(--accent-dim)" : "var(--card)",
-                    cursor: "pointer",
-                    textAlign: "left",
-                    transition: "all 0.14s ease"
-                  }}
-                >
+                <button key={t.id} type="button" onClick={() => setBotType(t.id)} style={{
+                  padding: "0.875rem",
+                  borderRadius: "var(--radius)",
+                  border: `1.5px solid ${botType === t.id ? "var(--accent)" : "var(--border)"}`,
+                  background: botType === t.id ? "var(--accent-dim)" : "var(--card)",
+                  cursor: "pointer",
+                  textAlign: "left",
+                }}>
                   <div style={{ fontSize: "1.25rem", marginBottom: "0.25rem" }}>{t.icon}</div>
                   <div style={{ fontWeight: 700, fontSize: "0.875rem", color: botType === t.id ? "var(--accent)" : "var(--text)", marginBottom: "0.25rem" }}>{t.label}</div>
                   <div style={{ fontSize: "0.75rem", color: "var(--text3)", lineHeight: 1.4 }}>{t.desc}</div>
@@ -353,177 +345,145 @@ export function DeployModal({ user, onClose, onDeployed }) {
             </div>
           </div>
 
-          <form onSubmit={deploy} style={{ width: "100%", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+          <form onSubmit={handleFormSubmit} style={{ width: "100%", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
             {error && <Alert type="error">{error}</Alert>}
             <div className="field">
               <label className="field-label">Bot name *</label>
-              <input
-                className="input"
-                placeholder={botType === "group" ? "e.g. group-helper" : "e.g. support-bot"}
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                autoFocus
-              />
+              <input className="input" placeholder={botType === "group" ? "e.g. group-helper" : "e.g. support-bot"} value={name} onChange={(e) => setName(e.target.value)} autoFocus />
             </div>
             <div className="field">
               <label className="field-label">Description (optional)</label>
-              <input className="input" placeholder="What does this bot do?" value={desc}
-                onChange={(e) => setDesc(e.target.value)} />
+              <input className="input" placeholder="What does this bot do?" value={desc} onChange={(e) => setDesc(e.target.value)} />
             </div>
-            <button type="submit" className="btn btn-primary w-full" disabled={loading}>
-              {loading ? <><Spinner size="sm" /> Deploying…</> : `Deploy ${botType === "group" ? "Group" : "DM"} Bot`}
-            </button>
+            <button type="submit" className="btn btn-primary w-full">Continue to connection method →</button>
           </form>
         </>
       )}
 
-      {/* ── Step 2: QR ───────────────────────────────────────── */}
-      {step === "qr" && (
+      {/* ── Step 1.5: Method Selection ───────────────────────── */}
+      {step === "form" && showMethodSelect && (
         <>
-          <div style={{ fontSize: "2rem" }}>📱</div>
-          <h3>Connect your number</h3>
-
-          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-            <button className={method === "qr" ? "btn btn-primary" : "btn btn-ghost"} onClick={() => setMethod("qr")}>QR code</button>
-            <button className={method === "code" ? "btn btn-primary" : "btn btn-ghost"} onClick={() => setMethod("code")}>Pairing code (mobile recommended)</button>
+          <div style={{ fontSize: "2rem" }}>🔌</div>
+          <h3>Choose connection method</h3>
+          
+          <div style={{ display: "flex", gap: "1rem", marginBottom: "1rem" }}>
+            <button className={method === "qr" ? "btn btn-primary" : "btn btn-secondary"} onClick={() => setMethod("qr")} style={{ flex: 1 }}>📱 QR Code</button>
+            <button className={method === "code" ? "btn btn-primary" : "btn btn-secondary"} onClick={() => setMethod("code")} style={{ flex: 1 }}>🔢 Pairing Code (mobile recommended)</button>
           </div>
 
           {method === "code" && (
-            <div style={{ marginBottom: 12 }}>
-              <div style={{ fontSize: "0.9rem", color: "var(--text2)", marginBottom: 8 }}>
-                Enter the phone number you will pair from (international format). An 8-digit code will be generated and shown below — open WhatsApp on your phone and enter the code in the pairing flow.
-              </div>
-              <input className="input" placeholder="+15551234567" value={phoneInput} onChange={(e) => setPhoneInput(e.target.value)} />
-              <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
-                <button className="btn btn-primary" onClick={async () => {
-                  if (!botIdRef.current) return;
-                  setPairCode(null); setPairExpiresAt(null);
-                  try {
-                    const resp = await botsApi.createPairingCode(botIdRef.current, phoneInput);
-                    setPairCode(resp.code); setPairExpiresAt(resp.expiresAt);
-                  } catch (e) { setError(e.message || "Could not create pairing code."); }
-                }}>Generate code</button>
-                <button className="btn btn-ghost" onClick={() => { setPairCode(null); setPhoneInput(""); }}>Reset</button>
-              </div>
-
-              {pairCode && (
-                <div className="card" style={{ marginTop: 12, textAlign: "center" }}>
-                  <div style={{ fontSize: "1.5rem", fontWeight: 700, letterSpacing: "0.2rem" }}>{pairCode}</div>
-                  <div style={{ color: "var(--text3)", marginTop: 6 }}>Expires: {new Date(pairExpiresAt).toLocaleTimeString()}</div>
-                  <div style={{ marginTop: 8 }}>
-                    <button className="btn btn-primary" onClick={async () => {
-                      if (!botIdRef.current || !pairCode) return;
-                      setClaiming(true);
-                      try {
-                        // In a real flow the bot would write session data; here we simulate claim
-                        await botsApi.claimPairingCode(botIdRef.current, pairCode, { simulated: true }).catch(() => {});
-                        // After claiming, poll bot status via SSE/poll — if connected, markConnected will run
-                      } catch (e) { setError(e.message || "Could not claim pairing code."); }
-                      setClaiming(false);
-                    }}>{claiming ? "Claiming…" : "Mark as paired"}</button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {method === "qr" && (
-            <>
-              <h3 style={{ display: "none" }}>Scan to connect</h3>
-            </>
-          )}
-
-          {method === "qr" && qrUrl && (
-            /* ── QR available ── */
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.625rem", width: "100%" }}>
-              <p style={{ fontSize: "0.8125rem", color: "var(--text2)", textAlign: "center", margin: 0 }}>
-                Open WhatsApp → <strong>Linked Devices</strong> → <strong>Link a Device</strong>, then scan:
-              </p>
-
-              {/* QR image + optional "refreshing" overlay */}
-              <div style={{ position: "relative", display: "inline-block" }}>
-                <div
-                  className="qr-wrap"
-                  style={{
-                    opacity:    qrExpired ? 0.35 : 1,
-                    transition: "opacity 0.4s ease",
-                    filter:     qrExpired ? "blur(2px)" : "none",
-                  }}
-                >
-                  <img src={qrUrl} alt="WhatsApp QR code" />
-                </div>
-
-                {qrExpired && (
-                  <div style={{
-                    position:       "absolute",
-                    inset:          0,
-                    display:        "flex",
-                    flexDirection:  "column",
-                    alignItems:     "center",
-                    justifyContent: "center",
-                    gap:            "0.5rem",
-                    borderRadius:   "var(--radius)",
-                    background:     "rgba(10,10,15,0.55)",
-                    backdropFilter: "blur(4px)",
-                  }}>
-                    <Spinner size="md" />
-                    <span style={{ fontSize: "0.75rem", color: "#fff", fontWeight: 600 }}>
-                      Refreshing QR…
-                    </span>
-                  </div>
-                )}
-              </div>
-
-              {/* Countdown row */}
-              <div style={{ fontSize: "0.75rem", color: "var(--text3)", textAlign: "center" }}>
-                {qrExpired ? (
-                  <span style={{ color: "var(--warning)" }}>
-                    ⟳ Waiting for new QR code from WhatsApp…
-                  </span>
-                ) : (
-                  <>
-                    Refreshes in{" "}
-                    <strong style={{ color: countdown <= 10 ? "var(--warning)" : "var(--text2)" }}>
-                      {countdown}s
-                    </strong>
-                  </>
-                )}
-                {" "}· window stays open 10 min
-              </div>
-
-              {/* Hint */}
-              <div style={{
-                fontSize: "0.75rem",
-                color: "var(--text3)",
-                background: "var(--bg)",
-                border: "1px solid var(--border)",
-                borderRadius: "var(--radius)",
-                padding: "0.5rem 0.75rem",
-                width: "100%",
-                textAlign: "center"
-              }}>
-                The QR code rotates every ~60 s. If it expires, a new one loads automatically.
-              </div>
-            </div>
-          )}
-
-          {method === "qr" && !qrUrl && (
-            /* ── Waiting for first QR ── */
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.875rem", padding: "1.5rem" }}>
-              <Spinner size="lg" />
-              <div style={{ textAlign: "center" }}>
-                <div style={{ fontSize: "0.875rem", color: "var(--text2)", fontWeight: 600 }}>
-                  Generating QR code…
-                </div>
-                <div style={{ fontSize: "0.75rem", color: "var(--text3)", marginTop: "0.25rem" }}>
-                  This takes a few seconds. The code will appear here automatically.
-                </div>
+            <div style={{ marginBottom: "1rem" }}>
+              <label className="field-label">Phone number (international format)</label>
+              <input className="input" placeholder="e.g. 628123456789" value={phoneInput} onChange={(e) => setPhoneInput(e.target.value)} />
+              <div style={{ fontSize: "0.75rem", color: "var(--text3)", marginTop: "0.25rem" }}>
+                No + sign, no spaces, no parentheses. Just numbers with country code.
               </div>
             </div>
           )}
 
           {error && <Alert type="error">{error}</Alert>}
-          <button className="btn btn-secondary w-full" onClick={onClose}>Cancel</button>
+
+          <div style={{ display: "flex", gap: "0.75rem", marginTop: "0.5rem" }}>
+            <button className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setShowMethodSelect(false)}>← Back</button>
+            <button className="btn btn-primary" style={{ flex: 1 }} onClick={deployWithMethod} disabled={loading || (method === "code" && !phoneInput)}>
+              {loading ? <><Spinner size="sm" /> Deploying…</> : `Deploy & Connect`}
+            </button>
+          </div>
+        </>
+      )}
+
+      {/* ── Step 2: Connection Screen (QR or Pairing Code) ────── */}
+      {step === "connecting" && (
+        <>
+          <div style={{ fontSize: "2rem" }}>{method === "qr" ? "📱" : "🔢"}</div>
+          <h3>{method === "qr" ? "Scan QR Code" : "Enter Pairing Code on Your Phone"}</h3>
+
+          {method === "pairing" || method === "code" ? (
+            // SHOW PAIRING CODE PROMINENTLY
+            <div style={{ textAlign: "center", width: "100%" }}>
+              <div style={{ 
+                fontSize: "3rem", 
+                fontWeight: "bold", 
+                letterSpacing: "0.75rem",
+                background: "linear-gradient(135deg, var(--accent) 0%, #c084fc 100%)",
+                padding: "1.5rem",
+                borderRadius: "var(--radius-xl)",
+                fontFamily: "monospace",
+                color: "white",
+                textShadow: "0 2px 4px rgba(0,0,0,0.2)",
+                marginBottom: "1rem"
+              }}>
+                {pairCode || "──────"}
+              </div>
+              
+              <div style={{ 
+                background: "var(--accent-dim)", 
+                padding: "1rem", 
+                borderRadius: "var(--radius)",
+                marginBottom: "1rem",
+                textAlign: "left"
+              }}>
+                <p style={{ fontWeight: "bold", marginBottom: "0.5rem" }}>📋 Instructions:</p>
+                <ol style={{ marginLeft: "1.25rem", color: "var(--text2)", lineHeight: "1.8" }}>
+                  <li>Open WhatsApp on your <strong>phone</strong></li>
+                  <li>Go to <strong>Settings</strong> (iOS) or <strong>three-dot menu</strong> (Android)</li>
+                  <li>Tap <strong>Linked Devices</strong></li>
+                  <li>Tap <strong>Link with phone number</strong></li>
+                  <li>Enter this code: <strong style={{ color: "var(--accent)", fontSize: "1.1rem" }}>{pairCode || "waiting..."}</strong></li>
+                </ol>
+              </div>
+
+              {pairExpiresAt && (
+                <p style={{ fontSize: "0.875rem", color: "var(--text3)" }}>
+                  ⏱ Code expires: {new Date(pairExpiresAt).toLocaleTimeString()}
+                </p>
+              )}
+              
+              <button className="btn btn-secondary" onClick={refreshPairingCode} style={{ marginTop: "0.5rem" }}>
+                ⟳ Refresh Code
+              </button>
+              <p style={{ fontSize: "0.75rem", color: "var(--text3)", marginTop: "0.75rem" }}>
+                The modal will close automatically once connected
+              </p>
+            </div>
+          ) : (
+            // SHOW QR CODE
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.625rem", width: "100%" }}>
+              {qrUrl ? (
+                <>
+                  <p style={{ fontSize: "0.8125rem", color: "var(--text2)", textAlign: "center" }}>
+                    Open WhatsApp → <strong>Linked Devices</strong> → <strong>Link a Device</strong>, then scan:
+                  </p>
+                  <div className="qr-wrap" style={{ position: "relative" }}>
+                    <img src={qrUrl} alt="WhatsApp QR code" style={{ opacity: qrExpired ? 0.35 : 1 }} />
+                    {qrExpired && (
+                      <div style={{
+                        position: "absolute", inset: 0,
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        background: "rgba(0,0,0,0.6)", borderRadius: "var(--radius)"
+                      }}>
+                        <Spinner size="md" />
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ fontSize: "0.75rem", color: "var(--text3)" }}>
+                    Refreshes in {countdown}s · window stays open 10 min
+                  </div>
+                </>
+              ) : (
+                <div style={{ padding: "2rem", textAlign: "center" }}>
+                  <Spinner size="lg" />
+                  <p style={{ marginTop: "1rem", color: "var(--text2)" }}>Generating {method === "qr" ? "QR code" : "pairing code"}…</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {error && <Alert type="error">{error}</Alert>}
+          
+          {!deployCompleted && (
+            <button className="btn btn-secondary w-full" onClick={onClose}>Cancel</button>
+          )}
         </>
       )}
 
