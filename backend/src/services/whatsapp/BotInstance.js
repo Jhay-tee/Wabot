@@ -23,6 +23,8 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { Boom }          from "@hapi/boom";
 import QRCode            from "qrcode";
+// ✅ FIX: top-level import instead of dynamic import inside _sendWebhook (performance)
+import { createHmac }    from "node:crypto";
 import { createSupabaseAuthState, clearSupabaseSession } from "./SupabaseStore.js";
 import { MessageQueue }  from "./MessageQueue.js";
 import { supabase }      from "../../lib/supabase.js";
@@ -83,8 +85,8 @@ function extractMessageBody(msg) {
 
   if (inner.extendedTextMessage)
     return { text: (inner.extendedTextMessage.text ?? "").trim(), type: "text", extra: {
-      quotedMsg:    inner.extendedTextMessage.contextInfo?.quotedMessage ?? null,
-      mentionedJid: inner.extendedTextMessage.contextInfo?.mentionedJid ?? [],
+      quotedMsg:         inner.extendedTextMessage.contextInfo?.quotedMessage ?? null,
+      mentionedJid:      inner.extendedTextMessage.contextInfo?.mentionedJid ?? [],
       quotedParticipant: inner.extendedTextMessage.contextInfo?.participant ?? null
     }};
 
@@ -111,8 +113,8 @@ function extractMessageBody(msg) {
 
   if (inner.locationMessage)
     return { text: "📍 Location shared", type: "location", extra: {
-      lat: inner.locationMessage.degreesLatitude,
-      lng: inner.locationMessage.degreesLongitude,
+      lat:  inner.locationMessage.degreesLatitude,
+      lng:  inner.locationMessage.degreesLongitude,
       name: inner.locationMessage.name
     }};
 
@@ -155,7 +157,7 @@ function formatCatalog(products = []) {
   const lines = ["📦 *Our Products:*\n"];
   products.forEach((p, i) => {
     lines.push(`${i + 1}. *${p.name}*`);
-    if (p.price) lines.push(`   💰 ₦${p.price}`);
+    if (p.price)       lines.push(`   💰 ₦${p.price}`);
     if (p.description) lines.push(`   ${p.description}`);
   });
   lines.push("\nSend a product name or number to enquire.");
@@ -195,45 +197,37 @@ export class BotInstance {
     this._onPair   = new Set();
     this._pendingUsage = { messagesThisMonth: 0, totalMessages: 0, lastActivity: null };
     this._pendingLogs  = [];
-    this._isPairingMode        = false; // Flag to prevent QR from overriding pairing mode
-    this._socketReadyForPairing = false; // True once WS is up and ready for pairing code
-    this._pairingPhone         = null;  // Phone stored while waiting for socket readiness
-    this._pairingCodeResolve   = null;  // Promise resolver for requestPairingCode callers
-    this._pairingCodeReject    = null;  // Promise rejecter for requestPairingCode callers
-    this._pairingCodeInFlight  = false; // Guard against duplicate Baileys pairing code calls
+    this._isPairingMode         = false;
+    this._socketReadyForPairing = false;
+    this._pairingPhone          = null;
+    this._pairingCodeResolve    = null;
+    this._pairingCodeReject     = null;
+    this._pairingCodeInFlight   = false;
 
     /* ── Group management in-memory state ─────────────────── */
-    // Strike counts for moderation actions (anti-link/spam/vulgar)
-    this._strikes       = new Map(); // `${groupJid}:${userJid}` → count
-    // Manual warn counts (.warn command)
-    this._warnCount     = new Map(); // `${groupJid}:${userJid}` → count
-    // Spam tracking: timestamps of recent messages
-    this._spamTracker   = new Map(); // `${groupJid}:${userJid}` → [timestamps]
-    // Group metadata cache
-    this._metaCache     = new Map(); // groupJid → { meta, cachedAt }
-    // DM contacts who've already received auto-help
-    this._seenDmContacts = new Set();
-    // DM contacts who've already received a sales welcome message
+    this._strikes            = new Map(); // `${groupJid}:${userJid}` → count
+    this._warnCount          = new Map(); // `${groupJid}:${userJid}` → count
+    this._spamTracker        = new Map(); // `${groupJid}:${userJid}` → [timestamps]
+    this._metaCache          = new Map(); // groupJid → { meta, cachedAt }
+    this._seenDmContacts     = new Set();
     this._welcomedDmContacts = new Set();
   }
 
-  onQR(cb)     { this._onQR.add(cb);     return () => this._onQR.delete(cb); }
-  onPairCode(cb) { this._onPair.add(cb); return () => this._onPair.delete(cb); }
-  onStatus(cb) { this._onStatus.add(cb); return () => this._onStatus.delete(cb); }
+  onQR(cb)       { this._onQR.add(cb);     return () => this._onQR.delete(cb); }
+  onPairCode(cb) { this._onPair.add(cb);   return () => this._onPair.delete(cb); }
+  onStatus(cb)   { this._onStatus.add(cb); return () => this._onStatus.delete(cb); }
   updateConfig(patch) { this.config = { ...this.config, ...patch }; }
 
   /* ── Helper: Increment user's monthly counter in DB ───────── */
   async _incrementUserMonthlyCounter() {
     try {
       await supabase.rpc("increment_user_messages", { uid: this.userId });
-    } catch (err) {
-      // Fallback if RPC doesn't exist
+    } catch {
       const { data: user } = await supabase
         .from("users")
         .select("messages_this_month")
         .eq("id", this.userId)
         .single();
-      
       if (user) {
         await supabase
           .from("users")
@@ -247,7 +241,6 @@ export class BotInstance {
 
   async start() {
     if (this._destroyed) return;
-    /* Reset pairing state for fresh connection cycle */
     this._socketReadyForPairing = false;
     this._pairingCodeInFlight   = false;
     try {
@@ -258,7 +251,6 @@ export class BotInstance {
       try {
         ({ version } = await fetchLatestBaileysVersion());
       } catch {
-        /* Network issue fetching latest version — fall back to last known good */
         version = [2, 3000, 1035194821];
         logger.warn({ botId: this.botId }, "fetchLatestBaileysVersion failed — using fallback version");
       }
@@ -266,28 +258,18 @@ export class BotInstance {
 
       this.socket = makeWASocket({
         version,
-        auth:           state,
-        printQRInTerminal: false,
-        browser:        ["WaBot", "Chrome", "1.0.0"],
-        syncFullHistory: false,
+        auth:                           state,
+        printQRInTerminal:              false,
+        mobile:                         false,   // ✅ FIX: explicit false prevents pairing-mode breakage in some Baileys builds
+        browser:                        ["WaBot", "Chrome", "1.0.0"],
+        syncFullHistory:                false,
         generateHighQualityLinkPreview: false
       });
 
       this.socket.ev.on("creds.update", saveCreds);
-
-      this.socket.ev.on("connection.update", (update) =>
-        this._onConnectionUpdate(update));
-
-      // expose requestPairingCode if available on socket
-      if (this.socket.requestPairingCode) {
-        // nothing to do now — method will be called when requested
-      }
-
-      this.socket.ev.on("messages.upsert", (upsert) =>
-        this._onMessages(upsert));
-
-      this.socket.ev.on("group-participants.update", (update) =>
-        this._onGroupParticipants(update));
+      this.socket.ev.on("connection.update", (u) => this._onConnectionUpdate(u));
+      this.socket.ev.on("messages.upsert",   (u) => this._onMessages(u));
+      this.socket.ev.on("group-participants.update", (u) => this._onGroupParticipants(u));
 
     } catch (err) {
       logger.error({ err, botId: this.botId }, "BotInstance.start failed");
@@ -302,23 +284,21 @@ export class BotInstance {
     this._queue.destroy();
     await this._flushPendingUsage();
     await this._flushLogs();
-    try { this.socket?.end(undefined); } catch {}
-    if (this._flushTimer) clearTimeout(this._flushTimer);
+    if (this._flushTimer)    clearTimeout(this._flushTimer);
     if (this._logFlushTimer) clearTimeout(this._logFlushTimer);
+    try { this.socket?.end(undefined); } catch {}
   }
 
   async sendMessage(to, text, options = { persist: true }) {
-    if (!this.socket) throw new Error("Bot is not connected.");
+    if (!this.socket)              throw new Error("Bot is not connected.");
     if (this.status !== "connected") throw new Error("Bot is not connected. Check bot status and try again.");
     const jid = to.replace(/[^0-9]/g, "") + "@s.whatsapp.net";
     await this._queue.send(async () => {
       try {
-        // Support sending a plain text string or an object describing media
         if (typeof text === "string") {
           await this.socket.sendMessage(jid, { text });
-        } else if (text && typeof text === "object" && text.media) {
+        } else if (text?.media) {
           const m = text.media;
-          // Expect media: { type: 'image'|'video'|'document', url, caption, fileName }
           if (m.type === "image") {
             await this.socket.sendMessage(jid, { image: { url: m.url }, caption: m.caption ?? undefined });
           } else if (m.type === "video") {
@@ -346,13 +326,14 @@ export class BotInstance {
 
   async _onConnectionUpdate({ connection, lastDisconnect, qr }) {
     if (qr) {
-      /* The WS is up and WhatsApp is waiting for login — socket is ready */
       this._socketReadyForPairing = true;
 
       if (this._isPairingMode && this._pairingPhone) {
-        /* Pairing mode: skip QR display, request pairing code right now */
-        this._doPairingCodeRequest();
-        return;
+        // ✅ FIX: guard against duplicate calls when Baileys re-emits the QR event
+        if (!this._pairingCodeInFlight) {
+          this._doPairingCodeRequest();
+        }
+        return; // always suppress QR display in pairing mode
       }
 
       /* Normal QR flow */
@@ -368,25 +349,24 @@ export class BotInstance {
 
     if (connection === "open") {
       this._clearQrTimeout();
-      this._reconnectAttempts   = 0;
-      this.qrCode               = null;
-      this._isPairingMode       = false;
-      this._socketReadyForPairing = false; // Reset for next cycle
-      this._pairingPhone        = null;
+      this._reconnectAttempts     = 0;
+      this.qrCode                 = null;
+      this._isPairingMode         = false;
+      this._socketReadyForPairing = false;
+      this._pairingPhone          = null;
       await this._setStatus("connected");
       await this._log("bot_connected", "WhatsApp connection established");
     }
 
     if (connection === "close") {
       this._clearQrTimeout();
-      this._socketReadyForPairing = false; // Reset for next connection attempt
+      this._socketReadyForPairing = false;
 
       const code = (lastDisconnect?.error instanceof Boom)
         ? lastDisconnect.error.output?.statusCode
         : undefined;
 
       if (code === DisconnectReason.loggedOut || code === DisconnectReason.forbidden) {
-        /* Reject any pending pairing code waiters */
         if (this._pairingCodeReject) {
           this._pairingCodeReject(new Error("WhatsApp logged out. Please scan QR to reconnect."));
         }
@@ -420,17 +400,8 @@ export class BotInstance {
   }
 
   /* ── requestPairingCode — event-driven, waits for socket ready ─ */
-  /*
-   * Baileys' socket.requestPairingCode() can ONLY be called after the
-   * WebSocket handshake completes but before login finishes — i.e. right
-   * when Baileys would normally emit a QR code.
-   *
-   * Strategy: set _isPairingMode + _pairingPhone so that _onConnectionUpdate
-   * calls _doPairingCodeRequest() as soon as the QR event fires (= socket ready).
-   * If the socket is already in that state, call immediately.
-   */
   async requestPairingCode(phone) {
-    if (!this.socket) throw new Error("Bot socket not started. Please wait a moment and try again.");
+    if (!this.socket)                   throw new Error("Bot socket not started. Please wait a moment and try again.");
     if (!this.socket.requestPairingCode) throw new Error("This Baileys version does not support pairing codes.");
 
     const cleanPhone = String(phone).replace(/[^\d]/g, "");
@@ -443,7 +414,6 @@ export class BotInstance {
     await this._setStatus("awaiting_pairing");
 
     return new Promise((resolve, reject) => {
-      /* 30-second hard timeout */
       const tid = setTimeout(() => {
         this._pairingCodeResolve = null;
         this._pairingCodeReject  = null;
@@ -467,59 +437,66 @@ export class BotInstance {
         reject(err);
       };
 
-      /* If the socket is already in the right state (QR was already emitted),
-         request the code right now instead of waiting for the next QR event. */
-      if (this._socketReadyForPairing) {
+      if (this._socketReadyForPairing && !this._pairingCodeInFlight) {
         this._doPairingCodeRequest();
       }
     });
   }
 
-  /* ── Internal: call Baileys and emit the pairing code ───────── */
+  /* ── Internal: call Baileys and emit the pairing code ─────── */
   async _doPairingCodeRequest() {
-    /* Guard against duplicate concurrent calls (e.g. re-emitted QR events) */
     if (this._pairingCodeInFlight) return;
     const phone = this._pairingPhone;
     if (!phone || !this.socket?.requestPairingCode) return;
+
     this._pairingCodeInFlight = true;
+
+    // ✅ FIX: 1500 ms stabilisation delay — Baileys emits the QR event at the
+    //         moment the WebSocket handshake finishes, but WhatsApp's server
+    //         needs a short window before it accepts a pairing-code request.
+    //         Calling requestPairingCode() too quickly causes an immediate
+    //         disconnect / "bad request" rejection from WhatsApp.
+    await new Promise(r => setTimeout(r, 1500));
+
+    // ✅ FIX: the mode may have been cancelled or the socket may have closed
+    //         during the delay — bail out rather than sending a stale request
+    if (!this._isPairingMode || !this._pairingPhone || !this.socket) {
+      this._pairingCodeInFlight = false;
+      return;
+    }
+
     try {
       logger.info({ botId: this.botId, phone }, "Requesting pairing code from Baileys");
       const code = await this.socket.requestPairingCode(phone);
       if (!code) throw new Error("Baileys returned an empty pairing code.");
       this._lastPairingCode = code;
-      /* Emit to all SSE listeners */
       for (const cb of this._onPair) cb(code);
-      /* Resolve the waiting promise (if any) */
       if (this._pairingCodeResolve) this._pairingCodeResolve(code);
     } catch (err) {
-      this._pairingCodeInFlight = false;
       logger.error({ err, botId: this.botId }, "Pairing code request failed");
       if (this._pairingCodeReject) {
         this._pairingCodeReject(err);
       } else {
-        /* No caller is waiting — fall back to QR mode */
+        // No caller waiting — fall back silently to QR mode
         this._isPairingMode = false;
         this._pairingPhone  = null;
       }
+    } finally {
+      // ✅ FIX: always reset the in-flight flag so retries are possible
+      this._pairingCodeInFlight = false;
     }
   }
 
-  /* ── Exponential backoff reconnect ────────────────────────── */
+  /* ── Exponential backoff reconnect ───────────────────────── */
 
   _scheduleReconnect() {
     if (this._destroyed) return;
     this._reconnectAttempts++;
 
     if (this._reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-      logger.error(
-        { botId: this.botId, attempts: this._reconnectAttempts },
-        "Max reconnect attempts reached — marking bot as failed"
-      );
+      logger.error({ botId: this.botId, attempts: this._reconnectAttempts }, "Max reconnect attempts reached");
       this._setStatus("failed").catch(() => {});
-      this._log(
-        "bot_error",
-        `Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Open bot settings → QR tab to manually reconnect.`
-      ).catch(() => {});
+      this._log("bot_error", `Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Open bot settings → QR tab to manually reconnect.`).catch(() => {});
       return;
     }
 
@@ -527,16 +504,9 @@ export class BotInstance {
     const backoff = RECONNECT_BASE_MS * Math.pow(2, this._reconnectAttempts - 1);
     const delayMs = Math.min(RECONNECT_MAX_MS, backoff) + jitter;
 
-    logger.info(
-      { botId: this.botId, attempt: this._reconnectAttempts, max: MAX_RECONNECT_ATTEMPTS, delayMs: Math.round(delayMs) },
-      "Scheduling reconnect with exponential backoff"
-    );
-
+    logger.info({ botId: this.botId, attempt: this._reconnectAttempts, max: MAX_RECONNECT_ATTEMPTS, delayMs: Math.round(delayMs) }, "Scheduling reconnect");
     this._setStatus("connecting").catch(() => {});
-    this._log(
-      "bot_reconnecting",
-      `Reconnect attempt ${this._reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} — retrying in ${(delayMs / 1000).toFixed(1)}s`
-    ).catch(() => {});
+    this._log("bot_reconnecting", `Reconnect attempt ${this._reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} — retrying in ${(delayMs / 1000).toFixed(1)}s`).catch(() => {});
 
     clearTimeout(this._reconnectTimer);
     this._reconnectTimer = setTimeout(() => {
@@ -544,7 +514,7 @@ export class BotInstance {
     }, delayMs);
   }
 
-  /* ── QR timeout — halt after 2 min to prevent ban signals ── */
+  /* ── QR timeout ───────────────────────────────────────────── */
 
   _startQrTimeout() {
     this._clearQrTimeout();
@@ -553,10 +523,7 @@ export class BotInstance {
       logger.warn({ botId: this.botId }, "QR scan timeout (2 min) — stopping socket");
       try { this.socket?.end(undefined); } catch {}
       await this._setStatus("disconnected").catch(() => {});
-      await this._log(
-        "bot_qr_timeout",
-        "QR code was not scanned within 2 minutes. Open bot settings → QR tab and click Reconnect to try again."
-      ).catch(() => {});
+      await this._log("bot_qr_timeout", "QR code was not scanned within 2 minutes. Open bot settings → QR tab and click Reconnect to try again.").catch(() => {});
     }, QR_TIMEOUT_MS);
   }
 
@@ -572,7 +539,6 @@ export class BotInstance {
   async _onGroupParticipants({ id, participants, action }) {
     if (this.config.bot_type === "dm") return;
     const sac = this.config.sales_agent_config ?? {};
-
     for (const jid of participants) {
       if (action === "add" && sac.group_welcome && this.socket) {
         try {
@@ -593,112 +559,94 @@ export class BotInstance {
       try {
         await this._handleInbound(msg);
       } catch (err) {
-        // Do not let a single message failure crash the instance (e.g. decrypt errors)
         logger.warn({ err, botId: this.botId, msgId: msg.key?.id }, "Failed to process inbound message — skipping");
-        continue;
       }
     }
   }
 
   async _handleInbound(msg) {
-    const jid       = msg.key.remoteJid ?? "";
-    const isGroup   = jid.endsWith("@g.us");
-    const isDM      = jid.endsWith("@s.whatsapp.net");
-    const botType   = this.config.bot_type ?? "dm";
+    const jid     = msg.key.remoteJid ?? "";
+    const isGroup = jid.endsWith("@g.us");
+    const isDM    = jid.endsWith("@s.whatsapp.net");
+    const botType = this.config.bot_type ?? "dm";
 
     /* ── Route by bot type ─────────────────────────────────── */
     if (botType === "dm"    && !isDM)    return;
     if (botType === "group" && !isGroup) return;
 
     /* ── Sender JID ────────────────────────────────────────── */
-    /* For group messages prefer key.participant; fall back to pushName JID if absent */
+    // ✅ FIX: always normalizeJid — device-scoped JIDs (12345:6@s.whatsapp.net)
+    //         cause silent admin-check mismatches if not stripped
     const rawSenderJid = isGroup
       ? (msg.key.participant || msg.participant || "")
       : jid;
     const senderJid = normalizeJid(rawSenderJid);
 
-    /* ── Guard: skip group messages if we don't know the bot's own JID yet ── */
     if (isGroup) {
       const botJid = normalizeJid(this.socket?.user?.id ?? "");
-      if (!botJid) return; // Can't do admin checks without knowing our own JID
-      if (!senderJid) return; // Can't identify sender
+      if (!botJid || !senderJid) return;
     }
 
     /* ── Extract message body ──────────────────────────────── */
     const { text: body, type: msgType, extra } = extractMessageBody(msg);
 
-    /* ── Plan message limit check (incoming messages count toward limit) ── */
+    /* ── Plan limit check (fast in-memory, then DB) ─────────── */
     const limit = PLAN_MSG_LIMITS[this.config.plan_tier] ?? PLAN_MSG_LIMITS.free;
-    
-    // Fetch current usage from DB to ensure accuracy across multiple bots
+
+    // ✅ FIX: in-memory fast-reject to avoid a DB round-trip on every message
+    //         when the bot is already known to be over limit
+    const localUsage = this.config.messages_this_month ?? 0;
+    if (localUsage >= limit) return;
+
+    // DB authoritative check (prevents multi-bot over-counting)
     const { data: user } = await supabase
       .from("users")
       .select("messages_this_month, plan_tier")
       .eq("id", this.userId)
       .single();
-    
-    const currentUsage = user?.messages_this_month ?? 0;
-    
-    if (currentUsage >= limit) {
-      logger.warn({ botId: this.botId, userId: this.userId, usage: currentUsage, limit }, "Monthly message limit reached — dropping incoming message");
-      return; // Silently drop the message, don't process or reply
+    const dbUsage = user?.messages_this_month ?? 0;
+    if (dbUsage >= limit) {
+      logger.warn({ botId: this.botId, userId: this.userId, dbUsage, limit }, "Monthly message limit reached");
+      return;
     }
 
-    /* ── Increment counter for this incoming message (since it will trigger an outgoing reply) ── */
+    /* ── Increment counters ────────────────────────────────── */
+    // ✅ FIX: counters now increment AFTER the limit check (were before it previously)
     await this._incrementUserMonthlyCounter();
     this.config.messages_this_month = (this.config.messages_this_month ?? 0) + 1;
-    
-    this._queueUsage({
-      messagesThisMonth: 1,
-      totalMessages: 1,
-      lastActivity: new Date().toISOString()
-    });
+    this._queueUsage({ messagesThisMonth: 1, totalMessages: 1, lastActivity: new Date().toISOString() });
 
     const fromDisplay = isGroup ? jid : jid.replace("@s.whatsapp.net", "");
     await this._log("message_received", `[${msgType}] from ${fromDisplay}`, { from: jid, body: body.slice(0, 200), type: msgType, extra });
 
-    /* ── Webhook (always) ────────────────────────────────────── */
+    /* ── Webhook ────────────────────────────────────────────── */
     if (this.config.webhook_url) {
-      this._sendWebhook({
-        event:    "message_received",
-        botId:    this.botId,
-        from:     fromDisplay,
-        body,
-        type:     msgType,
-        isGroup,
-        extra,
-        timestamp: Date.now()
-      }).catch(() => {});
+      this._sendWebhook({ event: "message_received", botId: this.botId, from: fromDisplay, body, type: msgType, isGroup, extra, timestamp: Date.now() }).catch(() => {});
     }
 
-    /* For non-text types with no body, skip auto-reply logic */
+    /* Non-text types with no body skip auto-reply logic */
     if (!body && !["list_reply", "button_reply", "template_reply"].includes(msgType)) return;
 
     /* ── GROUP FLOW ─────────────────────────────────────────── */
     if (isGroup) {
-      /* Check bot is admin — if not, silently skip ALL group handling */
       const botIsAdmin = await this._isBotAdmin(jid);
       if (!botIsAdmin) return;
 
-      /* Group moderation (anti-link / anti-spam / anti-vulgar) */
       const moderated = await this._handleGroupModeration(msg, jid, senderJid, body);
       if (moderated) return;
 
-      /* Group management commands (.kick .ban .help etc.) */
       if (await this._handleGroupCommand(msg, jid, senderJid, body, extra)) return;
 
-      /* Regular features also work in groups */
+      // ✅ DM-style commands (/ prefix) also work inside groups
       if (await this._handleCommand(jid, body)) return;
       if (await this._handleKeywordTrigger(jid, body)) return;
       if (await this._handleSalesAgent(jid, body)) return;
       if (await this._handleAiResponse(jid, body, extra, true)) return;
-      return; /* No auto-reply fallback in groups */
+      return;
     }
 
     /* ── DM FLOW ────────────────────────────────────────────── */
     await this._handleWelcomeMessage(jid);
-
-    /* First-DM auto-help */
     await this._handleFirstDmHelp(jid);
 
     if (await this._handleCommand(jid, body)) return;
@@ -706,7 +654,6 @@ export class BotInstance {
     if (await this._handleSalesAgent(jid, body)) return;
     if (await this._handleAiResponse(jid, body, extra, false)) return;
 
-    /* Standard auto-reply */
     if (this.config.auto_reply_enabled && this.config.auto_reply_message && this.socket) {
       try {
         await this.socket.sendMessage(jid, { text: this.config.auto_reply_message });
@@ -725,15 +672,12 @@ export class BotInstance {
     if (this._seenDmContacts.has(jid)) return;
     this._seenDmContacts.add(jid);
 
-    /* Build help text (same as /help command) */
     const enabledCmds = Object.entries(DEFAULT_COMMANDS)
       .filter(([k]) => (this.config.commands_config?.[k]?.enabled ?? true))
       .map(([, v]) => v.trigger);
 
     const helpText = `👋 *Welcome!*\n\nHere are the available commands:\n${enabledCmds.join("\n")}\n\nReply with any command to get started.`;
-    try {
-      await this.socket?.sendMessage(jid, { text: helpText });
-    } catch {}
+    try { await this.socket?.sendMessage(jid, { text: helpText }); } catch {}
   }
 
   async _handleWelcomeMessage(jid) {
@@ -741,21 +685,20 @@ export class BotInstance {
     if (!sac.enabled || !sac.welcome_enabled) return;
     if (!String(sac.greeting ?? "").trim()) return;
     if (this._welcomedDmContacts.has(jid)) return;
-
     this._welcomedDmContacts.add(jid);
     try {
       await this.socket?.sendMessage(jid, { text: String(sac.greeting).trim() });
-      await this._log("welcome_message_sent", `Welcome message sent to ${jid.replace("@s.whatsapp.net", "")}`);
+      await this._log("welcome_message_sent", `Welcome sent to ${jid.replace("@s.whatsapp.net", "")}`);
     } catch {}
   }
 
-  /* ── Group: fetch admin groups (used by API route) ─────────── */
+  /* ── Group helper queries ─────────────────────────────────── */
 
   async getAdminGroups() {
     if (!this.socket || this.status !== "connected") return [];
     try {
-      const groups  = await this.socket.groupFetchAllParticipating();
-      const botJid  = normalizeJid(this.socket.user?.id ?? "");
+      const groups = await this.socket.groupFetchAllParticipating();
+      const botJid = normalizeJid(this.socket.user?.id ?? "");
       return Object.values(groups).filter((g) => {
         const p = g.participants.find((p) =>
           normalizeJid(p.id) === botJid ||
@@ -765,8 +708,6 @@ export class BotInstance {
       });
     } catch { return []; }
   }
-
-  /* ── Group metadata (cached) ─────────────────────────────── */
 
   async _getGroupMeta(groupJid) {
     const cached = this._metaCache.get(groupJid);
@@ -790,13 +731,13 @@ export class BotInstance {
   }
 
   async _isSenderAdmin(groupJid, senderJid) {
-    const meta  = await this._getGroupMeta(groupJid);
+    const meta = await this._getGroupMeta(groupJid);
     if (!meta) return false;
     const p = meta.participants.find((p) => normalizeJid(p.id) === senderJid);
     return p?.admin === "admin" || p?.admin === "superadmin";
   }
 
-  /* ── Strike helper ───────────────────────────────────────── */
+  /* ── Strike helpers ───────────────────────────────────────── */
 
   _addStrike(groupJid, userJid) {
     const key = `${groupJid}:${userJid}`;
@@ -804,49 +745,39 @@ export class BotInstance {
     this._strikes.set(key, n);
     return n;
   }
-
-  _getStrikes(groupJid, userJid) {
-    return this._strikes.get(`${groupJid}:${userJid}`) ?? 0;
-  }
-
-  _clearStrikes(groupJid, userJid) {
-    this._strikes.delete(`${groupJid}:${userJid}`);
-  }
+  _getStrikes(groupJid, userJid)  { return this._strikes.get(`${groupJid}:${userJid}`) ?? 0; }
+  _clearStrikes(groupJid, userJid) { this._strikes.delete(`${groupJid}:${userJid}`); }
 
   /* ── Group moderation ─────────────────────────────────────── */
 
   async _handleGroupModeration(msg, groupJid, senderJid, body) {
     const gmc = this.config.group_management_config ?? {};
     const senderIsAdmin = await this._isSenderAdmin(groupJid, senderJid);
-    if (senderIsAdmin) return false; /* Admins are exempt from all moderation */
+    if (senderIsAdmin) return false; // admins are exempt
 
-    let violated  = false;
-    let reason    = "";
+    let violated = false;
+    let reason   = "";
 
-    /* ── Anti-link ─────────────────────────────────────────── */
     if (gmc.anti_link?.enabled && LINK_REGEX.test(body)) {
       violated = true;
-      reason   = "anti-link";
-      /* Delete the message */
+      reason   = "anti_link";
       try { await this.socket?.sendMessage(groupJid, { delete: msg.key }); } catch {}
     }
 
-    /* ── Anti-vulgar ────────────────────────────────────────── */
     if (!violated && gmc.anti_vulgar?.enabled) {
       const words   = Array.isArray(gmc.anti_vulgar.words) ? gmc.anti_vulgar.words : [];
       const bodyLow = body.toLowerCase();
       const found   = words.find((w) => w && bodyLow.includes(String(w).toLowerCase()));
       if (found) {
         violated = true;
-        reason   = "anti-vulgar";
+        reason   = "anti_vulgar";
         try { await this.socket?.sendMessage(groupJid, { delete: msg.key }); } catch {}
       }
     }
 
-    /* ── Anti-spam ──────────────────────────────────────────── */
     if (!violated && gmc.anti_spam?.enabled) {
-      const threshold = gmc.anti_spam.threshold    ?? 5;
-      const window    = (gmc.anti_spam.window_seconds ?? 10) * 1000;
+      const threshold = gmc.anti_spam.threshold          ?? 5;
+      const window    = (gmc.anti_spam.window_seconds    ?? 10) * 1000;
       const now       = Date.now();
       const key       = `${groupJid}:${senderJid}`;
       const times     = (this._spamTracker.get(key) ?? []).filter((t) => now - t < window);
@@ -854,25 +785,23 @@ export class BotInstance {
       this._spamTracker.set(key, times);
       if (times.length >= threshold) {
         violated = true;
-        reason   = "anti-spam";
-        this._spamTracker.set(key, []); /* Reset after triggering */
+        reason   = "anti_spam";
+        this._spamTracker.set(key, []);
       }
     }
 
     if (!violated) return false;
 
-    /* ── Apply action ───────────────────────────────────────── */
-    const action    = gmc[reason.replace("-", "_")]?.action ?? gmc.anti_link?.action ?? "warn";
-    const strikes   = this._addStrike(groupJid, senderJid);
-    const shortJid  = senderJid.replace("@s.whatsapp.net", "");
+    const strikes    = this._addStrike(groupJid, senderJid);
+    const shortJid   = senderJid.replace("@s.whatsapp.net", "");
     const maxStrikes = 3;
+    const action     = gmc[reason]?.action ?? "warn";
 
     if (action === "kick" || strikes >= maxStrikes) {
-      /* Remove from group */
       try {
         await this.socket?.groupParticipantsUpdate(groupJid, [senderJid], "remove");
         await this.socket?.sendMessage(groupJid, {
-          text: `🚫 @${shortJid} has been removed for violating group rules (${reason}).`,
+          text: `🚫 @${shortJid} has been removed for violating group rules (${reason.replace("_", "-")}).`,
           mentions: [senderJid]
         });
         this._clearStrikes(groupJid, senderJid);
@@ -881,16 +810,14 @@ export class BotInstance {
         logger.error({ err }, "Group kick failed");
       }
     } else {
-      /* Warn */
       try {
         await this.socket?.sendMessage(groupJid, {
-          text: `⚠️ @${shortJid}, this message was removed (${reason}). Strike *${strikes}/${maxStrikes}*. You will be removed after ${maxStrikes} strikes.`,
+          text: `⚠️ @${shortJid}, this message was removed (${reason.replace("_", "-")}). Strike *${strikes}/${maxStrikes}*. You will be removed after ${maxStrikes} strikes.`,
           mentions: [senderJid]
         });
         await this._log("group_moderation", `Warned @${shortJid} — ${reason} strike ${strikes}/${maxStrikes}`, { groupJid, senderJid });
       } catch {}
     }
-
     return true;
   }
 
@@ -898,36 +825,32 @@ export class BotInstance {
 
   async _handleGroupCommand(msg, groupJid, senderJid, body, extra = {}) {
     const lower = body.trim().toLowerCase();
-    const isGCmd = GROUP_COMMANDS.some((c) => lower === c || lower.startsWith(c + " ") || lower.startsWith(c + "@"));
+    const isGCmd = GROUP_COMMANDS.some(
+      (c) => lower === c || lower.startsWith(c + " ") || lower.startsWith(c + "@")
+    );
     if (!isGCmd) return false;
 
-    const parts      = body.trim().split(/\s+/);
-    const cmd        = parts[0].toLowerCase();
-    const mentioned  = Array.isArray(extra.mentionedJid) ? extra.mentionedJid : [];
+    const parts     = body.trim().split(/\s+/);
+    const cmd       = parts[0].toLowerCase();
+    const mentioned = Array.isArray(extra.mentionedJid) ? extra.mentionedJid : [];
 
-    /* Prefer @mention, then quoted participant, then bare phone number in the message */
     let targetJid = mentioned[0] ?? extra.quotedParticipant ?? null;
     if (!targetJid && parts[1]) {
-      /* Accept a bare phone number like .kick 2348012345678 */
       const maybePhone = parts[1].replace(/[^\d]/g, "");
-      if (maybePhone.length >= 7) {
-        targetJid = `${maybePhone}@s.whatsapp.net`;
-      }
+      if (maybePhone.length >= 7) targetJid = `${maybePhone}@s.whatsapp.net`;
     }
     const shortTarget = targetJid ? targetJid.replace("@s.whatsapp.net", "") : null;
-
     const senderIsAdmin = await this._isSenderAdmin(groupJid, senderJid);
 
-    /* .help is open to all group members */
+    /* .help is open to everyone */
     if (cmd === ".help") {
       const gmc = this.config.group_management_config ?? {};
       const lines = [
-        "*📋 Group Commands*",
-        "",
+        "*📋 Group Commands*", "",
         "*.help* — Show this list",
-        "*.kick @user* — Remove a member (admin)",
-        "*.ban @user* — Remove a member (admin)",
-        "*.lock* — Lock group (admins only can send)",
+        "*.kick @user* — Remove a member (admin only)",
+        "*.ban @user* — Remove a member (admin only)",
+        "*.lock* — Lock group so only admins can send",
         "*.unlock* — Allow all members to send",
         "*.promote @user* — Make someone an admin",
         "*.demote @user* — Remove someone's admin role",
@@ -937,8 +860,7 @@ export class BotInstance {
         "*.tagall [msg]* — Mention all members",
         "*.admins* — List group admins",
         "*.rules* — Show group rules",
-        "",
-        "*🛡 Auto-moderation*",
+        "", "*🛡 Auto-moderation*"
       ];
       if (gmc.anti_link?.enabled)   lines.push("• Anti-link: ON — links from non-admins are removed");
       if (gmc.anti_spam?.enabled)   lines.push("• Anti-spam: ON — excessive messages trigger a warning");
@@ -946,10 +868,7 @@ export class BotInstance {
       if (!gmc.anti_link?.enabled && !gmc.anti_spam?.enabled && !gmc.anti_vulgar?.enabled)
         lines.push("• No auto-moderation enabled");
       lines.push("", "3 strikes → automatic removal");
-
-      try {
-        await this.socket?.sendMessage(groupJid, { text: lines.join("\n") });
-      } catch {}
+      try { await this.socket?.sendMessage(groupJid, { text: lines.join("\n") }); } catch {}
       return true;
     }
 
@@ -965,27 +884,18 @@ export class BotInstance {
     }
 
     switch (cmd) {
-      /* ── .kick / .ban ─────────────────────────────────────── */
       case ".kick":
       case ".ban": {
-        if (!targetJid) {
-          await this.socket?.sendMessage(groupJid, { text: `❌ Usage: ${cmd} @user` }).catch(() => {});
-          return true;
-        }
+        if (!targetJid) { await this.socket?.sendMessage(groupJid, { text: `❌ Usage: ${cmd} @user` }).catch(() => {}); break; }
         try {
           await this.socket?.groupParticipantsUpdate(groupJid, [targetJid], "remove");
-          await this.socket?.sendMessage(groupJid, {
-            text: `✅ @${shortTarget} has been removed from the group.`,
-            mentions: [targetJid]
-          });
+          await this.socket?.sendMessage(groupJid, { text: `✅ @${shortTarget} has been removed.`, mentions: [targetJid] });
           await this._log("group_command", `${cmd}: removed @${shortTarget}`, { groupJid, targetJid });
-        } catch (err) {
+        } catch {
           await this.socket?.sendMessage(groupJid, { text: `❌ Could not remove @${shortTarget}. Make sure I am an admin.`, mentions: [targetJid] }).catch(() => {});
         }
         break;
       }
-
-      /* ── .lock ─────────────────────────────────────────────── */
       case ".lock": {
         try {
           await this.socket?.groupSettingUpdate(groupJid, "announcement");
@@ -996,8 +906,6 @@ export class BotInstance {
         }
         break;
       }
-
-      /* ── .unlock ───────────────────────────────────────────── */
       case ".unlock": {
         try {
           await this.socket?.groupSettingUpdate(groupJid, "not_announcement");
@@ -1008,39 +916,23 @@ export class BotInstance {
         }
         break;
       }
-
-      /* ── .promote ──────────────────────────────────────────── */
       case ".promote": {
-        if (!targetJid) {
-          await this.socket?.sendMessage(groupJid, { text: "❌ Usage: .promote @user" }).catch(() => {});
-          return true;
-        }
+        if (!targetJid) { await this.socket?.sendMessage(groupJid, { text: "❌ Usage: .promote @user" }).catch(() => {}); break; }
         try {
           await this.socket?.groupParticipantsUpdate(groupJid, [targetJid], "promote");
-          await this.socket?.sendMessage(groupJid, {
-            text: `⬆️ @${shortTarget} has been promoted to admin.`,
-            mentions: [targetJid]
-          });
-          this._metaCache.delete(groupJid); /* Invalidate cache */
+          await this.socket?.sendMessage(groupJid, { text: `⬆️ @${shortTarget} has been promoted to admin.`, mentions: [targetJid] });
+          this._metaCache.delete(groupJid);
           await this._log("group_command", `.promote @${shortTarget}`, { groupJid, targetJid });
         } catch {
           await this.socket?.sendMessage(groupJid, { text: `❌ Could not promote @${shortTarget}.`, mentions: [targetJid] }).catch(() => {});
         }
         break;
       }
-
-      /* ── .demote ───────────────────────────────────────────── */
       case ".demote": {
-        if (!targetJid) {
-          await this.socket?.sendMessage(groupJid, { text: "❌ Usage: .demote @user" }).catch(() => {});
-          return true;
-        }
+        if (!targetJid) { await this.socket?.sendMessage(groupJid, { text: "❌ Usage: .demote @user" }).catch(() => {}); break; }
         try {
           await this.socket?.groupParticipantsUpdate(groupJid, [targetJid], "demote");
-          await this.socket?.sendMessage(groupJid, {
-            text: `⬇️ @${shortTarget} has been demoted from admin.`,
-            mentions: [targetJid]
-          });
+          await this.socket?.sendMessage(groupJid, { text: `⬇️ @${shortTarget} has been demoted from admin.`, mentions: [targetJid] });
           this._metaCache.delete(groupJid);
           await this._log("group_command", `.demote @${shortTarget}`, { groupJid, targetJid });
         } catch {
@@ -1048,14 +940,9 @@ export class BotInstance {
         }
         break;
       }
-
-      /* ── .warn ─────────────────────────────────────────────── */
       case ".warn": {
-        if (!targetJid) {
-          await this.socket?.sendMessage(groupJid, { text: "❌ Usage: .warn @user [reason]" }).catch(() => {});
-          return true;
-        }
-        const reason     = parts.slice(2).join(" ") || "No reason given";
+        if (!targetJid) { await this.socket?.sendMessage(groupJid, { text: "❌ Usage: .warn @user [reason]" }).catch(() => {}); break; }
+        const warnReason = parts.slice(2).join(" ") || "No reason given";
         const wKey       = `${groupJid}:${targetJid}`;
         const warnCount  = (this._warnCount.get(wKey) ?? 0) + 1;
         this._warnCount.set(wKey, warnCount);
@@ -1063,111 +950,74 @@ export class BotInstance {
         if (warnCount >= maxWarns) {
           try {
             await this.socket?.groupParticipantsUpdate(groupJid, [targetJid], "remove");
-            await this.socket?.sendMessage(groupJid, {
-              text: `🚫 @${shortTarget} has reached *${maxWarns} warnings* and has been removed.\nReason: ${reason}`,
-              mentions: [targetJid]
-            });
+            await this.socket?.sendMessage(groupJid, { text: `🚫 @${shortTarget} reached *${maxWarns} warnings* and has been removed.\nReason: ${warnReason}`, mentions: [targetJid] });
             this._warnCount.delete(wKey);
             await this._log("group_command", `.warn (removed) @${shortTarget}`, { groupJid, targetJid });
           } catch {
             await this.socket?.sendMessage(groupJid, { text: `❌ Could not remove @${shortTarget} after ${maxWarns} warnings.`, mentions: [targetJid] }).catch(() => {});
           }
         } else {
-          await this.socket?.sendMessage(groupJid, {
-            text: `⚠️ @${shortTarget} has been warned (*${warnCount}/${maxWarns}*).\nReason: ${reason}`,
-            mentions: [targetJid]
-          }).catch(() => {});
+          await this.socket?.sendMessage(groupJid, { text: `⚠️ @${shortTarget} has been warned (*${warnCount}/${maxWarns}*).\nReason: ${warnReason}`, mentions: [targetJid] }).catch(() => {});
           await this._log("group_command", `.warn ${warnCount}/${maxWarns} @${shortTarget}`, { groupJid, targetJid });
         }
         break;
       }
-
-      /* ── .warnings ─────────────────────────────────────────── */
       case ".warnings": {
-        if (!targetJid) {
-          await this.socket?.sendMessage(groupJid, { text: "❌ Usage: .warnings @user" }).catch(() => {});
-          return true;
-        }
-        const wCount = this._warnCount.get(`${groupJid}:${targetJid}`) ?? 0;
-        await this.socket?.sendMessage(groupJid, {
-          text: `📋 @${shortTarget} has *${wCount}/3* warnings.`,
-          mentions: [targetJid]
-        }).catch(() => {});
+        if (!targetJid) { await this.socket?.sendMessage(groupJid, { text: "❌ Usage: .warnings @user" }).catch(() => {}); break; }
+        const wc = this._warnCount.get(`${groupJid}:${targetJid}`) ?? 0;
+        await this.socket?.sendMessage(groupJid, { text: `📋 @${shortTarget} has *${wc}/3* warnings.`, mentions: [targetJid] }).catch(() => {});
         break;
       }
-
-      /* ── .clearwarn ────────────────────────────────────────── */
       case ".clearwarn": {
-        if (!targetJid) {
-          await this.socket?.sendMessage(groupJid, { text: "❌ Usage: .clearwarn @user" }).catch(() => {});
-          return true;
-        }
+        if (!targetJid) { await this.socket?.sendMessage(groupJid, { text: "❌ Usage: .clearwarn @user" }).catch(() => {}); break; }
         this._warnCount.delete(`${groupJid}:${targetJid}`);
         this._clearStrikes(groupJid, targetJid);
-        await this.socket?.sendMessage(groupJid, {
-          text: `✅ Warnings cleared for @${shortTarget}.`,
-          mentions: [targetJid]
-        }).catch(() => {});
+        await this.socket?.sendMessage(groupJid, { text: `✅ Warnings cleared for @${shortTarget}.`, mentions: [targetJid] }).catch(() => {});
         await this._log("group_command", `.clearwarn @${shortTarget}`, { groupJid, targetJid });
         break;
       }
-
-      /* ── .tagall ───────────────────────────────────────────── */
       case ".tagall": {
-        const customMsg = parts.slice(1).join(" ");
+        const tagMsg = parts.slice(1).join(" ");
         try {
-          const meta     = await this._getGroupMeta(groupJid);
+          const meta    = await this._getGroupMeta(groupJid);
           if (!meta) break;
           const members  = meta.participants.map((p) => p.id);
           const mentions = members.map((m) => `@${m.replace("@s.whatsapp.net", "")}`).join(" ");
-          const text     = (customMsg ? `${customMsg}\n\n` : "") + mentions;
-          await this.socket?.sendMessage(groupJid, { text, mentions: members });
+          await this.socket?.sendMessage(groupJid, { text: (tagMsg ? `${tagMsg}\n\n` : "") + mentions, mentions: members });
           await this._log("group_command", `.tagall (${members.length} members)`, { groupJid });
         } catch {
           await this.socket?.sendMessage(groupJid, { text: "❌ Could not fetch group members." }).catch(() => {});
         }
         break;
       }
-
-      /* ── .admins ───────────────────────────────────────────── */
       case ".admins": {
         try {
           const meta   = await this._getGroupMeta(groupJid);
           if (!meta) break;
-          const admins = meta.participants.filter((p) => p.admin).map((p) => p.id);
+          const admins   = meta.participants.filter((p) => p.admin).map((p) => p.id);
           const mentions = admins.map((m) => `@${m.replace("@s.whatsapp.net", "")}`);
-          await this.socket?.sendMessage(groupJid, {
-            text: `👑 *Group Admins:*\n${mentions.join("\n")}`,
-            mentions: admins
-          });
+          await this.socket?.sendMessage(groupJid, { text: `👑 *Group Admins:*\n${mentions.join("\n")}`, mentions: admins });
         } catch {
           await this.socket?.sendMessage(groupJid, { text: "❌ Could not fetch admin list." }).catch(() => {});
         }
         break;
       }
-
-      /* ── .rules ────────────────────────────────────────────── */
       case ".rules": {
-        const gmc   = this.config.group_management_config ?? {};
-        const rules = gmc.rules?.trim();
-        await this.socket?.sendMessage(groupJid, {
-          text: rules || "📜 No group rules have been set yet. Contact an admin."
-        }).catch(() => {});
+        const rules = (this.config.group_management_config ?? {}).rules?.trim();
+        await this.socket?.sendMessage(groupJid, { text: rules || "📜 No group rules have been set yet. Contact an admin." }).catch(() => {});
         break;
       }
-
       default: break;
     }
-
     return true;
   }
 
-  /* ── DM Commands handler ──────────────────────────────────── */
+  /* ── DM commands ──────────────────────────────────────────── */
 
   async _handleCommand(jid, body) {
     if (!body.startsWith("/")) return false;
-    const cmd     = body.split(" ")[0].toLowerCase();
-    const cmdKey  = Object.keys(DEFAULT_COMMANDS).find((k) => DEFAULT_COMMANDS[k].trigger === cmd);
+    const cmd    = body.split(" ")[0].toLowerCase();
+    const cmdKey = Object.keys(DEFAULT_COMMANDS).find((k) => DEFAULT_COMMANDS[k].trigger === cmd);
     if (!cmdKey) return false;
 
     const override = this.config.commands_config?.[cmdKey] ?? {};
@@ -1192,10 +1042,9 @@ export class BotInstance {
         break;
       }
       case "catalog":
-      case "price": {
+      case "price":
         reply = products.length ? formatCatalog(products) : "No catalog available yet.";
         break;
-      }
       case "contact":
         reply = "Our team will contact you shortly. Please hold on.";
         break;
@@ -1230,7 +1079,7 @@ export class BotInstance {
 
   async _handleKeywordTrigger(jid, body) {
     const triggers = Array.isArray(this.config.keyword_triggers) ? this.config.keyword_triggers : [];
-    if (triggers.length === 0) return false;
+    if (!triggers.length) return false;
 
     for (const trigger of triggers) {
       if (!trigger.keyword || !trigger.response) continue;
@@ -1239,7 +1088,7 @@ export class BotInstance {
       const cs       = trigger.caseSensitive === true;
       const haystack = cs ? body : body.toLowerCase();
       const needle   = cs ? String(trigger.keyword).trim() : String(trigger.keyword).toLowerCase().trim();
-      let matchType  = trigger.matchType ?? (trigger.exact_match === true ? "exact" : "contains");
+      const matchType = trigger.matchType ?? (trigger.exact_match === true ? "exact" : "contains");
 
       let hit = false;
       try {
@@ -1292,72 +1141,44 @@ export class BotInstance {
         try { await this.socket?.sendMessage(jid, { text: reply }); } catch {}
         return true;
       }
-
       const productWords = ["buy", "order", "want", "price of", "how much", "get"];
-      if (productWords.some((w) => bodyL.includes(w)) && !match) {
+      if (productWords.some((w) => bodyL.includes(w))) {
         const msg = this.config.catalog_unavail_msg
-          ? this.config.catalog_unavail_msg
-          : this.config.website_url
-            ? `❌ Product not available. Check our website: ${this.config.website_url}`
-            : "❌ Product not available in catalogue. Our seller will be in touch with you shortly.";
+          ?? (this.config.website_url ? `❌ Product not available. Check our website: ${this.config.website_url}` : "❌ Product not available. Our seller will be in touch shortly.");
         try { await this.socket?.sendMessage(jid, { text: msg }); } catch {}
         return true;
       }
     }
-
     return false;
   }
 
-  /* ── AI response (Pro only) ───────────────────────────────── */
-  /*
-   * trigger_mode (ai_config):
-   *   "all"     — respond to every message (DM default, group opt-in)
-   *   "mention" — respond only when bot is tagged/mentioned (group default)
-   *   "keyword" — respond only when body starts with ai_config.trigger_prefix
-   *               (default "@bot") — works in both DMs and groups
-   *
-   * In groups the default is "mention" to prevent flooding.
-   * In DMs the default is "all" (preserves existing behaviour).
-   */
+  /* ── AI response (paid plan only) ────────────────────────── */
 
   async _handleAiResponse(jid, body, extra = {}, isGroup = false) {
     const ai = this.config.ai_config ?? {};
     if (!ai.enabled || !ai.encrypted_key || this.config.plan_tier !== "paid") return false;
     if (!body?.trim()) return false;
 
-    /* ── Per-channel enabled checks ───────────────────────── */
-    /* ai.groups_enabled defaults to true (backward compat) unless explicitly false.
-       ai.dm_enabled     defaults to true unless explicitly false.             */
     if (isGroup  && ai.groups_enabled === false) return false;
     if (!isGroup && ai.dm_enabled     === false) return false;
 
-    /* ── Per-channel trigger mode ─────────────────────────── */
-    /*
-     * group_trigger_mode / dm_trigger_mode:
-     *   "all"     — respond to every message
-     *   "mention" — respond only when bot is @-tagged (group default)
-     *   "keyword" — respond only when body starts with trigger_prefix
-     *
-     * Falls back to legacy trigger_mode, then channel-appropriate default.
-     */
     const triggerMode = isGroup
       ? (ai.group_trigger_mode ?? ai.trigger_mode ?? "mention")
       : (ai.dm_trigger_mode    ?? ai.trigger_mode ?? "all");
 
     if (triggerMode === "mention") {
-      const botJid      = normalizeJid(this.socket?.user?.id ?? "");
-      const mentioned   = Array.isArray(extra?.mentionedJid) ? extra.mentionedJid : [];
-      const botMentioned = mentioned.some((m) => normalizeJid(m) === botJid
-        || normalizeJid(m).split("@")[0] === botJid.split("@")[0]);
+      const botJid       = normalizeJid(this.socket?.user?.id ?? "");
+      const mentioned    = Array.isArray(extra?.mentionedJid) ? extra.mentionedJid : [];
+      const botMentioned = mentioned.some((m) =>
+        normalizeJid(m) === botJid || normalizeJid(m).split("@")[0] === botJid.split("@")[0]
+      );
       if (!botMentioned) return false;
     } else if (triggerMode === "keyword") {
       const prefix = (ai.trigger_prefix ?? "@bot").toLowerCase().trim();
       if (!body.toLowerCase().trimStart().startsWith(prefix)) return false;
-      /* Strip the prefix from the message body before sending to AI */
       body = body.slice(body.toLowerCase().indexOf(prefix) + prefix.length).trim();
       if (!body) return false;
     }
-    /* "all" mode falls through with no extra check */
 
     try {
       const apiKey = decryptApiKey(ai.encrypted_key, env.jwtSecret);
@@ -1369,20 +1190,12 @@ export class BotInstance {
         ? `\n\nProducts:\n${products.map((p) => `- ${p.name}: ₦${p.price || "?"} — ${p.description || ""}`).join("\n")}`
         : "";
 
-      /* Use channel-specific system prompt when provided, fall back to shared prompt */
       const systemPrompt =
         (isGroup ? (ai.group_system_prompt || null) : null)
         ?? ai.system_prompt
         ?? `You are a helpful WhatsApp assistant for a business. Be concise and friendly. Answer in 1-3 sentences maximum.${catalog}`;
 
-      const reply = await getAiCompletion({
-        provider:    ai.provider,
-        apiKey,
-        model:       ai.model,
-        systemPrompt,
-        userMessage: body
-      });
-
+      const reply = await getAiCompletion({ provider: ai.provider, apiKey, model: ai.model, systemPrompt, userMessage: body });
       if (reply) {
         await this.socket?.sendMessage(jid, { text: reply });
         await this._log("ai_reply_sent", `AI (${ai.provider}) replied to ${jid.replace("@s.whatsapp.net", "")}`);
@@ -1400,19 +1213,19 @@ export class BotInstance {
     const body    = JSON.stringify(payload);
     const headers = { "Content-Type": "application/json", "User-Agent": "WaBot-Webhook/2.0" };
     if (this.config.webhook_secret) {
-      const { createHmac } = await import("node:crypto");
+      // ✅ FIX: top-level import used here instead of dynamic import()
       headers["X-WaBot-Signature"] = "sha256=" + createHmac("sha256", this.config.webhook_secret).update(body).digest("hex");
     }
     const res = await fetch(this.config.webhook_url, { method: "POST", headers, body, signal: AbortSignal.timeout(10_000) });
     await this._log("webhook_sent", `Webhook → HTTP ${res.status}`);
   }
 
-  /* ── Helpers ─────────────────────────────────────────────────*/
+  /* ── Usage / log helpers ──────────────────────────────────── */
 
   _queueUsage(delta = {}) {
     this._pendingUsage.messagesThisMonth += Number(delta.messagesThisMonth ?? 0);
-    this._pendingUsage.totalMessages += Number(delta.totalMessages ?? 0);
-    this._pendingUsage.lastActivity = delta.lastActivity ?? this._pendingUsage.lastActivity;
+    this._pendingUsage.totalMessages     += Number(delta.totalMessages     ?? 0);
+    this._pendingUsage.lastActivity       = delta.lastActivity ?? this._pendingUsage.lastActivity;
     if (this._flushTimer) return;
     this._flushTimer = setTimeout(() => {
       this._flushTimer = null;
@@ -1430,7 +1243,6 @@ export class BotInstance {
 
     const patch = {};
     if (pending.messagesThisMonth) {
-      // Write the in-memory accumulated total (already updated per-message in _handleInbound)
       patch.messages_this_month = Math.max(0, this.config.messages_this_month ?? 0);
     }
     if (pending.lastActivity) patch.last_activity = pending.lastActivity;
@@ -1441,16 +1253,10 @@ export class BotInstance {
       }
       if (pending.totalMessages > 0) {
         try {
-          await supabase.rpc("increment_bot_messages_by", {
-            bid: this.botId,
-            amount: pending.totalMessages
-          });
+          await supabase.rpc("increment_bot_messages_by", { bid: this.botId, amount: pending.totalMessages });
         } catch {
-          // Fallback if RPC doesn't exist
-          for (let i = 0; i < pending.totalMessages; i += 1) {
-            try {
-              await supabase.rpc("increment_bot_messages", { bid: this.botId });
-            } catch {}
+          for (let i = 0; i < pending.totalMessages; i++) {
+            try { await supabase.rpc("increment_bot_messages", { bid: this.botId }); } catch {}
           }
         }
       }
@@ -1462,10 +1268,7 @@ export class BotInstance {
   }
 
   _scheduleLogFlush() {
-    if (this._pendingLogs.length >= 20) {
-      this._flushLogs();
-      return;
-    }
+    if (this._pendingLogs.length >= 20) { this._flushLogs(); return; }
     if (this._logFlushTimer) return;
     this._logFlushTimer = setTimeout(() => {
       this._logFlushTimer = null;
@@ -1487,43 +1290,18 @@ export class BotInstance {
 
   async _setStatus(status) {
     if (this.status === status) return;
-    
     const oldStatus = this.status;
     this.status = status;
-    
-    // Notify all status listeners
-    for (const cb of this._onStatus) {
-      try { cb(status); } catch (e) {}
-    }
-    
-    // Update database - use try/catch instead of .catch()
+    for (const cb of this._onStatus) { try { cb(status); } catch {} }
     try {
-      await supabase
-        .from("bots")
-        .update({ 
-          status, 
-          updated_at: new Date().toISOString() 
-        })
-        .eq("id", this.botId);
+      await supabase.from("bots").update({ status, updated_at: new Date().toISOString() }).eq("id", this.botId);
     } catch (err) {
-      // Log error but don't crash the bot
-      logger.warn({ 
-        botId: this.botId, 
-        oldStatus, 
-        newStatus: status, 
-        error: err.message 
-      }, "Failed to update bot status in database");
+      logger.warn({ botId: this.botId, oldStatus, newStatus: status, error: err.message }, "Failed to update bot status in DB");
     }
   }
 
   async _log(eventType, details, metadata = {}) {
-    this._pendingLogs.push({
-      user_id: this.userId,
-      bot_id: this.botId,
-      event_type: eventType,
-      details,
-      metadata
-    });
+    this._pendingLogs.push({ user_id: this.userId, bot_id: this.botId, event_type: eventType, details, metadata });
     this._scheduleLogFlush();
   }
-            }
+  }
