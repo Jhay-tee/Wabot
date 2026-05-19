@@ -10,7 +10,7 @@ import { deployLimiter } from "../middleware/rateLimiter.js";
 import { botManager }    from "../services/whatsapp/BotManager.js";
 import { logger }        from "../utils/logger.js";
 import { dashboardRealtime } from "../services/realtime/DashboardRealtime.js";
-import { AI_PROVIDERS, encryptApiKey } from "../services/ai/AiService.js";
+import { AI_PROVIDERS, encryptApiKey, testAiKey } from "../services/ai/AiService.js";
 import { env }           from "../config/env.js";
 
 const router = Router();
@@ -504,7 +504,7 @@ router.patch("/:id", async (req, res) => {
     const provider = String(ai.provider ?? "openai").trim().toLowerCase();
     if (!ALLOWED_AI_PROVIDERS.has(provider)) {
       return res.status(400).json({
-        error: "Supported AI providers are OpenAI and Gemini only."
+        error: `Unsupported AI provider "${provider}". Supported: ${[...ALLOWED_AI_PROVIDERS].join(", ")}.`
       });
     }
     ai.provider = provider;
@@ -565,6 +565,46 @@ router.patch("/:id", async (req, res) => {
   }).catch(() => {});
 
   return res.json({ bot: { ...updated, ai_config: safeAi } });
+});
+
+/* ── POST /api/bots/:id/test-ai ─────────────────────────────── */
+router.post("/:id/test-ai", async (req, res) => {
+  const userId = req.user.sub;
+  const { id } = req.params;
+
+  const { data: bot } = await supabase
+    .from("bots").select("id, user_id, plan_tier:users!inner(plan_tier), ai_config").eq("id", id).maybeSingle();
+  if (!bot || bot.user_id !== userId) return res.status(404).json({ error: "Bot not found." });
+
+  const planTier = bot.plan_tier?.plan_tier ?? "free";
+  if (planTier !== "paid") return res.status(403).json({ error: "AI features require the Pro plan." });
+
+  const rawKey = String(req.body?.api_key ?? "").trim();
+  const provider = String(req.body?.provider ?? bot.ai_config?.provider ?? "openai").trim().toLowerCase();
+
+  if (!ALLOWED_AI_PROVIDERS.has(provider)) {
+    return res.status(400).json({ error: `Unsupported provider: ${provider}` });
+  }
+
+  let apiKey = rawKey;
+  if (!apiKey) {
+    const encrypted = bot.ai_config?.encrypted_key;
+    if (!encrypted) return res.status(400).json({ error: "No API key available to test." });
+    if (!env.hasJwt) return res.status(500).json({ error: "Server not configured for key decryption." });
+    const { decryptApiKey } = await import("../services/ai/AiService.js");
+    apiKey = decryptApiKey(encrypted, env.jwtSecret);
+    if (!apiKey) return res.status(500).json({ error: "Could not decrypt stored API key." });
+  }
+
+  const result = await testAiKey({ provider, apiKey });
+  return res.json(result);
+});
+
+/* ── GET /api/bots/ai-providers ──────────────────────────────── */
+router.get("/ai-providers", (_req, res) => {
+  return res.json({
+    providers: AI_PROVIDERS.map(({ id, name, logo, models, applyUrl }) => ({ id, name, logo, models, applyUrl }))
+  });
 });
 
 /* ── GET /api/bots/:id/groups ────────────────────────────────── */

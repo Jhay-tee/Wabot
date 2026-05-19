@@ -7,8 +7,9 @@ import { botsApi }     from "../../api/bots.js";
 import { fmtDate }     from "../../utils/format.js";
 
 const AI_PROVIDERS = [
-  { id: "openai",  name: "OpenAI",              logo: "🟢", models: ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],                                applyUrl: "https://platform.openai.com/api-keys"   },
-  { id: "gemini",  name: "Google Gemini",        logo: "🔵", models: ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash"],                applyUrl: "https://aistudio.google.com/apikey"     },
+  { id: "openai",  name: "OpenAI",        logo: "🟢", models: ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-3.5-turbo"],                                applyUrl: "https://platform.openai.com/api-keys"   },
+  { id: "gemini",  name: "Google Gemini", logo: "🔵", models: ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.5-flash-8b"],          applyUrl: "https://aistudio.google.com/apikey"     },
+  { id: "groq",    name: "Groq",          logo: "⚡", models: ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192", "mixtral-8x7b-32768", "gemma2-9b-it"], applyUrl: "https://console.groq.com/keys" },
 ];
 
 const DEFAULT_COMMANDS = [
@@ -99,6 +100,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   const [aiKeyInput,    setAiKeyInput]    = useState("");
   const [aiKeySensitive,setAiKeySensitive]= useState(form.ai_config.is_sensitive ?? false);
   const [aiKeyVisible,  setAiKeyVisible]  = useState(false);
+  const [aiKeyTest,     setAiKeyTest]     = useState({ status: "idle", msg: "" });
   const [bulkPaste,     setBulkPaste]     = useState("");
   const [showBulk,      setShowBulk]      = useState(false);
 

@@ -27,6 +27,8 @@ export const botsApi = {
 
   /* AI config (Pro) */
   saveAiConfig:    (id, aiConfig)           => apiFetch(`/bots/${id}`,           { method: "PATCH",  body: JSON.stringify({ ai_config: aiConfig }) }),
+  testAiKey:       (id, provider, apiKey)   => apiFetch(`/bots/${id}/test-ai`,   { method: "POST",   body: JSON.stringify({ provider, api_key: apiKey }) }),
+  aiProviders:     ()                       => apiFetch("/bots/ai-providers"),
 
   /* Commands config */
   saveCommands:    (id, commandsConfig)     => apiFetch(`/bots/${id}`,           { method: "PATCH",  body: JSON.stringify({ commands_config: commandsConfig }) }),
