@@ -132,6 +132,13 @@ async function requestPairingCodeWithRetry(botId, phone, retryCount = 0, maxRetr
   }
 }
 
+/* ── GET /api/bots/ai-providers (must be before /:id routes) ─── */
+router.get("/ai-providers", (_req, res) => {
+  return res.json({
+    providers: AI_PROVIDERS.map(({ id, name, logo, models, applyUrl }) => ({ id, name, logo, models, applyUrl }))
+  });
+});
+
 /* ── GET /api/bots/dashboard ─────────────────────────────────── */
 router.get("/dashboard", async (req, res) => {
   const userId = req.user.sub;
@@ -573,13 +580,16 @@ router.post("/:id/test-ai", async (req, res) => {
   const { id } = req.params;
 
   const { data: bot } = await supabase
-    .from("bots").select("id, user_id, plan_tier:users!inner(plan_tier), ai_config").eq("id", id).maybeSingle();
+    .from("bots")
+    .select("id, user_id, ai_config, users!inner(plan_tier)")
+    .eq("id", id)
+    .maybeSingle();
   if (!bot || bot.user_id !== userId) return res.status(404).json({ error: "Bot not found." });
 
-  const planTier = bot.plan_tier?.plan_tier ?? "free";
+  const planTier = bot.users?.plan_tier ?? "free";
   if (planTier !== "paid") return res.status(403).json({ error: "AI features require the Pro plan." });
 
-  const rawKey = String(req.body?.api_key ?? "").trim();
+  const rawKey  = String(req.body?.api_key ?? "").trim();
   const provider = String(req.body?.provider ?? bot.ai_config?.provider ?? "openai").trim().toLowerCase();
 
   if (!ALLOWED_AI_PROVIDERS.has(provider)) {
@@ -589,22 +599,14 @@ router.post("/:id/test-ai", async (req, res) => {
   let apiKey = rawKey;
   if (!apiKey) {
     const encrypted = bot.ai_config?.encrypted_key;
-    if (!encrypted) return res.status(400).json({ error: "No API key available to test." });
-    if (!env.hasJwt) return res.status(500).json({ error: "Server not configured for key decryption." });
+    if (!encrypted) return res.status(400).json({ error: "No API key to test. Enter a key in the field above first." });
     const { decryptApiKey } = await import("../services/ai/AiService.js");
     apiKey = decryptApiKey(encrypted, env.jwtSecret);
-    if (!apiKey) return res.status(500).json({ error: "Could not decrypt stored API key." });
+    if (!apiKey) return res.status(500).json({ error: "Could not decrypt the stored API key." });
   }
 
   const result = await testAiKey({ provider, apiKey });
   return res.json(result);
-});
-
-/* ── GET /api/bots/ai-providers ──────────────────────────────── */
-router.get("/ai-providers", (_req, res) => {
-  return res.json({
-    providers: AI_PROVIDERS.map(({ id, name, logo, models, applyUrl }) => ({ id, name, logo, models, applyUrl }))
-  });
 });
 
 /* ── GET /api/bots/:id/groups ────────────────────────────────── */

@@ -785,6 +785,37 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                     </button>
                   </div>
                   <span className="field-hint">Key is encrypted and stored securely. Never exposed in API responses.</span>
+
+                  {/* ── Test key button ── */}
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
+                    <button type="button" className="btn btn-secondary btn-sm"
+                      disabled={aiKeyTest.status === "loading" || (!aiKeyInput && !form.ai_config.has_key)}
+                      onClick={async () => {
+                        setAiKeyTest({ status: "loading", msg: "" });
+                        try {
+                          const result = await botsApi.testAiKey(
+                            bot.id,
+                            form.ai_config.provider,
+                            aiKeyInput || undefined
+                          );
+                          setAiKeyTest({
+                            status: result.ok ? "ok" : "error",
+                            msg: result.ok ? "Key is valid and working!" : (result.error || "Key is invalid")
+                          });
+                        } catch (err) {
+                          setAiKeyTest({ status: "error", msg: err.message || "Test failed" });
+                        }
+                      }}>
+                      {aiKeyTest.status === "loading" ? <><Spinner size="sm" /> Testing…</> : "Test key"}
+                    </button>
+                    {aiKeyTest.status === "ok" && (
+                      <span style={{ fontSize: "0.8rem", color: "var(--success)", fontWeight: 500 }}>✓ {aiKeyTest.msg}</span>
+                    )}
+                    {aiKeyTest.status === "error" && (
+                      <span style={{ fontSize: "0.8rem", color: "var(--error)" }}>✗ {aiKeyTest.msg}</span>
+                    )}
+                  </div>
+
                   <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "0.375rem", cursor: "pointer", fontSize: "0.875rem" }}>
                     <input type="checkbox" checked={aiKeySensitive} onChange={(e) => setAiKeySensitive(e.target.checked)} />
                     <span style={{ color: "var(--text2)" }}>

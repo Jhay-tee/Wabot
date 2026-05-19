@@ -195,7 +195,11 @@ export class BotInstance {
     this._onPair   = new Set();
     this._pendingUsage = { messagesThisMonth: 0, totalMessages: 0, lastActivity: null };
     this._pendingLogs  = [];
-    this._isPairingMode = false; // ✅ Flag to prevent QR from overriding pairing mode
+    this._isPairingMode        = false; // Flag to prevent QR from overriding pairing mode
+    this._socketReadyForPairing = false; // True once WS is up and ready for pairing code
+    this._pairingPhone         = null;  // Phone stored while waiting for socket readiness
+    this._pairingCodeResolve   = null;  // Promise resolver for requestPairingCode callers
+    this._pairingCodeReject    = null;  // Promise rejecter for requestPairingCode callers
 
     /* ── Group management in-memory state ─────────────────── */
     // Strike counts for moderation actions (anti-link/spam/vulgar)
@@ -242,6 +246,8 @@ export class BotInstance {
 
   async start() {
     if (this._destroyed) return;
+    /* Reset pairing state for fresh connection cycle */
+    this._socketReadyForPairing = false;
     try {
       if (this.socket) {
         try { this.socket.end(undefined); } catch {}
@@ -334,18 +340,20 @@ export class BotInstance {
     }
   }
 
-  /* ── Connection update (FIXED: Pairing mode prevents QR) ──── */
+  /* ── Connection update ────────────────────────────────────── */
 
   async _onConnectionUpdate({ connection, lastDisconnect, qr }) {
-    // Clear any outstanding pair codes on open
-    if (connection === "open") {
-      try {
-        for (const cb of this._onPair) cb(null);
-      } catch {}
-    }
-    
-    // ✅ SKIP QR if we're in pairing mode - this prevents QR from overriding pairing
-    if (qr && !this._isPairingMode) {
+    if (qr) {
+      /* The WS is up and WhatsApp is waiting for login — socket is ready */
+      this._socketReadyForPairing = true;
+
+      if (this._isPairingMode && this._pairingPhone) {
+        /* Pairing mode: skip QR display, request pairing code right now */
+        this._doPairingCodeRequest();
+        return;
+      }
+
+      /* Normal QR flow */
       try {
         this.qrCode = await QRCode.toDataURL(qr);
         for (const cb of this._onQR) cb(this.qrCode);
@@ -358,65 +366,135 @@ export class BotInstance {
 
     if (connection === "open") {
       this._clearQrTimeout();
-      this._reconnectAttempts = 0;
-      this.qrCode = null;
-      this._isPairingMode = false; // ✅ Reset pairing mode on successful connection
+      this._reconnectAttempts   = 0;
+      this.qrCode               = null;
+      this._isPairingMode       = false;
+      this._socketReadyForPairing = false; // Reset for next cycle
+      this._pairingPhone        = null;
       await this._setStatus("connected");
       await this._log("bot_connected", "WhatsApp connection established");
     }
 
     if (connection === "close") {
       this._clearQrTimeout();
+      this._socketReadyForPairing = false; // Reset for next connection attempt
+
       const code = (lastDisconnect?.error instanceof Boom)
         ? lastDisconnect.error.output?.statusCode
         : undefined;
 
       if (code === DisconnectReason.loggedOut || code === DisconnectReason.forbidden) {
+        /* Reject any pending pairing code waiters */
+        if (this._pairingCodeReject) {
+          this._pairingCodeReject(new Error("WhatsApp logged out. Please scan QR to reconnect."));
+        }
+        this._isPairingMode = false;
+        this._pairingPhone  = null;
         await clearSupabaseSession(this.botId);
         await this._setStatus("disconnected");
         await this._log("bot_disconnected", "Logged out — QR scan required to reconnect");
         return;
       }
 
-      // Inspect error payload for conflict/device_removed hints (Baileys stream errors)
       try {
-        const raw = lastDisconnect?.error ?? null;
+        const raw  = lastDisconnect?.error ?? null;
         const text = raw ? JSON.stringify(raw) : "";
         if (text.includes("device_removed") || text.includes("conflict") || text.includes("device_revoked")) {
           logger.error({ botId: this.botId, lastDisconnect }, "Detected device_removed/conflict — clearing session");
+          if (this._pairingCodeReject) {
+            this._pairingCodeReject(new Error("Session conflict detected. Please reconnect."));
+          }
+          this._isPairingMode = false;
+          this._pairingPhone  = null;
           await clearSupabaseSession(this.botId);
           await this._setStatus("disconnected");
-          await this._log("bot_disconnected", "Session removed by WhatsApp (device removed/conflict) — QR scan required to reconnect");
+          await this._log("bot_disconnected", "Session removed by WhatsApp — QR scan required");
           return;
         }
-      } catch (e) { /* ignore JSON errors */ }
+      } catch {}
 
-      if (!this._destroyed) {
-        this._scheduleReconnect();
-      }
+      if (!this._destroyed) this._scheduleReconnect();
     }
   }
 
-  /* ── FIXED: requestPairingCode sets pairing mode and status ── */
+  /* ── requestPairingCode — event-driven, waits for socket ready ─ */
+  /*
+   * Baileys' socket.requestPairingCode() can ONLY be called after the
+   * WebSocket handshake completes but before login finishes — i.e. right
+   * when Baileys would normally emit a QR code.
+   *
+   * Strategy: set _isPairingMode + _pairingPhone so that _onConnectionUpdate
+   * calls _doPairingCodeRequest() as soon as the QR event fires (= socket ready).
+   * If the socket is already in that state, call immediately.
+   */
   async requestPairingCode(phone) {
-    if (!this.socket) throw new Error("Bot socket not started.");
-    if (!this.socket.requestPairingCode) throw new Error("Pairing not supported by this Baileys version.");
-    
-    // ✅ Set pairing mode flag to prevent QR from taking over
+    if (!this.socket) throw new Error("Bot socket not started. Please wait a moment and try again.");
+    if (!this.socket.requestPairingCode) throw new Error("This Baileys version does not support pairing codes.");
+
+    const cleanPhone = String(phone).replace(/[^\d]/g, "");
+    if (!cleanPhone || cleanPhone.length < 7) {
+      throw new Error("Invalid phone number — include country code (e.g. 2348012345678).");
+    }
+
     this._isPairingMode = true;
-    
-    // ✅ Set status to awaiting_pairing
+    this._pairingPhone  = cleanPhone;
     await this._setStatus("awaiting_pairing");
-    
+
+    return new Promise((resolve, reject) => {
+      /* 30-second hard timeout */
+      const tid = setTimeout(() => {
+        this._pairingCodeResolve = null;
+        this._pairingCodeReject  = null;
+        this._isPairingMode      = false;
+        this._pairingPhone       = null;
+        reject(new Error("Pairing code request timed out (30 s). Reconnect the bot and try again."));
+      }, 30_000);
+
+      this._pairingCodeResolve = (code) => {
+        clearTimeout(tid);
+        this._pairingCodeResolve = null;
+        this._pairingCodeReject  = null;
+        resolve(code);
+      };
+      this._pairingCodeReject = (err) => {
+        clearTimeout(tid);
+        this._pairingCodeResolve = null;
+        this._pairingCodeReject  = null;
+        this._isPairingMode      = false;
+        this._pairingPhone       = null;
+        reject(err);
+      };
+
+      /* If the socket is already in the right state (QR was already emitted),
+         request the code right now instead of waiting for the next QR event. */
+      if (this._socketReadyForPairing) {
+        this._doPairingCodeRequest();
+      }
+    });
+  }
+
+  /* ── Internal: call Baileys and emit the pairing code ───────── */
+  async _doPairingCodeRequest() {
+    const phone = this._pairingPhone;
+    if (!phone || !this.socket?.requestPairingCode) return;
     try {
+      logger.info({ botId: this.botId, phone }, "Requesting pairing code from Baileys");
       const code = await this.socket.requestPairingCode(phone);
-      this._lastPairingCode = code; // Store for SSE clients
+      if (!code) throw new Error("Baileys returned an empty pairing code.");
+      this._lastPairingCode = code;
+      /* Emit to all SSE listeners */
       for (const cb of this._onPair) cb(code);
-      return code;
+      /* Resolve the waiting promise (if any) */
+      if (this._pairingCodeResolve) this._pairingCodeResolve(code);
     } catch (err) {
-      this._isPairingMode = false; // Reset on error
-      logger.error({ err, botId: this.botId }, "requestPairingCode failed");
-      throw err;
+      logger.error({ err, botId: this.botId }, "Pairing code request failed");
+      if (this._pairingCodeReject) {
+        this._pairingCodeReject(err);
+      } else {
+        /* No caller is waiting — fall back to QR mode */
+        this._isPairingMode = false;
+        this._pairingPhone  = null;
+      }
     }
   }
 
@@ -527,9 +605,18 @@ export class BotInstance {
     if (botType === "group" && !isGroup) return;
 
     /* ── Sender JID ────────────────────────────────────────── */
-    const senderJid = isGroup
-      ? normalizeJid(msg.key.participant ?? "")
-      : normalizeJid(jid);
+    /* For group messages prefer key.participant; fall back to pushName JID if absent */
+    const rawSenderJid = isGroup
+      ? (msg.key.participant || msg.participant || "")
+      : jid;
+    const senderJid = normalizeJid(rawSenderJid);
+
+    /* ── Guard: skip group messages if we don't know the bot's own JID yet ── */
+    if (isGroup) {
+      const botJid = normalizeJid(this.socket?.user?.id ?? "");
+      if (!botJid) return; // Can't do admin checks without knowing our own JID
+      if (!senderJid) return; // Can't identify sender
+    }
 
     /* ── Extract message body ──────────────────────────────── */
     const { text: body, type: msgType, extra } = extractMessageBody(msg);
@@ -811,7 +898,16 @@ export class BotInstance {
     const parts      = body.trim().split(/\s+/);
     const cmd        = parts[0].toLowerCase();
     const mentioned  = Array.isArray(extra.mentionedJid) ? extra.mentionedJid : [];
-    const targetJid  = mentioned[0] ?? extra.quotedParticipant ?? null;
+
+    /* Prefer @mention, then quoted participant, then bare phone number in the message */
+    let targetJid = mentioned[0] ?? extra.quotedParticipant ?? null;
+    if (!targetJid && parts[1]) {
+      /* Accept a bare phone number like .kick 2348012345678 */
+      const maybePhone = parts[1].replace(/[^\d]/g, "");
+      if (maybePhone.length >= 7) {
+        targetJid = `${maybePhone}@s.whatsapp.net`;
+      }
+    }
     const shortTarget = targetJid ? targetJid.replace("@s.whatsapp.net", "") : null;
 
     const senderIsAdmin = await this._isSenderAdmin(groupJid, senderJid);
