@@ -517,7 +517,7 @@ router.patch("/:id", async (req, res) => {
     ai.provider = provider;
 
     /* If new raw API key provided, encrypt it */
-    if (ai.api_key && !ai.api_key.startsWith("***")) {
+    if (ai.api_key && ai.api_key.trim() && !ai.api_key.startsWith("***")) {
       if (!env.hasJwt)
         return res.status(500).json({ error: "Server not configured for key encryption (JWT_SECRET missing)." });
       ai.encrypted_key = encryptApiKey(String(ai.api_key), env.jwtSecret);

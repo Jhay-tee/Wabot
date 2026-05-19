@@ -190,33 +190,22 @@ export function DeployModal({ user, onClose, onDeployed }) {
     codeReceivedRef.current = false;
     setPairCode(null);
     setConnectionStep("waiting");
-    
+
     try {
-      const data = await botsApi.deploy({ 
-        botName: name.trim(), 
-        description: desc.trim(), 
-        botType, 
+      const data = await botsApi.deploy({
+        botName: name.trim(),
+        description: desc.trim(),
+        botType,
         method,
         phone: method === "code" ? phoneInput.replace(/[^0-9]/g, '') : undefined
       });
       const botId = data.bot.id;
-      
-      // Check if pairing code is in the immediate response
-      if (data.pairing?.code) {
-        console.log("[Deploy] Pairing code from response:", data.pairing.code);
-        setPairCode(data.pairing.code);
-        if (data.pairing.expiresAt) setPairExpiresAt(data.pairing.expiresAt);
-        setConnectionStep("showing");
-      }
-      
-      connectedRef.current = false;
-      setQrUrl(null);
-      setQrExpired(false);
-      setStep("connecting");
-      
-      connectSse(botId, markConnected);
-      startPolling(botId);
-      
+
+      // Deployment initiated successfully — close modal immediately
+      // so user can see bot card and copy the pairing code/QR from there
+      try { onDeployed(); } catch (e) {}
+      try { onClose(); } catch (e) {}
+
     } catch (err) {
       setError(err.message);
       setShowMethodSelect(true);
