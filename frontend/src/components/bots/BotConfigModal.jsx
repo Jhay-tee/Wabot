@@ -388,8 +388,17 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       setAiKeyInput("");
       setMsg({ text: "Saved successfully.", ok: true });
       onSaved(updated);
+
+      // Auto-clear success message after 2 seconds
+      setTimeout(() => {
+        setMsg({ text: "", ok: false });
+      }, 2000);
     } catch (err) {
       setMsg({ text: err.message, ok: false });
+      // Auto-clear error message after 4 seconds
+      setTimeout(() => {
+        setMsg({ text: "", ok: false });
+      }, 4000);
     } finally {
       setSaving(false);
     }
