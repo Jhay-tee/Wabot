@@ -1749,7 +1749,7 @@ export class BotInstance {
       return;
     }
 
-    if (isGroup) {
+  if (isGroup) {
       if (!botJid || !senderJid) return;
     }
 
@@ -1884,7 +1884,7 @@ export class BotInstance {
       if (await this._handleCommand(jid, normalizedBody)) return;
       if (await this._handleKeywordTrigger(jid, normalizedBody)) return;
       if (await this._handleSalesAgent(jid, normalizedBody)) return;
-      if (await this._handleAiResponse(jid, normalizedBody, extra, true, { messageId, conversationId, msgType })) return;
+      if (await this._handleAiResponse(jid, normalizedBody, extra, true, { messageId, conversationId, msgType, senderJid })) return;
       return;
     }
 
@@ -1895,8 +1895,8 @@ export class BotInstance {
     if (await this._handleCommand(jid, normalizedBody)) return;
     if (await this._handleKeywordTrigger(jid, normalizedBody)) return;
     if (await this._handleSalesAgent(jid, normalizedBody)) return;
-    if (await this._handleAssistantMode(jid, normalizedBody, { conversationId, senderJid, extra, isGroup: false })) return;
-    if (await this._handleAiResponse(jid, normalizedBody, extra, false, { messageId, conversationId, msgType })) return;
+  if (await this._handleAssistantMode(jid, normalizedBody, { conversationId, senderJid, extra, isGroup: false })) return;
+  if (await this._handleAiResponse(jid, normalizedBody, extra, false, { messageId, conversationId, msgType, senderJid })) return;
 
     if (this.config.auto_reply_enabled && this.config.auto_reply_message && this.socket) {
       try {
@@ -2478,6 +2478,13 @@ export class BotInstance {
     const messageId = context.messageId ?? null;
     const normalizedJid = normalizeJid(jid);
 
+    // Defensive: ensure senderJid flows through context; fallback to jid for DMs
+    const rawSender = context.senderJid ?? (isGroup ? (extra?.participant || extra?.sender || null) : jid);
+    const senderJid = rawSender ? normalizeJid(rawSender) : null;
+
+    // Debug log inbound sender information
+    logger.debug({ botId: this.botId, jid: normalizedJid, senderJid, messageId, isGroup }, "AI inbound: sender info");
+
     if (!ai.enabled || !ai.encrypted_key || this.config.plan_tier !== "paid") {
       logger.debug({
         botId: this.botId,
@@ -2546,8 +2553,9 @@ export class BotInstance {
         ? `Recent conversation:\n${memoryBlock}\n\nCurrent user message:\n${body}`
         : body;
 
-      const isAdmin = this._isAssistantAdmin(senderJid);
-      const senderNumber = extractPhoneFromJid(senderJid) || null;
+      // Defensive: determine admin and sender number only if senderJid is present
+      const isAdmin = senderJid ? this._isAssistantAdmin(senderJid) : false;
+      const senderNumber = senderJid ? (extractPhoneFromJid(senderJid) || null) : null;
 
       // Use PromptEngine to strictly compile messages (server-controlled system blocks only)
       const compiled = compilePrompt({
@@ -2578,7 +2586,7 @@ export class BotInstance {
       }
       const wantsImageResponse = ai.provider === "gemini" && looksLikeImageGenerationPrompt(body);
 
-      typingSession = await this._startTypingPresence(normalizedJid);
+  typingSession = await this._startTypingPresence(normalizedJid);
       const initialDelayMs = this._sampleDelay(300, 1_200);
       await this._sleep(initialDelayMs);
 
@@ -2603,6 +2611,7 @@ export class BotInstance {
           messageId,
           jobId,
           wantsImageResponse,
+          senderJid,
         }, "AI provider initialized");
         // Enforce AI mode dependency and ensure the system prompt is always passed.
         // ai_config is the canonical source of modes for this bot.
@@ -2637,10 +2646,20 @@ export class BotInstance {
         return getAiCompletion(callOpts);
       });
 
+      // Log generation success details (if any)
+      try {
+        logger.info({ botId: this.botId, jid: normalizedJid, messageId, jobId, replyLength: aiReply?.text?.length ?? 0, hasMedia: Boolean(aiReply?.media) }, "AI generation success");
+      } catch {}
+
+      // If senderJid is missing for DM contexts, warn (defensive)
+      if (!senderJid && !isGroup) {
+        logger.warn({ botId: this.botId, jid: normalizedJid, messageId, jobId }, "AI pipeline: missing senderJid for DM — responses targeting sender may be blocked");
+      }
+
       // Parse structured contract output — only structured contracts can request actions.
       let finalReply = aiReply;
       try {
-        const { parse } = await import('../ai/OutputParser.js');
+  const { parse } = await import('../ai/OutputParser.js');
         const { executeAction } = await import('../ai/ExecutionEngine.js');
         const { validateContract } = await import('../ai/ContractValidator.js');
   const parsed = parse(aiReply?.text ?? '');
@@ -2655,11 +2674,19 @@ export class BotInstance {
               // Execute action via ExecutionEngine (ExecutionEngine MUST NOT parse or validate)
               const execResult = await executeAction(contract, { botInstance: this, senderJid, senderNumber, isAdmin });
               if (!execResult.ok) {
-                // Execution denied/failed: send a refusal message to user
-                await this.sendMessage(normalizedJid, { text: `I couldn't perform the requested action: ${execResult.error}` }, { persist: true });
+                // Execution denied/failed: send a refusal message to user (guarded)
+                try {
+                  await this.sendMessage(normalizedJid, { text: `I couldn't perform the requested action: ${execResult.error}` }, { persist: true });
+                } catch (err) {
+                  logger.warn({ err, botId: this.botId, jobId, normalizedJid }, "Failed to send execution failure message");
+                }
               } else {
                 // On success, optionally notify the user
-                await this.sendMessage(normalizedJid, { text: `Action ${contract.action} executed successfully.` }, { persist: true });
+                try {
+                  await this.sendMessage(normalizedJid, { text: `Action ${contract.action} executed successfully.` }, { persist: true });
+                } catch (err) {
+                  logger.warn({ err, botId: this.botId, jobId, normalizedJid }, "Failed to send execution success message");
+                }
               }
               await this._markConversationAiResponse(context.conversationId ?? null);
               return true;
@@ -2668,8 +2695,12 @@ export class BotInstance {
             if (contract.type === 'message') {
               const textOut = String(contract.text ?? '').trim();
               if (textOut) {
-                await this.sendMessage(normalizedJid, { text: textOut }, { persist: true, countOnly: false });
-                await this._markConversationAiResponse(context.conversationId ?? null);
+                try {
+                  await this.sendMessage(normalizedJid, { text: textOut }, { persist: true, countOnly: false });
+                  await this._markConversationAiResponse(context.conversationId ?? null);
+                } catch (err) {
+                  logger.warn({ err, botId: this.botId, jobId, normalizedJid }, "Failed to send AI parsed message");
+                }
                 // Log ai_reply_sent only when assistant mode is active (structured logging requirement)
                 const { resolveAiModes } = await import('../ai/AiService.js');
                 if (resolveAiModes(ai).assistantActive) {
@@ -2686,8 +2717,12 @@ export class BotInstance {
 
             if (contract.type === 'refusal') {
               const reason = String(contract.reason ?? 'Refused to comply');
-              await this.sendMessage(normalizedJid, { text: reason }, { persist: true });
-              await this._markConversationAiResponse(context.conversationId ?? null);
+              try {
+                await this.sendMessage(normalizedJid, { text: reason }, { persist: true });
+                await this._markConversationAiResponse(context.conversationId ?? null);
+              } catch (err) {
+                logger.warn({ err, botId: this.botId, jobId, normalizedJid }, "Failed to send AI refusal message");
+              }
               return true;
             }
           }
