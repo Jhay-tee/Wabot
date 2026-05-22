@@ -1193,9 +1193,16 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                         type="checkbox"
                         checked={!!form.ai_config.assistant_enabled}
                         onChange={(e) => setAiVal("assistant_enabled", e.target.checked)}
+                        disabled={!form.ai_config.enabled}
+                        title={!form.ai_config.enabled ? "Enable AI (chatbot) first to use Assistant mode" : undefined}
                       />
                       <span className="toggle-track" />
                     </label>
+                    {!form.ai_config.enabled && (
+                      <div style={{ fontSize: '0.85rem', color: 'var(--text3)', marginTop: 6 }}>
+                        Assistant mode depends on Chatbot being enabled. Turn on the main AI toggle to enable.
+                      </div>
+                    )}
                   </div>
 
                   {form.ai_config.assistant_enabled && (

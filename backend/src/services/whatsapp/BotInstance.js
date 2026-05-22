@@ -2582,7 +2582,7 @@ export class BotInstance {
       const initialDelayMs = this._sampleDelay(300, 1_200);
       await this._sleep(initialDelayMs);
 
-      const jobId = `${this.botId}:${messageId ?? normalizedJid}:${ai.provider}:${body.trim().slice(0, 120)}`;
+  const jobId = `${this.botId}:${messageId ?? normalizedJid}:${ai.provider}:${body.trim().slice(0, 120)}`;
       logger.info({
         botId: this.botId,
         jid: normalizedJid,
@@ -2604,13 +2604,21 @@ export class BotInstance {
           jobId,
           wantsImageResponse,
         }, "AI provider initialized");
-        return getAiCompletion({
+        // Enforce AI mode dependency and ensure the system prompt is always passed.
+        // ai_config is the canonical source of modes for this bot.
+        const { resolveAiModes } = await import('../ai/AiService.js');
+        const modes = resolveAiModes(ai);
+
+        // Build system prompt: DM uses system_prompt, group uses group_system_prompt when present
+        const configPrompt = isGroup ? (ai.group_system_prompt || ai.system_prompt || "") : (ai.system_prompt || "");
+
+        const callOpts = {
           provider: ai.provider,
           apiKey,
           model: ai.model,
-          // backward-compatible: keep systemPrompt/userMessage empty when passing messages
-          systemPrompt: undefined,
-          userMessage: undefined,
+          // always include the system prompt so both modes share the same base instructions
+          systemPrompt: configPrompt,
+          // For backward compatibility we still pass messages when the prompt compiler requires it
           messages,
           metadata: {
             botId: this.botId,
@@ -2621,9 +2629,12 @@ export class BotInstance {
             assistant_admin_numbers: assistantAdminNumbers,
             sender_number: senderNumber,
             sender_jid: senderJid,
+            assistantMode: modes.assistantActive,
           },
           responseModalities: wantsImageResponse ? ["TEXT", "IMAGE"] : undefined,
-        });
+        };
+
+        return getAiCompletion(callOpts);
       });
 
       // Parse structured contract output — only structured contracts can request actions.
@@ -2632,7 +2643,7 @@ export class BotInstance {
         const { parse } = await import('../ai/OutputParser.js');
         const { executeAction } = await import('../ai/ExecutionEngine.js');
         const { validateContract } = await import('../ai/ContractValidator.js');
-        const parsed = parse(aiReply?.text ?? '');
+  const parsed = parse(aiReply?.text ?? '');
         if (parsed.ok) {
           const contract = parsed.parsed;
           // Strict schema validation: only execute when contract strictly matches schema.
@@ -2659,12 +2670,16 @@ export class BotInstance {
               if (textOut) {
                 await this.sendMessage(normalizedJid, { text: textOut }, { persist: true, countOnly: false });
                 await this._markConversationAiResponse(context.conversationId ?? null);
-                await this._log("ai_reply_sent", `AI (${ai.provider}) replied to ${normalizedJid.replace("@s.whatsapp.net", "")}`, {
-                  provider: ai.provider,
-                  model: ai.model,
-                  message_id: messageId,
-                  conversation_id: context.conversationId ?? null,
-                });
+                // Log ai_reply_sent only when assistant mode is active (structured logging requirement)
+                const { resolveAiModes } = await import('../ai/AiService.js');
+                if (resolveAiModes(ai).assistantActive) {
+                  await this._log("ai_reply_sent", `AI (${ai.provider}) replied to ${normalizedJid.replace("@s.whatsapp.net", "")}`, {
+                    provider: ai.provider,
+                    model: ai.model,
+                    message_id: messageId,
+                    conversation_id: context.conversationId ?? null,
+                  });
+                }
                 return true;
               }
             }

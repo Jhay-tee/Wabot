@@ -166,6 +166,18 @@ export async function getAiCompletion({ provider, apiKey, model, systemPrompt, u
 }
 
 /**
+ * Resolve AI runtime modes from ai_config.
+ * Enforces dependency: assistant mode is only active when chatbot (ai.enabled) is true.
+ * @param {{enabled?:boolean, assistant_enabled?:boolean}} aiConfig
+ * @returns {{chatbotActive:boolean, assistantActive:boolean}}
+ */
+export function resolveAiModes(aiConfig = {}) {
+  const chatbotActive = Boolean(aiConfig?.enabled);
+  const assistantActive = Boolean(aiConfig?.assistant_enabled) && chatbotActive;
+  return { chatbotActive, assistantActive };
+}
+
+/**
  * Validate an AI API key by making a minimal test call.
  * @param {{provider:string, apiKey:string}} opts
  * @returns {Promise<{ok:boolean, model?:string, error?:string}>}
