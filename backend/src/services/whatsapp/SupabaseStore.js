@@ -8,6 +8,8 @@
 
 import { initAuthCreds, BufferJSON } from "@whiskeysockets/baileys";
 import { supabase } from "../../lib/supabase.js";
+import { createClient } from "@supabase/supabase-js";
+import { env } from "../../config/env.js";
 import { logger } from "../../utils/logger.js";
 
 const authPersistors = new Map();
@@ -130,11 +132,30 @@ class BotAuthPersistor {
 
           if (error) throw error;
         } else {
-          const { error } = await supabase
-            .from("bot_sessions")
-            .insert(payload);
+          // Normal insert attempt
+          let insertResult = await supabase.from("bot_sessions").insert(payload);
 
-          if (error) throw error;
+          // If Postgres returns RLS/permission denied (42501), try again with an
+          // explicit server-side service-role client in case the imported
+          // `supabase` instance was created with a restricted key.
+          if (insertResult?.error && String(insertResult.error?.code) === "42501") {
+            logger.error({ err: insertResult.error, botId: this.botId }, "auth insert blocked by RLS. Attempting retry with explicit service-role client.");
+
+            try {
+              if (!env.supabaseUrl || !env.supabaseServiceRoleKey) {
+                throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment for retry.");
+              }
+
+              const serviceClient = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, { auth: { persistSession: false } });
+              const { error: svcErr } = await serviceClient.from("bot_sessions").insert(payload);
+              if (svcErr) throw svcErr;
+            } catch (svcErr) {
+              // Re-throw original or new error so outer handler logs it
+              throw insertResult.error || svcErr;
+            }
+          } else if (insertResult?.error) {
+            throw insertResult.error;
+          }
         }
 
         this.latestDbVersion = snapshot.state_version;
