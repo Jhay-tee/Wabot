@@ -1,0 +1,1741 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  BadgeCheck,
+  Bot,
+  Boxes,
+  BrainCircuit,
+  Eye,
+  EyeOff,
+  Globe,
+  KeyRound,
+  Link2,
+  MessageSquareText,
+  Phone,
+  Plus,
+  Shield,
+  Store,
+  Trash2,
+  Users,
+  Zap,
+} from "lucide-react";
+import { Modal }       from "../ui/Modal.jsx";
+import { Alert }       from "../ui/Alert.jsx";
+import { Spinner }     from "../ui/Spinner.jsx";
+import { StatusBadge } from "../ui/Badge.jsx";
+import { botsApi }     from "../../api/bots.js";
+import { fmtDate }     from "../../utils/format.js";
+import { PHONE_COUNTRIES, getCountryByCode, normalizePhoneNumber } from "../../utils/phone.js";
+
+const AI_PROVIDERS = [
+  { id: "openai",  name: "OpenAI",        short: "OA", models: ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-3.5-turbo"],                                applyUrl: "https://platform.openai.com/api-keys"   },
+  { id: "gemini",  name: "Google Gemini", short: "GM", models: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.5-flash-8b"], applyUrl: "https://aistudio.google.com/apikey"     },
+  { id: "groq",    name: "Groq",          short: "GQ", models: ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768", "gemma2-9b-it"], applyUrl: "https://console.groq.com/keys" },
+];
+
+const DEFAULT_COMMANDS = [
+  { key: "help",    trigger: "/help",    desc: "Show list of available commands"              },
+  { key: "catalog", trigger: "/catalog", desc: "Display product catalog"                      },
+  { key: "price",   trigger: "/price",   desc: "Show pricing information"                     },
+  { key: "contact", trigger: "/contact", desc: "Contact / human agent info"                   },
+  { key: "stop",    trigger: "/stop",    desc: "Unsubscribe from messages"                    },
+  { key: "agent",   trigger: "/agent",   desc: "Connect to a live agent"                      },
+  { key: "hours",   trigger: "/hours",   desc: "Business operating hours"                     },
+  { key: "order",   trigger: "/order",   desc: "How to place an order"                        },
+];
+
+function emptyTrigger() {
+  return {
+    id:            crypto.randomUUID(),
+    keyword:       "",
+    response:      "",
+    matchType:     "contains",
+    caseSensitive: false,
+    enabled:       true
+  };
+}
+function emptyProduct()  { return { name: "", price: "", description: "" }; }
+
+function normalizeSalesAgentConfig(config) {
+  return {
+    enabled: false,
+    welcome_enabled: false,
+    greeting: "",
+    group_welcome: "",
+    show_catalog_on_keyword: true,
+    products: [],
+    ...(typeof config === "object" && config ? config : {})
+  };
+}
+
+function normalizeCommandsConfigState(config) {
+  const current = typeof config === "object" && config ? config : {};
+  const timing = current.reply_timing ?? {};
+  const min = Number.isFinite(Number(timing.min_ms)) ? Math.max(0, Math.round(Number(timing.min_ms))) : 1000;
+  const max = Number.isFinite(Number(timing.max_ms)) ? Math.max(0, Math.round(Number(timing.max_ms))) : 12000;
+
+  return {
+    ...current,
+    reply_timing: {
+      min_ms: Math.min(min, max),
+      max_ms: Math.max(min, max),
+    },
+  };
+}
+
+function buildTabs(isPro, botType) {
+  const tabs = [
+    { id: "info",     label: "Info"         },
+    { id: "sales",    label: "Sales Agent"  },
+    { id: "commands", label: "Commands"     },
+    { id: "webhook",  label: "Webhook"      },
+    { id: "autoreply",label: "Auto-reply"  },
+    { id: "ai",       label: isPro ? "AI" : "AI Locked" },
+  ];
+  if (botType === "group" || botType === "all") {
+    tabs.push({ id: "group", label: "Group" });
+  }
+  if (botType === "dm" || botType === "all") {
+    tabs.push({ id: "dmhelp", label: "DM Help" });
+  }
+  tabs.push({ id: "qr", label: "QR / Pairing" });
+  return tabs;
+}
+
+export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
+  const isPro = user?.plan_tier === "paid";
+  const [bot, setBot]   = useState(initialBot);
+  const [tab, setTab]   = useState(initialBot._openQr ? "qr" : "info");
+  const [form, setForm] = useState({
+    bot_name:            bot.bot_name          ?? "",
+    description:         bot.description       ?? "",
+    webhook_url:         bot.webhook_url        ?? "",
+    webhook_secret:      bot.webhook_secret     ?? "",
+    auto_reply_enabled:  bot.auto_reply_enabled ?? false,
+    auto_reply_message:  bot.auto_reply_message ?? "",
+    website_url:         bot.website_url        ?? "",
+    catalog_unavail_msg: bot.catalog_unavail_msg ?? "",
+    keyword_triggers:    Array.isArray(bot.keyword_triggers) ? bot.keyword_triggers : [],
+    sales_agent_config:  normalizeSalesAgentConfig(bot.sales_agent_config),
+    commands_config:     normalizeCommandsConfigState(bot.commands_config),
+    ai_config:           typeof bot.ai_config === "object" && bot.ai_config
+      ? {
+          conversation_memory_enabled: true,
+          memory_message_limit: 6,
+          memory_char_limit: 1200,
+          ...bot.ai_config,
+        }
+      : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
+    group_management_config: typeof bot.group_management_config === "object" && bot.group_management_config
+      ? bot.group_management_config
+      : {
+          anti_link:           { enabled: false, action: "warn" },
+          anti_spam:           { enabled: false, threshold: 5, window_seconds: 10, action: "warn" },
+          anti_vulgar:         { enabled: false, words: [], action: "warn" },
+          auto_help_on_first_dm: false,
+          rules:               ""
+        }
+  });
+
+  /* AI key state */
+  const [aiKeyInput,    setAiKeyInput]    = useState("");
+  const [aiKeySensitive,setAiKeySensitive]= useState(form.ai_config.is_sensitive ?? false);
+  const [aiKeyVisible,  setAiKeyVisible]  = useState(false);
+  const [aiKeyCleared,  setAiKeyCleared]  = useState(false);
+  const [aiKeyTest,     setAiKeyTest]     = useState({ status: "idle", msg: "" });
+  const [bulkPaste,     setBulkPaste]     = useState("");
+  const [showBulk,      setShowBulk]      = useState(false);
+
+  /* QR / Pairing code state */
+  const [qrMethod, setQrMethod] = useState("qr");
+  const [pairingCode, setPairingCode] = useState(null);
+  const [pairingExpiresAt, setPairingExpiresAt] = useState(null);
+  const [showPhoneInput, setShowPhoneInput] = useState(false);
+  const [pairCountry, setPairCountry] = useState("NG");
+  const [phoneNumberInput, setPhoneNumberInput] = useState("");
+  const [generatingCode, setGeneratingCode] = useState(false);
+
+  const [saving,        setSaving]        = useState(false);
+  const [msg,           setMsg]           = useState({ text: "", ok: false });
+  const [qrUrl,         setQrUrl]         = useState(null);
+  const [qrCountdown,   setQrCountdown]   = useState(60);
+  const [qrExpired,     setQrExpired]     = useState(false);
+  const [reconnecting,  setReconnecting]  = useState(false);
+  const [reconnectMsg,  setReconnectMsg]  = useState("");
+  const [adminGroups,   setAdminGroups]   = useState(null);
+  const [vulgarInput, setVulgarInput] = useState("");
+  const esRef        = useRef(null);
+  const qrPollRef    = useRef(null);
+  const qrFirstRef   = useRef(null);
+  const qrCdRef      = useRef(null);
+  const qrMethodRef  = useRef(qrMethod);
+
+  const TABS = buildTabs(isPro, bot.bot_type);
+  const selectedPairCountry = getCountryByCode(pairCountry);
+  const normalizedPairPhone = normalizePhoneNumber(pairCountry, phoneNumberInput);
+  const hasUnsavedChanges = JSON.stringify({
+    bot_name: form.bot_name,
+    description: form.description,
+    webhook_url: form.webhook_url,
+    webhook_secret: form.webhook_secret,
+    auto_reply_enabled: form.auto_reply_enabled,
+    auto_reply_message: form.auto_reply_message,
+    website_url: form.website_url,
+    catalog_unavail_msg: form.catalog_unavail_msg,
+    keyword_triggers: form.keyword_triggers,
+    sales_agent_config: form.sales_agent_config,
+    commands_config: form.commands_config,
+    ai_config: form.ai_config,
+    group_management_config: form.group_management_config,
+  }) !== JSON.stringify({
+    bot_name: bot.bot_name ?? "",
+    description: bot.description ?? "",
+    webhook_url: bot.webhook_url ?? "",
+    webhook_secret: bot.webhook_secret ?? "",
+    auto_reply_enabled: bot.auto_reply_enabled ?? false,
+    auto_reply_message: bot.auto_reply_message ?? "",
+    website_url: bot.website_url ?? "",
+    catalog_unavail_msg: bot.catalog_unavail_msg ?? "",
+    keyword_triggers: Array.isArray(bot.keyword_triggers) ? bot.keyword_triggers : [],
+    sales_agent_config: normalizeSalesAgentConfig(bot.sales_agent_config),
+    commands_config: normalizeCommandsConfigState(bot.commands_config),
+    ai_config: typeof bot.ai_config === "object" && bot.ai_config
+      ? {
+          conversation_memory_enabled: true,
+          memory_message_limit: 6,
+          memory_char_limit: 1200,
+          ...bot.ai_config,
+        }
+      : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
+    group_management_config: typeof bot.group_management_config === "object" && bot.group_management_config
+      ? bot.group_management_config
+      : {
+          anti_link: { enabled: false, action: "warn" },
+          anti_spam: { enabled: false, threshold: 5, window_seconds: 10, action: "warn" },
+          anti_vulgar: { enabled: false, words: [], action: "warn" },
+          auto_help_on_first_dm: false,
+          rules: "",
+        },
+  }) || Boolean(aiKeyInput.trim()) || aiKeyCleared;
+
+  useEffect(() => {
+    qrMethodRef.current = qrMethod;
+  }, [qrMethod]);
+
+  useEffect(() => {
+    setBot(initialBot);
+    setTab(initialBot._openQr ? "qr" : "info");
+    setForm({
+      bot_name:            initialBot.bot_name          ?? "",
+      description:         initialBot.description       ?? "",
+      webhook_url:         initialBot.webhook_url        ?? "",
+      webhook_secret:      initialBot.webhook_secret     ?? "",
+      auto_reply_enabled:  initialBot.auto_reply_enabled ?? false,
+      auto_reply_message:  initialBot.auto_reply_message ?? "",
+      website_url:         initialBot.website_url        ?? "",
+      catalog_unavail_msg: initialBot.catalog_unavail_msg ?? "",
+      keyword_triggers:    Array.isArray(initialBot.keyword_triggers) ? initialBot.keyword_triggers : [],
+      sales_agent_config:  normalizeSalesAgentConfig(initialBot.sales_agent_config),
+      commands_config:     normalizeCommandsConfigState(initialBot.commands_config),
+      ai_config:           typeof initialBot.ai_config === "object" && initialBot.ai_config
+        ? {
+            conversation_memory_enabled: true,
+            memory_message_limit: 6,
+            memory_char_limit: 1200,
+            ...initialBot.ai_config,
+          }
+        : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
+      group_management_config: typeof initialBot.group_management_config === "object" && initialBot.group_management_config
+        ? initialBot.group_management_config
+        : {
+            anti_link:           { enabled: false, action: "warn" },
+            anti_spam:           { enabled: false, threshold: 5, window_seconds: 10, action: "warn" },
+            anti_vulgar:         { enabled: false, words: [], action: "warn" },
+            auto_help_on_first_dm: false,
+            rules:               ""
+          }
+    });
+    setPairingCode(null);
+    setPairingExpiresAt(null);
+    setQrUrl(null);
+    setShowPhoneInput(false);
+    setAiKeyInput("");
+    setAiKeyCleared(false);
+    setAiKeySensitive(initialBot.ai_config?.is_sensitive ?? false);
+    setAiKeyTest({ status: "idle", msg: "" });
+    setPhoneNumberInput("");
+    setMsg({ text: "", ok: false });
+  }, [initialBot]);
+
+  /* ── Fetch admin groups when Group tab is opened ─────────── */
+  useEffect(() => {
+    if (tab !== "group") return;
+    botsApi.groups(bot.id)
+      .then((d) => setAdminGroups(d))
+      .catch(() => setAdminGroups({ count: 0, groups: [] }));
+  }, [tab, bot.id]);
+
+  /* ── QR countdown helpers ────────────────────────────────── */
+  const startQrCountdown = useCallback(() => {
+    clearInterval(qrCdRef.current);
+    setQrCountdown(60);
+    setQrExpired(false);
+    qrCdRef.current = setInterval(() => {
+      setQrCountdown((c) => {
+        if (c <= 1) { setQrExpired(true); return 0; }
+        return c - 1;
+      });
+    }, 1000);
+  }, []);
+
+  const receiveQr = useCallback((url) => {
+    if (qrMethodRef.current !== "qr") return;
+    setQrUrl(url);
+    setQrExpired(false);
+    startQrCountdown();
+  }, [startQrCountdown]);
+
+  const receivePairingCode = useCallback((code, expiresAt) => {
+    setPairingCode(code);
+    setPairingExpiresAt(expiresAt);
+    setQrMethod("code");  // Switch to pairing code display
+    setQrUrl(null);       // Clear QR code
+  }, []);
+
+  /* SSE + HTTP polling fallback for QR tab */
+  useEffect(() => {
+    if (tab !== "qr") {
+      esRef.current?.close();
+      clearTimeout(qrFirstRef.current);
+      clearInterval(qrPollRef.current);
+      clearInterval(qrCdRef.current);
+      return;
+    }
+
+    const token = localStorage.getItem("wabot_token") ?? "";
+    const es    = new EventSource(botsApi.eventsUrl(bot.id, token));
+    esRef.current = es;
+    es.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        if (d.type === "qr" && qrMethodRef.current === "qr") receiveQr(d.qrUrl);
+        if (d.type === "pair_code") {
+          if (!d.code) {
+            setPairingCode(null);
+            setPairingExpiresAt(null);
+          } else if (typeof d.code === "string") receivePairingCode(d.code, d.expiresAt ?? null);
+          else if (d.code && typeof d.code === "object") {
+            receivePairingCode(d.code.code ?? null, d.code.expiresAt ?? null);
+          }
+        }
+        if (d.type === "status") {
+          setBot((b) => ({ ...b, status: d.status }));
+          if (d.status === "connected") {
+            setPairingCode(null);
+            setPairingExpiresAt(null);
+            setQrUrl(null);
+            setShowPhoneInput(false);
+            onClose();
+          }
+        }
+      } catch {}
+    };
+    es.onerror = () => {};
+
+    if (qrMethod === "qr") {
+      qrFirstRef.current = setTimeout(async () => {
+        try {
+          const data = await botsApi.qr(bot.id);
+          if (data?.qrCodeDataUrl) receiveQr(data.qrCodeDataUrl);
+        } catch {}
+      }, 3_000);
+
+      qrPollRef.current = setInterval(async () => {
+        try {
+          const data = await botsApi.qr(bot.id);
+          if (data?.qrCodeDataUrl) receiveQr(data.qrCodeDataUrl);
+        } catch {}
+      }, 8_000);
+    }
+
+    return () => {
+      es.close();
+      clearTimeout(qrFirstRef.current);
+      clearInterval(qrPollRef.current);
+      clearInterval(qrCdRef.current);
+    };
+  }, [tab, bot.id, qrMethod, receiveQr, receivePairingCode]);
+
+  /* ── Pairing code functions ───────────────────────────────── */
+  const requestNewPairingCode = () => {
+    setShowPhoneInput(true);
+    setPhoneNumberInput("");
+  };
+
+  const generateNewPairingCode = async () => {
+    if (!normalizedPairPhone) return;
+    setGeneratingCode(true);
+    setShowPhoneInput(false);
+    setQrMethod("code");
+    setQrUrl(null);
+    try {
+      const resp = await botsApi.createPairingCode(bot.id, normalizedPairPhone);
+      setPairingCode(resp.code);
+      setPairingExpiresAt(resp.expiresAt);
+      setQrMethod("code");
+      setMsg({ text: "Pairing code generated successfully!", ok: true });
+      setTimeout(() => setMsg({ text: "", ok: false }), 3000);
+    } catch (err) {
+      setMsg({ text: err.message || "Could not generate pairing code", ok: false });
+    } finally {
+      setGeneratingCode(false);
+    }
+  };
+
+  const refreshPairingCode = async () => {
+    if (!normalizedPairPhone) {
+      setShowPhoneInput(true);
+      return;
+    }
+    setGeneratingCode(true);
+    setQrMethod("code");
+    setQrUrl(null);
+    try {
+      const resp = await botsApi.createPairingCode(bot.id, normalizedPairPhone);
+      setPairingCode(resp.code);
+      setPairingExpiresAt(resp.expiresAt);
+      setMsg({ text: "Pairing code refreshed!", ok: true });
+      setTimeout(() => setMsg({ text: "", ok: false }), 2000);
+    } catch (err) {
+      setMsg({ text: err.message || "Could not refresh pairing code", ok: false });
+    } finally {
+      setGeneratingCode(false);
+    }
+  };
+
+  /* ── Generic setters ─────────────────────────────────────── */
+  const set = (k) => (e) =>
+    setForm((p) => ({ ...p, [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
+
+  const setSac = useCallback((k) => (e) =>
+    setForm((p) => ({
+      ...p,
+      sales_agent_config: {
+        ...p.sales_agent_config,
+        [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value
+      }
+    })), []);
+
+  /* ── Keyword triggers ────────────────────────────────────── */
+  const addTrigger    = ()       => setForm((p) => ({ ...p, keyword_triggers: [...p.keyword_triggers, emptyTrigger()] }));
+  const removeTrigger = (i)      => setForm((p) => ({ ...p, keyword_triggers: p.keyword_triggers.filter((_, x) => x !== i) }));
+  const setTrigger    = (i, k, v) =>
+    setForm((p) => { const n = [...p.keyword_triggers]; n[i] = { ...n[i], [k]: v }; return { ...p, keyword_triggers: n }; });
+
+  /* ── Products ────────────────────────────────────────────── */
+  const addProduct    = ()       =>
+    setForm((p) => ({ ...p, sales_agent_config: { ...p.sales_agent_config, products: [...(p.sales_agent_config.products ?? []), emptyProduct()] } }));
+  const removeProduct = (i)      =>
+    setForm((p) => ({ ...p, sales_agent_config: { ...p.sales_agent_config, products: p.sales_agent_config.products.filter((_, x) => x !== i) } }));
+  const setProduct    = (i, k, v) =>
+    setForm((p) => {
+      const products = [...(p.sales_agent_config.products ?? [])];
+      products[i] = { ...products[i], [k]: v };
+      return { ...p, sales_agent_config: { ...p.sales_agent_config, products } };
+    });
+
+  /* ── Bulk paste parser ───────────────────────────────────── */
+  const applyBulkPaste = () => {
+    const lines   = bulkPaste.split("\n").map((l) => l.trim()).filter(Boolean);
+    const parsed  = lines.map((line) => {
+      const parts = line.split("|").map((s) => s.trim());
+      return {
+        name:        parts[0] ?? "",
+        price:       parts[1] ?? "",
+        description: parts[2] ?? ""
+      };
+    }).filter((p) => p.name);
+
+    if (parsed.length === 0) return;
+    setForm((p) => ({
+      ...p,
+      sales_agent_config: {
+        ...p.sales_agent_config,
+        products: [...(p.sales_agent_config.products ?? []), ...parsed]
+      }
+    }));
+    setBulkPaste("");
+    setShowBulk(false);
+  };
+
+  /* ── Commands config ─────────────────────────────────────── */
+  const toggleCommand = (key) =>
+    setForm((p) => ({
+      ...p,
+      commands_config: {
+        ...p.commands_config,
+        [key]: { ...(p.commands_config[key] ?? {}), enabled: !(p.commands_config[key]?.enabled ?? true) }
+      }
+    }));
+  const setCommandResponse = (key, val) =>
+    setForm((p) => ({
+      ...p,
+      commands_config: {
+        ...p.commands_config,
+        [key]: { ...(p.commands_config[key] ?? {}), custom_response: val }
+      }
+    }));
+
+  /* ── AI config ───────────────────────────────────────────── */
+  const setAi = (k) => (e) =>
+    setForm((p) => ({ ...p, ai_config: { ...p.ai_config, [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value } }));
+
+  const setAiVal = (k, v) =>
+    setForm((p) => ({ ...p, ai_config: { ...p.ai_config, [k]: v } }));
+
+  const selectedProvider = AI_PROVIDERS.find((p) => p.id === (form.ai_config.provider || "openai")) ?? AI_PROVIDERS[0];
+
+  /* ── Group management config ─────────────────────────────── */
+  const setGmc = useCallback((section, key, val) =>
+    setForm((p) => ({
+      ...p,
+      group_management_config: {
+        ...p.group_management_config,
+        [section]: { ...(p.group_management_config[section] ?? {}), [key]: val }
+      }
+    })), []);
+
+  const setGmcTop = useCallback((key, val) =>
+    setForm((p) => ({
+      ...p,
+      group_management_config: { ...p.group_management_config, [key]: val }
+    })), []);
+
+  const addVulgarWord = () => {
+    const w = vulgarInput.trim().toLowerCase();
+    if (!w) return;
+    const words = Array.isArray(form.group_management_config.anti_vulgar?.words)
+      ? form.group_management_config.anti_vulgar.words : [];
+    if (!words.includes(w)) setGmc("anti_vulgar", "words", [...words, w]);
+    setVulgarInput("");
+  };
+
+  const removeVulgarWord = (w) => {
+    const words = (form.group_management_config.anti_vulgar?.words ?? []).filter((x) => x !== w);
+    setGmc("anti_vulgar", "words", words);
+  };
+
+  const gmc = form.group_management_config ?? {};
+
+  /* ── Save ────────────────────────────────────────────────── */
+  const save = async () => {
+    setSaving(true); setMsg({ text: "", ok: false });
+    try {
+      const payload = { ...form };
+
+      if (aiKeyInput.trim() || aiKeyCleared) {
+        payload.ai_config = {
+          ...form.ai_config,
+          api_key:      aiKeyInput.trim(),
+          is_sensitive: aiKeyCleared ? false : aiKeySensitive,
+          clear_key:    aiKeyCleared,
+        };
+      }
+
+      const { bot: updated } = await botsApi.patch(bot.id, payload);
+      setBot(updated);
+      setForm((prev) => ({
+        ...prev,
+        ...updated,
+        sales_agent_config: normalizeSalesAgentConfig(updated.sales_agent_config),
+        commands_config: normalizeCommandsConfigState(updated.commands_config),
+        ai_config: typeof updated.ai_config === "object" && updated.ai_config
+          ? {
+              conversation_memory_enabled: true,
+              memory_message_limit: 6,
+              memory_char_limit: 1200,
+              ...updated.ai_config,
+            }
+          : prev.ai_config,
+      }));
+      setAiKeyInput("");
+      setAiKeyCleared(false);
+      setAiKeySensitive(updated.ai_config?.is_sensitive ?? false);
+      setAiKeyTest({ status: "idle", msg: "" });
+      setMsg({ text: "Saved successfully.", ok: true });
+      onSaved(updated);
+
+      // Auto-clear success message after 2 seconds
+      setTimeout(() => {
+        setMsg({ text: "", ok: false });
+      }, 2000);
+    } catch (err) {
+      setMsg({ text: err.message, ok: false });
+      // Auto-clear error message after 4 seconds
+      setTimeout(() => {
+        setMsg({ text: "", ok: false });
+      }, 4000);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const sac      = form.sales_agent_config;
+  const products = sac.products ?? [];
+  const typeIcon = bot.bot_type === "group" ? Users : bot.bot_type === "all" ? Globe : Bot;
+  const TypeIcon = typeIcon;
+
+  return (
+    <Modal onClose={onClose} wide>
+      <div style={{ width: "100%", textAlign: "left" }}>
+        {/* Header */}
+        <div className="mb-5 flex items-center gap-3">
+          <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-[var(--accent-dim)] text-[var(--accent)]">
+            <TypeIcon size={22} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, fontSize: "1rem" }}>{bot.bot_name}</div>
+            <div style={{ fontSize: "0.75rem", color: "var(--text3)", fontFamily: "monospace" }}>
+              {bot.id?.slice(0, 8)}… · {bot.bot_type ?? "dm"} bot
+            </div>
+          </div>
+          <StatusBadge status={bot.status} />
+        </div>
+
+        {/* Tab bar */}
+        <div className="tab-bar" style={{ marginBottom: "1rem" }}>
+          {TABS.map(({ id, label }) => (
+            <button key={id} className={`tab-btn ${tab === id ? "active" : ""}`}
+              onClick={() => setTab(id)}>{label}</button>
+          ))}
+        </div>
+
+        {msg.text && (
+          <Alert type={msg.ok ? "success" : "error"} style={{ marginBottom: "0.75rem" }}>{msg.text}</Alert>
+        )}
+
+        {/* ── Info ── */}
+        {tab === "info" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.875rem" }}>
+            <div className="field">
+              <label className="field-label">Bot name</label>
+              <input className="input" value={form.bot_name} onChange={set("bot_name")} />
+            </div>
+            <div className="field">
+              <label className="field-label">Description</label>
+              <input className="input" placeholder="What does this bot do?" value={form.description} onChange={set("description")} />
+            </div>
+            <div className="field">
+              <label className="field-label">Website URL <span style={{ fontSize: "0.75rem", color: "var(--text3)" }}>(used in product-not-found replies)</span></label>
+              <input className="input" type="url" placeholder="https://yourstore.com" value={form.website_url} onChange={set("website_url")} />
+            </div>
+            <div style={{ display: "flex", gap: "1.25rem", fontSize: "0.8125rem", color: "var(--text3)", padding: "0.25rem 0" }}>
+              <span>Created: <strong style={{ color: "var(--text2)" }}>{fmtDate(bot.created_at)}</strong></span>
+              <span>Messages: <strong style={{ color: "var(--text2)" }}>{(bot.messages_count ?? 0).toLocaleString()}</strong></span>
+              <span>Type: <strong style={{ color: "var(--accent)" }}>{bot.bot_type ?? "dm"}</strong></span>
+            </div>
+          </div>
+        )}
+
+        {/* ── Sales Agent ── */}
+        {tab === "sales" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "1.125rem" }}>
+            <div className="toggle-row">
+              <div>
+                <div className="toggle-label">Enable Sales Agent</div>
+                <div className="toggle-desc">Welcome message, product catalog, and smart product lookup</div>
+              </div>
+              <label className="toggle">
+                <input type="checkbox" checked={!!sac.enabled} onChange={setSac("enabled")} />
+                <span className="toggle-track" />
+              </label>
+            </div>
+
+            {sac.enabled && (<>
+              <div className="field">
+                <label className="field-label">Welcome message</label>
+                <textarea className="input" rows={3}
+                  placeholder="Welcome. Type /catalog to see our products."
+                  value={sac.greeting ?? ""} onChange={setSac("greeting")} />
+                <span className="field-hint">Used as the first-message welcome text for direct messages.</span>
+              </div>
+
+              <div className="toggle-row">
+                <div>
+                  <div className="toggle-label">Send welcome on first DM</div>
+                  <div className="toggle-desc">Greets a person once when they first message the bot</div>
+                </div>
+                <label className="toggle">
+                  <input type="checkbox" checked={!!sac.welcome_enabled} onChange={setSac("welcome_enabled")} />
+                  <span className="toggle-track" />
+                </label>
+              </div>
+
+              <div className="field">
+                <label className="field-label">Group welcome message</label>
+                <textarea className="input" rows={3}
+                  placeholder="Welcome to the group, {name}!"
+                  value={sac.group_welcome ?? ""} onChange={setSac("group_welcome")} />
+                <span className="field-hint">Optional. For group bots, `{name}` is replaced with the participant number.</span>
+              </div>
+
+              <div className="toggle-row">
+                <div>
+                  <div className="toggle-label">Auto-send catalog on request</div>
+                  <div className="toggle-desc">Sends catalog when someone says "catalog", "products", "price", "menu"</div>
+                </div>
+                <label className="toggle">
+                  <input type="checkbox" checked={!!sac.show_catalog_on_keyword} onChange={setSac("show_catalog_on_keyword")} />
+                  <span className="toggle-track" />
+                </label>
+              </div>
+
+              <div className="field">
+                <label className="field-label">"Product not available" message</label>
+                <input className="input" placeholder={form.website_url ? `Product not available. Check: ${form.website_url}` : "Product not available. Our seller will be in touch shortly."}
+                  value={form.catalog_unavail_msg} onChange={set("catalog_unavail_msg")} />
+                <span className="field-hint">Leave blank to auto-generate. If you set a Website URL, it'll be included.</span>
+              </div>
+
+              {/* Product catalog */}
+              <div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.5rem" }}>
+                  <div style={{ fontWeight: 600, fontSize: "0.875rem" }}>Product catalog ({products.length})</div>
+                  <div style={{ display: "flex", gap: "0.5rem" }}>
+                    <button className="btn btn-ghost btn-sm" onClick={() => setShowBulk((v) => !v)}>
+                      {showBulk ? "Hide" : "📋 Bulk paste"}
+                    </button>
+                    <button className="btn btn-ghost btn-sm" onClick={addProduct}>+ Add</button>
+                  </div>
+                </div>
+
+                {showBulk && (
+                  <div style={{ background: "var(--bg)", border: "1px solid var(--border-accent)", borderRadius: "var(--radius)", padding: "0.875rem", marginBottom: "0.75rem" }}>
+                    <div style={{ fontSize: "0.8rem", color: "var(--text2)", marginBottom: "0.5rem" }}>
+                      Paste products — one per line. Format: <code style={{ color: "var(--accent)" }}>Name | Price | Description</code>
+                    </div>
+                    <textarea className="input" rows={5} style={{ fontFamily: "monospace", fontSize: "0.825rem" }}
+                      placeholder={"iPhone 15 | 1200000 | Latest Apple smartphone\nSamsung S24 | 950000 | Android flagship\nAirPods Pro | 320000 | Noise cancelling earbuds"}
+                      value={bulkPaste} onChange={(e) => setBulkPaste(e.target.value)} />
+                    <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+                      <button className="btn btn-primary btn-sm" onClick={applyBulkPaste}>Add products</button>
+                      <button className="btn btn-ghost btn-sm" onClick={() => { setBulkPaste(""); setShowBulk(false); }}>Cancel</button>
+                    </div>
+                  </div>
+                )}
+
+                {products.length === 0 && !showBulk && (
+                  <div style={{ padding: "1rem", textAlign: "center", color: "var(--text3)", fontSize: "0.875rem", background: "var(--bg)", borderRadius: "var(--radius)", border: "1px dashed var(--border)" }}>
+                    No products yet. Use "Bulk paste" to add multiple at once, or "Add" for one at a time.
+                  </div>
+                )}
+
+                {products.map((p, i) => (
+                  <div key={i} style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem", marginBottom: "0.5rem", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                    <div style={{ display: "flex", gap: "0.5rem" }}>
+                      <input className="input" style={{ flex: 2 }} placeholder="Product name" value={p.name} onChange={(e) => setProduct(i, "name", e.target.value)} />
+                      <input className="input" style={{ flex: 1 }} placeholder="₦ Price" value={p.price} onChange={(e) => setProduct(i, "price", e.target.value)} />
+                      <button className="btn btn-danger btn-icon" onClick={() => removeProduct(i)}>✕</button>
+                    </div>
+                    <input className="input" placeholder="Short description (optional)" value={p.description} onChange={(e) => setProduct(i, "description", e.target.value)} />
+                  </div>
+                ))}
+              </div>
+            </>)}
+
+            {/* Keyword triggers */}
+            <div>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.5rem" }}>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: "0.875rem" }}>Keyword triggers ({form.keyword_triggers.length})</div>
+                  <div style={{ fontSize: "0.75rem", color: "var(--text3)", marginTop: "0.1rem" }}>Reply with specific text when a keyword is detected</div>
+                </div>
+                <button className="btn btn-ghost btn-sm" onClick={addTrigger}>+ Add</button>
+              </div>
+              {form.keyword_triggers.length === 0 && (
+                <div style={{ padding: "1rem", textAlign: "center", color: "var(--text3)", fontSize: "0.875rem", background: "var(--bg)", borderRadius: "var(--radius)", border: "1px dashed var(--border)" }}>
+                  Example: keyword "delivery" → "We deliver within 3–5 business days."
+                </div>
+              )}
+              {form.keyword_triggers.map((t, i) => {
+                const matchType = t.matchType ?? (t.exact_match ? "exact" : "contains");
+                const enabled   = t.enabled !== false;
+                return (
+                  <div key={t.id ?? i} style={{ background: "var(--bg)", border: `1px solid ${enabled ? "var(--border)" : "rgba(244,63,94,0.2)"}`, borderRadius: "var(--radius)", padding: "0.875rem", marginBottom: "0.5rem", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                    <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", flexWrap: "wrap" }}>
+                      <input className="input" style={{ flex: 2, minWidth: "100px" }} placeholder="Keyword / pattern"
+                        value={t.keyword} onChange={(e) => setTrigger(i, "keyword", e.target.value)} />
+                      <select className="input" style={{ flex: "0 0 auto", minWidth: "120px" }}
+                        value={matchType}
+                        onChange={(e) => setTrigger(i, "matchType", e.target.value)}>
+                        <option value="contains">Contains</option>
+                        <option value="exact">Exact match</option>
+                        <option value="starts_with">Starts with</option>
+                        <option value="ends_with">Ends with</option>
+                        <option value="regex">Regex</option>
+                      </select>
+                      <label style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: "0.78rem", color: "var(--text2)", cursor: "pointer", flexShrink: 0 }}>
+                        <input type="checkbox" checked={enabled}
+                          onChange={(e) => setTrigger(i, "enabled", e.target.checked)} />
+                        On
+                      </label>
+                      <button className="btn btn-danger btn-icon" onClick={() => removeTrigger(i)}>✕</button>
+                    </div>
+                    <textarea className="input" rows={2} placeholder="Reply message…"
+                      value={t.response} onChange={(e) => setTrigger(i, "response", e.target.value)} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* ── Commands ── */}
+        {tab === "commands" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+            <div style={{ fontSize: "0.875rem", color: "var(--text3)", marginBottom: "0.25rem" }}>
+              Default commands are built-in. Toggle any off instantly — no redeployment needed.
+              {isPro && " Pro users can also set custom responses."}
+              {!isPro && <span style={{ color: "var(--accent)" }}> Custom responses require Pro.</span>}
+            </div>
+            {DEFAULT_COMMANDS.map((cmd) => {
+              const cfg     = form.commands_config[cmd.key] ?? {};
+              const enabled = cfg.enabled !== false;
+              return (
+                <div key={cmd.key} style={{
+                  background: "var(--bg)", border: `1px solid ${enabled ? "var(--border)" : "rgba(244,63,94,0.2)"}`,
+                  borderRadius: "var(--radius)", padding: "0.875rem",
+                  opacity: enabled ? 1 : 0.6
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", marginBottom: isPro && enabled ? "0.625rem" : 0 }}>
+                    <code style={{ background: "var(--card2)", padding: "0.25rem 0.5rem", borderRadius: "6px", fontSize: "0.8rem", color: "var(--accent)", flexShrink: 0 }}>{cmd.trigger}</code>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: "0.875rem", fontWeight: 500, color: "var(--text)" }}>{cmd.desc}</div>
+                    </div>
+                    <label className="toggle">
+                      <input type="checkbox" checked={enabled} onChange={() => toggleCommand(cmd.key)} />
+                      <span className="toggle-track" />
+                    </label>
+                  </div>
+                  {isPro && enabled && (
+                    <input className="input" style={{ fontSize: "0.825rem" }}
+                      placeholder="Custom response (leave blank for default)"
+                      value={cfg.custom_response ?? ""}
+                      onChange={(e) => setCommandResponse(cmd.key, e.target.value)} />
+                  )}
+                </div>
+              );
+            })}
+
+            <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.75rem" }}>
+                <Zap size={16} color="var(--accent)" />
+                <div style={{ fontSize: "0.875rem", fontWeight: 600 }}>Automated reply timing</div>
+              </div>
+              <div style={{ display: "flex", gap: "0.75rem" }}>
+                <div className="field" style={{ flex: 1, marginBottom: 0 }}>
+                  <label className="field-label">Minimum delay (ms)</label>
+                  <input
+                    className="input"
+                    type="number"
+                    min={0}
+                    max={120000}
+                    value={form.commands_config.reply_timing?.min_ms ?? 1000}
+                    onChange={(e) =>
+                      setForm((p) => ({
+                        ...p,
+                        commands_config: normalizeCommandsConfigState({
+                          ...p.commands_config,
+                          reply_timing: {
+                            ...(p.commands_config.reply_timing ?? {}),
+                            min_ms: Number(e.target.value),
+                          },
+                        }),
+                      }))
+                    }
+                  />
+                </div>
+                <div className="field" style={{ flex: 1, marginBottom: 0 }}>
+                  <label className="field-label">Maximum delay (ms)</label>
+                  <input
+                    className="input"
+                    type="number"
+                    min={0}
+                    max={120000}
+                    value={form.commands_config.reply_timing?.max_ms ?? 12000}
+                    onChange={(e) =>
+                      setForm((p) => ({
+                        ...p,
+                        commands_config: normalizeCommandsConfigState({
+                          ...p.commands_config,
+                          reply_timing: {
+                            ...(p.commands_config.reply_timing ?? {}),
+                            max_ms: Number(e.target.value),
+                          },
+                        }),
+                      }))
+                    }
+                  />
+                </div>
+              </div>
+              <div className="field-hint" style={{ marginTop: "0.5rem" }}>
+                AI replies and auto-replies will wait for a random amount of time inside this range.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Webhook ── */}
+        {tab === "webhook" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.875rem" }}>
+            <div className="field">
+              <label className="field-label">Webhook URL</label>
+              <input className="input" type="url" placeholder="https://yourapp.com/webhook"
+                value={form.webhook_url} onChange={set("webhook_url")} />
+              <span className="field-hint">WaBot POSTs JSON to this URL on every incoming message.</span>
+            </div>
+            <div className="field">
+              <label className="field-label">Webhook secret (optional)</label>
+              <input className="input" type="password" placeholder="HMAC-SHA256 signing secret"
+                value={form.webhook_secret} onChange={set("webhook_secret")} />
+              <span className="field-hint">Verify payloads using the X-WaBot-Signature header.</span>
+            </div>
+            <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem", fontSize: "0.8rem" }}>
+              <div style={{ color: "var(--text3)", marginBottom: "0.5rem", fontWeight: 600 }}>Payload example:</div>
+              <pre className="mono" style={{ color: "var(--text2)", whiteSpace: "pre-wrap", wordBreak: "break-all", fontSize: "0.775rem" }}>
+                {JSON.stringify({ event: "message_received", botId: bot.id, from: "+2348012345678", body: "Hello!", type: "text", isGroup: false, timestamp: Date.now() }, null, 2)}
+              </pre>
+            </div>
+          </div>
+        )}
+
+        {/* ── Auto-reply ── */}
+        {tab === "autoreply" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.875rem" }}>
+            <div className="toggle-row">
+              <div>
+                <div className="toggle-label">Enable auto-reply</div>
+                <div className="toggle-desc">Reply to every message not handled by commands, keyword triggers, or AI</div>
+              </div>
+              <label className="toggle">
+                <input type="checkbox" checked={form.auto_reply_enabled} onChange={set("auto_reply_enabled")} />
+                <span className="toggle-track" />
+              </label>
+            </div>
+            {form.auto_reply_enabled && (
+              <div className="field">
+                <label className="field-label">Auto-reply message</label>
+                <textarea className="input" rows={4} style={{ resize: "vertical" }}
+                  placeholder="Hi! Thanks for reaching out. We'll get back to you soon."
+                  value={form.auto_reply_message} onChange={set("auto_reply_message")} />
+                <span className="field-hint">Fallback when no other handler matches.</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── AI ── */}
+        {tab === "ai" && !isPro && (
+            <div style={{ textAlign: "center", padding: "2rem 1rem" }}>
+            <div style={{ display: "flex", justifyContent: "center", marginBottom: "1rem", color: "var(--warning)" }}><Shield size={34} /></div>
+            <h4 style={{ marginBottom: "0.5rem" }}>AI integration is a Pro feature</h4>
+            <p style={{ color: "var(--text2)", fontSize: "0.875rem", marginBottom: "1.25rem" }}>
+              Upgrade to Pro to give your bots an AI brain. Connect OpenAI, Gemini, Claude, Meta Llama, or Replit AI.
+            </p>
+            <a href="#pricing" className="btn btn-primary">Upgrade to Pro — ₦1,500/mo</a>
+          </div>
+        )}
+
+        {tab === "ai" && isPro && (() => {
+          const botType   = bot.bot_type ?? "dm";
+          const hasDm     = botType === "dm"    || botType === "all";
+          const hasGroup  = botType === "group"  || botType === "all";
+          const dmEnabled     = form.ai_config.dm_enabled     !== false;
+          const groupsEnabled = form.ai_config.groups_enabled === true;
+
+          return (
+            <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+
+              <div className="toggle-row">
+                <div>
+                  <div className="toggle-label">Enable AI responses</div>
+                  <div className="toggle-desc">Bot uses AI when no keyword trigger or command matches</div>
+                </div>
+                <label className="toggle">
+                  <input type="checkbox" checked={!!form.ai_config.enabled} onChange={setAi("enabled")} />
+                  <span className="toggle-track" />
+                </label>
+              </div>
+
+              {form.ai_config.enabled && (<>
+                <div className="field">
+                  <label className="field-label">AI Provider</label>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "0.5rem" }}>
+                    {AI_PROVIDERS.map((p) => (
+                      <button key={p.id} type="button"
+                        onClick={() => setForm((f) => ({ ...f, ai_config: { ...f.ai_config, provider: p.id, model: p.models[0] } }))}
+                        style={{
+                          padding: "0.625rem 0.5rem",
+                          borderRadius: "var(--radius)",
+                          border: `1.5px solid ${form.ai_config.provider === p.id ? "var(--accent)" : "var(--border)"}`,
+                          background: form.ai_config.provider === p.id ? "var(--accent-dim)" : "var(--bg)",
+                          cursor: "pointer", fontSize: "0.8rem", fontWeight: 600,
+                          color: form.ai_config.provider === p.id ? "var(--accent)" : "var(--text2)",
+                          display: "flex", flexDirection: "column", alignItems: "center", gap: "0.2rem"
+                        }}>
+                        <span>{p.short}</span>
+                        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "100%" }}>{p.name.split(" ")[0]}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="field">
+                  <label className="field-label">Model</label>
+                  <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+                    <select className="input" value={form.ai_config.model || selectedProvider.models[0]}
+                      onChange={setAi("model")} style={{ flex: 1 }}>
+                      {selectedProvider.models.map((m) => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                    <a href={selectedProvider.applyUrl} target="_blank" rel="noopener noreferrer"
+                      className="btn btn-secondary btn-sm" style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
+                      Get API key ↗
+                    </a>
+                  </div>
+                </div>
+
+                <div className="field">
+                  <label className="field-label">
+                    API Key
+                    {form.ai_config.has_key && (
+                      <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", color: "var(--success)" }}>✓ Key saved</span>
+                    )}
+                    {form.ai_config.is_sensitive && form.ai_config.has_key && (
+                      <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", color: "var(--warning)" }}>Sensitive — not viewable</span>
+                    )}
+                  </label>
+                  <div style={{ position: "relative" }}>
+                    <input
+                      className="input"
+                      type={aiKeyVisible ? "text" : "password"}
+                      placeholder={aiKeyCleared
+                        ? "Saved API key will be cleared on save"
+                        : form.ai_config.has_key
+                          ? "Enter new key to replace…"
+                          : `Paste your ${selectedProvider.name} API key…`}
+                      value={aiKeyInput}
+                      onChange={(e) => {
+                        setAiKeyInput(e.target.value);
+                        if (e.target.value.trim()) setAiKeyCleared(false);
+                      }}
+                      style={{ paddingRight: "3rem" }}
+                    />
+                    <button type="button"
+                      onClick={() => setAiKeyVisible((v) => !v)}
+                      style={{ position: "absolute", right: "0.75rem", top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: "var(--text3)", fontSize: "1.2rem" }}>
+                      {aiKeyVisible ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
+                  </div>
+                  <span className="field-hint">Key is encrypted and stored securely. Saving a new key replaces the old one immediately.</span>
+
+                  {/* ── Test key button ── */}
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
+                    <button type="button" className="btn btn-secondary btn-sm"
+                      disabled={aiKeyTest.status === "loading" || aiKeyCleared || (!aiKeyInput && !form.ai_config.has_key)}
+                      onClick={async () => {
+                        setAiKeyTest({ status: "loading", msg: "" });
+                        try {
+                          const result = await botsApi.testAiKey(
+                            bot.id,
+                            form.ai_config.provider,
+                            aiKeyInput || undefined
+                          );
+                          setAiKeyTest({
+                            status: result.ok ? "ok" : "error",
+                            msg: result.ok ? "Key is valid and working!" : (result.error || "Key is invalid")
+                          });
+                        } catch (err) {
+                          setAiKeyTest({ status: "error", msg: err.message || "Test failed" });
+                        }
+                      }}>
+                      {aiKeyTest.status === "loading" ? <><Spinner size="sm" /> Testing…</> : "Test key"}
+                    </button>
+                    {form.ai_config.has_key && (
+                      <button
+                        type="button"
+                        className={`btn btn-sm ${aiKeyCleared ? "btn-danger" : "btn-ghost"}`}
+                        onClick={() => {
+                          setAiKeyInput("");
+                          setAiKeyVisible(false);
+                          setAiKeyTest({ status: "idle", msg: "" });
+                          setAiKeyCleared((current) => !current);
+                        }}
+                      >
+                        {aiKeyCleared ? "Key will be cleared" : "Clear saved key"}
+                      </button>
+                    )}
+                    {aiKeyTest.status === "ok" && (
+                      <span style={{ fontSize: "0.8rem", color: "var(--success)", fontWeight: 500 }}>✓ {aiKeyTest.msg}</span>
+                    )}
+                    {aiKeyTest.status === "error" && (
+                      <span style={{ fontSize: "0.8rem", color: "var(--error)" }}>✗ {aiKeyTest.msg}</span>
+                    )}
+                    {aiKeyCleared && (
+                      <span style={{ fontSize: "0.8rem", color: "var(--warning)" }}>The saved API key will be removed when you save.</span>
+                    )}
+                  </div>
+
+                  <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginTop: "0.375rem", cursor: "pointer", fontSize: "0.875rem" }}>
+                    <input type="checkbox" checked={aiKeySensitive} onChange={(e) => setAiKeySensitive(e.target.checked)} />
+                    <span style={{ color: "var(--text2)" }}>
+                      Mark as <strong>very sensitive</strong> — after saving, the key cannot be viewed again (only replaced)
+                    </span>
+                  </label>
+                </div>
+
+                {hasDm && (
+                  <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+                    <div className="toggle-row" style={{ marginBottom: 0 }}>
+                      <div>
+                        <div className="toggle-label">AI in Direct Messages</div>
+                        <div className="toggle-desc">Reply with AI when someone messages the bot directly</div>
+                      </div>
+                      <label className="toggle">
+                        <input type="checkbox" checked={dmEnabled}
+                          onChange={(e) => setAiVal("dm_enabled", e.target.checked)} />
+                        <span className="toggle-track" />
+                      </label>
+                    </div>
+                    {dmEnabled && (
+                      <div className="field" style={{ marginBottom: 0 }}>
+                        <label className="field-label">DM trigger mode</label>
+                        <select className="input" value={form.ai_config.dm_trigger_mode ?? "all"}
+                          onChange={setAi("dm_trigger_mode")}>
+                          <option value="all">All messages — respond to every DM</option>
+                          <option value="keyword">Keyword — respond only when DM starts with prefix</option>
+                          <option value="mention">Mention — respond only when bot is @-tagged</option>
+                        </select>
+                        {(form.ai_config.dm_trigger_mode === "keyword") && (
+                          <input className="input" style={{ marginTop: "0.4rem" }}
+                            placeholder="Trigger prefix (default: @bot)"
+                            value={form.ai_config.trigger_prefix ?? ""}
+                            onChange={setAi("trigger_prefix")} />
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {hasGroup && (
+                  <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+                    <div className="toggle-row" style={{ marginBottom: 0 }}>
+                      <div>
+                        <div className="toggle-label">AI in Group Chats</div>
+                        <div className="toggle-desc">Reply with AI in groups (bot must be admin)</div>
+                      </div>
+                      <label className="toggle">
+                        <input type="checkbox" checked={groupsEnabled}
+                          onChange={(e) => setAiVal("groups_enabled", e.target.checked)} />
+                        <span className="toggle-track" />
+                      </label>
+                    </div>
+                    {groupsEnabled && (<>
+                      <div className="field" style={{ marginBottom: 0 }}>
+                        <label className="field-label">Group trigger mode</label>
+                        <select className="input" value={form.ai_config.group_trigger_mode ?? "mention"}
+                          onChange={setAi("group_trigger_mode")}>
+                          <option value="mention">Mention — respond only when bot is @-tagged (recommended)</option>
+                          <option value="all">All messages — respond to every group message</option>
+                          <option value="keyword">Keyword — respond only when message starts with prefix</option>
+                        </select>
+                        {(form.ai_config.group_trigger_mode === "keyword") && (
+                          <input className="input" style={{ marginTop: "0.4rem" }}
+                            placeholder="Trigger prefix (default: @bot)"
+                            value={form.ai_config.trigger_prefix ?? ""}
+                            onChange={setAi("trigger_prefix")} />
+                        )}
+                      </div>
+                      <div className="field" style={{ marginBottom: 0 }}>
+                        <label className="field-label">
+                          Group system prompt
+                          <span style={{ fontWeight: 400, color: "var(--text3)", marginLeft: "0.4rem", fontSize: "0.75rem" }}>(optional — overrides shared prompt for groups)</span>
+                        </label>
+                        <textarea className="input" rows={3} style={{ resize: "vertical" }}
+                          placeholder="You are a group moderator assistant. Be brief and community-focused…"
+                          value={form.ai_config.group_system_prompt ?? ""}
+                          onChange={setAi("group_system_prompt")} />
+                      </div>
+                    </>)}
+                  </div>
+                )}
+
+                <div className="field">
+                  <label className="field-label">
+                    System prompt
+                    {hasGroup && groupsEnabled && (
+                      <span style={{ fontWeight: 400, color: "var(--text3)", marginLeft: "0.4rem", fontSize: "0.75rem" }}>(used for DMs; groups use the group prompt above if set)</span>
+                    )}
+                  </label>
+                  <textarea className="input" rows={4} style={{ resize: "vertical" }}
+                    placeholder={`You are a helpful WhatsApp assistant for [your business name]. Be friendly and concise. Answer in 1-3 sentences. If asked about products you don't know about, say you don't have info about that.`}
+                    value={form.ai_config.system_prompt ?? ""}
+                    onChange={setAi("system_prompt")} />
+                  <span className="field-hint">Instructions for the AI. Include your business name, tone, and what the bot should/shouldn't do.</span>
+                </div>
+
+                <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+                  <div className="toggle-row" style={{ marginBottom: 0 }}>
+                    <div>
+                      <div className="toggle-label">Assistant mode</div>
+                      <div className="toggle-desc">Pro-only receptionist flow for non-admin chats. Admin numbers can still use `/leads`.</div>
+                    </div>
+                    <label className="toggle">
+                      <input
+                        type="checkbox"
+                        checked={!!form.ai_config.assistant_enabled}
+                        onChange={(e) => setAiVal("assistant_enabled", e.target.checked)}
+                      />
+                      <span className="toggle-track" />
+                    </label>
+                  </div>
+
+                  {form.ai_config.assistant_enabled && (
+                    <div className="field" style={{ marginBottom: 0 }}>
+                      <label className="field-label">Assistant admin numbers</label>
+                      <textarea
+                        className="input"
+                        rows={2}
+                        style={{ resize: "vertical" }}
+                        placeholder="2348012345678, 2348099999999"
+                        value={Array.isArray(form.ai_config.assistant_admin_numbers) ? form.ai_config.assistant_admin_numbers.join(", ") : ""}
+                        onChange={(e) => setAiVal(
+                          "assistant_admin_numbers",
+                          e.target.value.split(/[\n,]/).map((value) => value.replace(/[^\d]/g, "")).filter(Boolean)
+                        )}
+                      />
+                      <span className="field-hint">Only these numbers can bypass receptionist mode and use the `/leads` command.</span>
+                    </div>
+                  )}
+
+                  <div className="toggle-row" style={{ marginBottom: 0 }}>
+                    <div>
+                      <div className="toggle-label">Conversation memory</div>
+                      <div className="toggle-desc">Keep a tiny slice of recent chat so the bot follows the flow without sending full transcripts every time</div>
+                    </div>
+                    <label className="toggle">
+                      <input
+                        type="checkbox"
+                        checked={form.ai_config.conversation_memory_enabled !== false}
+                        onChange={(e) => setAiVal("conversation_memory_enabled", e.target.checked)}
+                      />
+                      <span className="toggle-track" />
+                    </label>
+                  </div>
+
+                  {form.ai_config.conversation_memory_enabled !== false && (
+                    <div style={{ display: "flex", gap: "0.75rem" }}>
+                      <div className="field" style={{ flex: 1, marginBottom: 0 }}>
+                        <label className="field-label">Recent messages</label>
+                        <input
+                          className="input"
+                          type="number"
+                          min={0}
+                          max={12}
+                          value={form.ai_config.memory_message_limit ?? 6}
+                          onChange={(e) => setAiVal("memory_message_limit", Number(e.target.value))}
+                        />
+                      </div>
+                      <div className="field" style={{ flex: 1, marginBottom: 0 }}>
+                        <label className="field-label">Memory char budget</label>
+                        <input
+                          className="input"
+                          type="number"
+                          min={0}
+                          max={6000}
+                          step={100}
+                          value={form.ai_config.memory_char_limit ?? 1200}
+                          onChange={(e) => setAiVal("memory_char_limit", Number(e.target.value))}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="field-hint">
+                    Default is 6 recent messages and about 1200 characters. Smaller numbers save tokens faster.
+                  </div>
+                </div>
+
+                <div style={{ background: "var(--info-bg)", border: "1px solid var(--border-accent)", borderRadius: "var(--radius)", padding: "0.75rem", fontSize: "0.8rem", color: "var(--text2)" }}>
+                  <strong>Priority order:</strong> Commands → Keyword triggers → AI response → Auto-reply fallback
+                </div>
+              </>)}
+            </div>
+          );
+        })()}
+
+        {/* ── Group Management ── */}
+        {tab === "group" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "1.125rem" }}>
+
+            <div style={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem 1rem", display: "flex", alignItems: "center", gap: "0.75rem" }}>
+              <Shield size={22} color="var(--accent)" />
+              <div>
+                <div style={{ fontWeight: 700, fontSize: "1.1rem" }}>
+                  {adminGroups === null ? "—" : adminGroups.count}
+                </div>
+                <div style={{ fontSize: "0.8rem", color: "var(--text3)" }}>
+                  Groups where this bot is admin
+                  {adminGroups?.groups?.length > 0 && (
+                    <span style={{ display: "block", marginTop: "0.2rem" }}>
+                      {adminGroups.groups.map((g) => g.subject || g.id).join(", ")}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div style={{ background: "var(--info-bg)", border: "1px solid var(--border-accent)", borderRadius: "var(--radius)", padding: "0.75rem", fontSize: "0.8rem", color: "var(--text2)" }}>
+              <strong>Bot must be group admin</strong> for commands and moderation to work. If the bot is not an admin, it will silently ignore all group messages.
+            </div>
+
+            {/* Anti-link */}
+            <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem" }}>
+              <div className="toggle-row" style={{ marginBottom: gmc.anti_link?.enabled ? "0.75rem" : 0 }}>
+                <div>
+                  <div className="toggle-label">Anti-link</div>
+                  <div className="toggle-desc">Delete messages with URLs/links from non-admins</div>
+                </div>
+                <label className="toggle">
+                  <input type="checkbox" checked={!!gmc.anti_link?.enabled}
+                    onChange={(e) => setGmc("anti_link", "enabled", e.target.checked)} />
+                  <span className="toggle-track" />
+                </label>
+              </div>
+              {gmc.anti_link?.enabled && (
+                <div className="field" style={{ marginBottom: 0 }}>
+                  <label className="field-label">Action on violation</label>
+                  <select className="input" value={gmc.anti_link?.action ?? "warn"}
+                    onChange={(e) => setGmc("anti_link", "action", e.target.value)}>
+                    <option value="warn">Warn (3 strikes → remove)</option>
+                    <option value="kick">Immediately remove</option>
+                  </select>
+                </div>
+              )}
+            </div>
+
+            {/* Anti-spam */}
+            <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem" }}>
+              <div className="toggle-row" style={{ marginBottom: gmc.anti_spam?.enabled ? "0.75rem" : 0 }}>
+                <div>
+                  <div className="toggle-label">Anti-spam</div>
+                  <div className="toggle-desc">Warn or remove members who flood the group with messages</div>
+                </div>
+                <label className="toggle">
+                  <input type="checkbox" checked={!!gmc.anti_spam?.enabled}
+                    onChange={(e) => setGmc("anti_spam", "enabled", e.target.checked)} />
+                  <span className="toggle-track" />
+                </label>
+              </div>
+              {gmc.anti_spam?.enabled && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "0.625rem" }}>
+                  <div style={{ display: "flex", gap: "0.5rem" }}>
+                    <div className="field" style={{ flex: 1, marginBottom: 0 }}>
+                      <label className="field-label">Messages threshold</label>
+                      <input className="input" type="number" min={2} max={50}
+                        value={gmc.anti_spam?.threshold ?? 5}
+                        onChange={(e) => setGmc("anti_spam", "threshold", Number(e.target.value))} />
+                    </div>
+                    <div className="field" style={{ flex: 1, marginBottom: 0 }}>
+                      <label className="field-label">Within (seconds)</label>
+                      <input className="input" type="number" min={3} max={60}
+                        value={gmc.anti_spam?.window_seconds ?? 10}
+                        onChange={(e) => setGmc("anti_spam", "window_seconds", Number(e.target.value))} />
+                    </div>
+                  </div>
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label className="field-label">Action on violation</label>
+                    <select className="input" value={gmc.anti_spam?.action ?? "warn"}
+                      onChange={(e) => setGmc("anti_spam", "action", e.target.value)}>
+                      <option value="warn">Warn (3 strikes → remove)</option>
+                      <option value="kick">Immediately remove</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Anti-vulgar */}
+            <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem" }}>
+              <div className="toggle-row" style={{ marginBottom: gmc.anti_vulgar?.enabled ? "0.75rem" : 0 }}>
+                <div>
+                  <div className="toggle-label">Anti-vulgar / Word filter</div>
+                  <div className="toggle-desc">Delete messages containing banned words from non-admins</div>
+                </div>
+                <label className="toggle">
+                  <input type="checkbox" checked={!!gmc.anti_vulgar?.enabled}
+                    onChange={(e) => setGmc("anti_vulgar", "enabled", e.target.checked)} />
+                  <span className="toggle-track" />
+                </label>
+              </div>
+              {gmc.anti_vulgar?.enabled && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "0.625rem" }}>
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label className="field-label">Action on violation</label>
+                    <select className="input" value={gmc.anti_vulgar?.action ?? "warn"}
+                      onChange={(e) => setGmc("anti_vulgar", "action", e.target.value)}>
+                      <option value="warn">Warn (3 strikes → remove)</option>
+                      <option value="kick">Immediately remove</option>
+                    </select>
+                  </div>
+                  <div className="field" style={{ marginBottom: 0 }}>
+                    <label className="field-label">Banned words</label>
+                    <div style={{ display: "flex", gap: "0.4rem", marginBottom: "0.5rem" }}>
+                      <input className="input" placeholder="Type a word and press Add"
+                        value={vulgarInput} onChange={(e) => setVulgarInput(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), addVulgarWord())}
+                        style={{ flex: 1 }} />
+                      <button className="btn btn-secondary btn-sm" onClick={addVulgarWord} type="button">Add</button>
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "0.35rem" }}>
+                      {(gmc.anti_vulgar?.words ?? []).map((w) => (
+                        <span key={w} style={{ background: "rgba(244,63,94,0.12)", border: "1px solid rgba(244,63,94,0.3)", color: "var(--error)", borderRadius: "20px", padding: "0.15rem 0.6rem", fontSize: "0.8rem" }}>
+                          {w}
+                          <button onClick={() => removeVulgarWord(w)} style={{ background: "none", border: "none", cursor: "pointer", color: "inherit", padding: 0, lineHeight: 1 }}>×</button>
+                        </span>
+                      ))}
+                      {(gmc.anti_vulgar?.words ?? []).length === 0 && (
+                        <span style={{ color: "var(--text3)", fontSize: "0.8rem" }}>No words added yet</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Group rules */}
+            <div className="field" style={{ marginBottom: 0 }}>
+              <label className="field-label">Group rules <span style={{ color: "var(--text3)", fontWeight: 400, fontSize: "0.75rem" }}>(shown with .rules command)</span></label>
+              <textarea className="input" rows={4} style={{ resize: "vertical" }}
+                placeholder={"1. Be respectful to all members.\n2. No spam or excessive self-promotion.\n3. No links without admin approval.\n4. Keep topics relevant to this group."}
+                value={gmc.rules ?? ""}
+                onChange={(e) => setGmcTop("rules", e.target.value)} />
+            </div>
+
+            <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "0.875rem", fontSize: "0.8rem", color: "var(--text2)" }}>
+              <div style={{ fontWeight: 600, marginBottom: "0.5rem" }}>Group commands (non-admins see .help):</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.25rem 1rem", fontFamily: "monospace", fontSize: "0.78rem" }}>
+                {[".help",".kick @user",".ban @user",".lock",".unlock",".promote @user",".demote @user",".warn @user",".warnings @user",".clearwarn @user",".tagall [msg]",".admins",".rules"].map((c) => (
+                  <span key={c} style={{ color: "var(--accent)" }}>{c}</span>
+                ))}
+              </div>
+              <div style={{ marginTop: "0.5rem", color: "var(--text3)" }}>Only group admins can use moderation commands. 3 auto-moderation strikes = removal.</div>
+            </div>
+          </div>
+        )}
+
+        {/* ── DM Help ── */}
+        {tab === "dmhelp" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "1.125rem" }}>
+            <div className="toggle-row">
+              <div>
+                <div className="toggle-label">Auto-send /help on first DM</div>
+                <div className="toggle-desc">When someone messages this bot for the first time, automatically send the command menu</div>
+              </div>
+              <label className="toggle">
+                <input type="checkbox" checked={!!gmc.auto_help_on_first_dm}
+                  onChange={(e) => setGmcTop("auto_help_on_first_dm", e.target.checked)} />
+                <span className="toggle-track" />
+              </label>
+            </div>
+            {gmc.auto_help_on_first_dm && (
+              <div style={{ background: "var(--bg)", border: "1px solid var(--border-accent)", borderRadius: "var(--radius)", padding: "0.875rem", fontSize: "0.8rem" }}>
+                <div style={{ fontWeight: 600, color: "var(--text2)", marginBottom: "0.5rem" }}>Preview message sent to new contacts:</div>
+                <pre style={{ color: "var(--text3)", fontFamily: "monospace", fontSize: "0.775rem", whiteSpace: "pre-wrap", margin: 0 }}>
+{`👋 *Welcome!*
+
+Here are the available commands:
+/help
+/catalog
+/price
+/contact
+/stop
+/agent
+/hours
+/order
+
+Reply with any command to get started.`}
+                </pre>
+                <div style={{ marginTop: "0.5rem", color: "var(--text3)" }}>
+                  Only enabled commands appear. Each contact only sees this once per bot session.
+                </div>
+              </div>
+            )}
+            {!gmc.auto_help_on_first_dm && (
+              <div style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "1.5rem", textAlign: "center", color: "var(--text3)", fontSize: "0.875rem" }}>
+                Enable the toggle above so new customers automatically know what commands are available without having to guess.
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── QR / Pairing Code Tab (UPDATED WITH BOTH METHODS) ── */}
+        {tab === "qr" && (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "1rem" }}>
+            
+            {/* Method selector - only show when bot is not connected */}
+            {(bot.status === "disconnected" || bot.status === "failed" || bot.status === "qr_timeout" || bot.status === "error" || bot.status === "connecting") && (
+              <div style={{ width: "100%", marginBottom: "0.5rem" }}>
+                <div style={{ display: "flex", gap: "0.5rem", justifyContent: "center" }}>
+                  <button 
+                    className={`btn ${qrMethod === "qr" ? "btn-primary" : "btn-secondary"}`}
+                    onClick={() => setQrMethod("qr")}
+                    style={{ flex: 1 }}
+                  >
+                    QR Code
+                  </button>
+                  <button 
+                    className={`btn ${qrMethod === "code" ? "btn-primary" : "btn-secondary"}`}
+                    onClick={() => setQrMethod("code")}
+                    style={{ flex: 1 }}
+                  >
+                    Pairing Code
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Bot is already connected */}
+            {bot.status === "connected" ? (
+              <div style={{ textAlign: "center", padding: "1.5rem" }}>
+                <div style={{ fontSize: "2.5rem", marginBottom: "0.75rem" }}>✅</div>
+                <div style={{ fontWeight: 700 }}>Bot is connected</div>
+                <div style={{ fontSize: "0.875rem", color: "var(--text2)", marginTop: "0.375rem" }}>
+                  This bot is linked to WhatsApp and active.
+                </div>
+                <div style={{ fontSize: "0.75rem", color: "var(--text3)", marginTop: "0.5rem" }}>
+                  To reconnect with a new number, delete this bot and create a new one.
+                </div>
+              </div>
+            ) : qrMethod === "code" ? (
+              // SHOW PAIRING CODE PROMINENTLY
+              <div style={{ textAlign: "center", width: "100%" }}>
+                {pairingCode ? (
+                  <>
+                    <div style={{ 
+                      fontSize: "2.5rem", 
+                      fontWeight: "bold", 
+                      letterSpacing: "0.5rem",
+                      background: "linear-gradient(135deg, var(--accent) 0%, #c084fc 100%)",
+                      padding: "1.5rem",
+                      borderRadius: "var(--radius-xl)",
+                      fontFamily: "monospace",
+                      color: "white",
+                      textShadow: "0 2px 4px rgba(0,0,0,0.2)",
+                      marginBottom: "1rem"
+                    }}>
+                      {pairingCode}
+                    </div>
+                    
+                    <div style={{ 
+                      background: "var(--accent-dim)", 
+                      padding: "1rem", 
+                      borderRadius: "var(--radius)",
+                      marginBottom: "1rem",
+                      textAlign: "left"
+                    }}>
+                      <p style={{ fontWeight: "bold", marginBottom: "0.5rem" }}>📋 Instructions:</p>
+                      <ol style={{ marginLeft: "1.25rem", color: "var(--text2)", lineHeight: "1.8" }}>
+                        <li>Open WhatsApp on your <strong>phone</strong></li>
+                        <li>Go to <strong>Settings</strong> (iOS) or <strong>three-dot menu</strong> (Android)</li>
+                        <li>Tap <strong>Linked Devices</strong></li>
+                        <li>Tap <strong>Link with phone number</strong></li>
+                        <li>Enter this code: <strong style={{ color: "var(--accent)", fontSize: "1.1rem" }}>{pairingCode}</strong></li>
+                      </ol>
+                    </div>
+
+                    {pairingExpiresAt && (
+                      <p style={{ fontSize: "0.875rem", color: "var(--text3)" }}>
+                        ⏱ Code expires: {new Date(pairingExpiresAt).toLocaleTimeString()}
+                      </p>
+                    )}
+                    
+                    <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem", justifyContent: "center", flexWrap: "wrap" }}>
+                      <button className="btn btn-secondary" onClick={refreshPairingCode} disabled={generatingCode}>
+                        {generatingCode ? <Spinner size="sm" /> : "⟳ Refresh Code"}
+                      </button>
+                      <button className="btn btn-primary" onClick={requestNewPairingCode}>
+                        New Code
+                      </button>
+                    </div>
+                  </>
+                ) : showPhoneInput ? (
+                  <div style={{ width: "100%", marginTop: "1rem" }}>
+                    <p style={{ marginBottom: "0.5rem", color: "var(--text2)" }}>Choose a country and enter the local number. We format it automatically.</p>
+                    <div style={{ display: "grid", gridTemplateColumns: "180px 1fr", gap: "0.75rem", marginBottom: "0.5rem" }}>
+                      <select className="input" value={pairCountry} onChange={(e) => setPairCountry(e.target.value)}>
+                        {PHONE_COUNTRIES.map((item) => (
+                          <option key={item.code} value={item.code}>
+                            {item.name} (+{item.dialCode})
+                          </option>
+                        ))}
+                      </select>
+                      <input 
+                        className="input" 
+                        placeholder={selectedPairCountry.example} 
+                        value={phoneNumberInput}
+                        onChange={(e) => setPhoneNumberInput(e.target.value)}
+                      />
+                    </div>
+                    <div style={{ marginBottom: "0.75rem", fontSize: "0.8rem", color: "var(--text3)" }}>
+                      Final WhatsApp number: {normalizedPairPhone ? `+${normalizedPairPhone}` : "waiting for number"}
+                    </div>
+                    <div style={{ display: "flex", gap: "0.5rem" }}>
+                      <button 
+                        className="btn btn-secondary" 
+                        onClick={() => setShowPhoneInput(false)}
+                        style={{ flex: 1 }}
+                      >
+                        Cancel
+                      </button>
+                      <button 
+                        className="btn btn-primary" 
+                        onClick={generateNewPairingCode}
+                        disabled={!normalizedPairPhone || generatingCode}
+                        style={{ flex: 1 }}
+                      >
+                        {generatingCode ? <Spinner size="sm" /> : "Generate Code"}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button className="btn btn-primary" onClick={requestNewPairingCode}>
+                    Generate Pairing Code
+                  </button>
+                )}
+              </div>
+            ) : (bot.status === "disconnected" || bot.status === "failed" || bot.status === "qr_timeout" || bot.status === "error") && !qrUrl ? (
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "1rem", padding: "1.5rem", textAlign: "center" }}>
+                <div className="inline-flex h-16 w-16 items-center justify-center rounded-3xl bg-[var(--accent-dim)] text-[var(--accent)]">
+                  {bot.status === "failed" ? <Shield size={28} /> : <Phone size={28} />}
+                </div>
+                <div style={{ fontWeight: 700, color: "var(--text)" }}>
+                  {bot.status === "failed" ? "Bot failed to reconnect" : "Bot is disconnected"}
+                </div>
+                <div style={{ fontSize: "0.8125rem", color: "var(--text2)", maxWidth: "320px", lineHeight: 1.5 }}>
+                  {bot.status === "failed"
+                    ? "Maximum reconnect attempts reached. Click Reconnect to start a fresh session."
+                    : bot.status === "qr_timeout"
+                    ? "QR code was not scanned within 2 minutes. Click Reconnect to generate a new one."
+                    : "The WhatsApp session has ended. Click Reconnect to start a new session."}
+                </div>
+                {reconnectMsg && (
+                  <Alert type={reconnectMsg.startsWith("✓") ? "success" : "error"}>{reconnectMsg}</Alert>
+                )}
+                <button
+                  className="btn btn-primary"
+                  style={{ minWidth: "160px" }}
+                  disabled={reconnecting}
+                  onClick={async () => {
+                    setReconnecting(true);
+                    setReconnectMsg("");
+                    try {
+                      await botsApi.reconnect(bot.id);
+                      setReconnectMsg("✓ Reconnect initiated — a QR/pairing code will appear shortly.");
+                    } catch (err) {
+                      setReconnectMsg(err.message ?? "Reconnect failed. Please try again.");
+                    } finally {
+                      setReconnecting(false);
+                    }
+                  }}
+                >
+                  {reconnecting ? <><Spinner size="sm" /> Reconnecting…</> : "Reconnect"}
+                </button>
+              </div>
+            ) : qrUrl ? (
+              // Show QR code
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.625rem", width: "100%" }}>
+                <p style={{ fontSize: "0.8125rem", color: "var(--text2)", textAlign: "center", margin: 0 }}>
+                  Open WhatsApp → <strong>Linked Devices</strong> → <strong>Link a Device</strong>, then scan:
+                </p>
+
+                <div style={{ position: "relative", display: "inline-block" }}>
+                  <div
+                    className="qr-wrap"
+                    style={{
+                      opacity:    qrExpired ? 0.35 : 1,
+                      transition: "opacity 0.4s ease",
+                      filter:     qrExpired ? "blur(2px)" : "none",
+                    }}
+                  >
+                    <img src={qrUrl} alt="WhatsApp QR code" />
+                  </div>
+                  {qrExpired && (
+                    <div style={{
+                      position:       "absolute",
+                      inset:          0,
+                      display:        "flex",
+                      flexDirection:  "column",
+                      alignItems:     "center",
+                      justifyContent: "center",
+                      gap:            "0.5rem",
+                      borderRadius:   "var(--radius)",
+                      background:     "rgba(10,10,15,0.55)",
+                      backdropFilter: "blur(4px)",
+                    }}>
+                      <Spinner size="md" />
+                      <span style={{ fontSize: "0.75rem", color: "#fff", fontWeight: 600 }}>
+                        Refreshing QR…
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ fontSize: "0.75rem", color: "var(--text3)", textAlign: "center" }}>
+                  {qrExpired ? (
+                    <span style={{ color: "var(--warning)" }}>⟳ Waiting for new QR code from WhatsApp…</span>
+                  ) : (
+                    <>
+                      Refreshes in{" "}
+                      <strong style={{ color: qrCountdown <= 10 ? "var(--warning)" : "var(--text2)" }}>
+                        {qrCountdown}s
+                      </strong>
+                    </>
+                  )}
+                </div>
+
+                <div style={{
+                  fontSize: "0.75rem", color: "var(--text3)",
+                  background: "var(--bg)", border: "1px solid var(--border)",
+                  borderRadius: "var(--radius)", padding: "0.5rem 0.75rem",
+                  width: "100%", textAlign: "center"
+                }}>
+                  The QR code rotates every ~60 s. A new one loads automatically if it expires.
+                </div>
+              </div>
+            ) : (
+              <div style={{ padding: "2rem", display: "flex", flexDirection: "column", alignItems: "center", gap: "0.75rem" }}>
+                <Spinner size="lg" />
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ fontSize: "0.875rem", color: "var(--text2)", fontWeight: 600 }}>
+                    {bot.status === "connecting" || bot.status === "reconnecting"
+                      ? "Connecting to WhatsApp…"
+                      : "Generating connection code…"}
+                  </div>
+                  <div style={{ fontSize: "0.75rem", color: "var(--text3)", marginTop: "0.25rem" }}>
+                    This takes a few seconds. The code will appear here automatically.
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+      </div>
+
+      {tab !== "qr" && (
+        <button className="btn btn-primary w-full" onClick={save} disabled={saving || !hasUnsavedChanges}>
+          {saving ? <><Spinner size="sm" /> Saving…</> : hasUnsavedChanges ? "Save changes" : "No changes to save"}
+        </button>
+      )}
+    </Modal>
+  );
+}

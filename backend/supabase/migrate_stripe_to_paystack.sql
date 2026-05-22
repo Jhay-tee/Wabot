@@ -1,0 +1,2 @@
+-- Deprecated.
+-- Use backend/supabase/schema.sql as the single canonical SQL file for the full WaBot app.
