@@ -174,7 +174,13 @@ process.on('unhandledRejection', (reason) => {
   console.error('Unhandled rejection:', reason);
 });
 
-// Start everything
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`));
-startBot();
+// Start everything only when explicitly enabled via env var
+const LEGACY_ENABLED = String(process.env.LEGACY_BOT_ENABLED || "").toLowerCase() === "true";
+
+if (!LEGACY_ENABLED) {
+  console.log('legacy-bot: automatic startup is disabled. Set LEGACY_BOT_ENABLED=true to enable.');
+} else {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`));
+  startBot();
+}

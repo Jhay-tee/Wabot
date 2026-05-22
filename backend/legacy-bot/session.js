@@ -57,6 +57,9 @@ async function makeSupabaseAuthState() {
 }
 
 export const initSession = async () => {
+  const LEGACY_ENABLED = String(process.env.LEGACY_BOT_ENABLED || "").toLowerCase() === "true";
+  if (!LEGACY_ENABLED) throw new Error('legacy-bot: initSession blocked because LEGACY_BOT_ENABLED is not true');
+
   if (isConnecting) return socketInstance;
   isConnecting = true;
 

@@ -1,17 +1,10 @@
 // db.js
-import { createClient } from '@supabase/supabase-js';
-import { BufferJSON } from '@whiskeysockets/baileys';
 import 'dotenv/config';
+import { supabase } from '../src/lib/supabase.js';
+import { BufferJSON } from '@whiskeysockets/baileys';
 
-const url = process.env.SUPABASE_URL;
-const key = process.env.SUPABASE_ANON_KEY;
-
-if (!url || !key) {
-  console.error('Missing Supabase URL or ANON key');
-  process.exit(1);
-}
-
-const supabase = createClient(url, key);
+// NOTE: legacy-bot now reuses the main backend Supabase client (service_role key).
+// This ensures all backend writes use the service role and avoid RLS permission issues.
 
 // ────────────────────────────────────────────────
 // Auth session (Baileys v7 compatible – with BufferJSON)

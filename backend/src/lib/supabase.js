@@ -18,3 +18,16 @@ export const supabase = createClient(
     realtime: { transport: ws }
   }
 );
+
+// Optional anon client for read-only operations that may be needed in some legacy
+// code paths. Prefer using the server `supabase` (service-role) for all backend
+// operations. If SUPABASE_ANON_KEY is present, expose it as `supabaseAnon`.
+export const supabaseAnon = (function () {
+  const anonKey = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+  if (!anonKey) return null;
+  try {
+    return createClient(env.supabaseUrl, anonKey, { auth: { persistSession: false }, realtime: { transport: ws } });
+  } catch {
+    return null;
+  }
+})();
