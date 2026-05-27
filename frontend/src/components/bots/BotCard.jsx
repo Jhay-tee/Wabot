@@ -1,4 +1,4 @@
-import { Bot, MessageSquare, QrCode, RefreshCcw, Settings2, Trash2, Users, Globe2, Link2, Sparkles, Hash } from "lucide-react";
+import { Bot, FolderKanban, MessageSquare, QrCode, RefreshCcw, Settings2, Trash2, Users, Globe2, Link2, Sparkles, Hash } from "lucide-react";
 import { StatusBadge } from "../ui/Badge.jsx";
 import { Spinner } from "../ui/Spinner.jsx";
 import { timeAgo } from "../../utils/format.js";
@@ -9,7 +9,7 @@ const TYPE_ICON = {
   all: Globe2,
 };
 
-export function BotCard({ bot, onConfigure, onShowQr, onSendDM, onDelete, deleting }) {
+export function BotCard({ bot, onOpenPage, onConfigure, onShowQr, onSendDM, onDelete, deleting }) {
   const hasSalesAgent = bot.sales_agent_config?.enabled;
   const hasKeywords = Array.isArray(bot.keyword_triggers) && bot.keyword_triggers.length > 0;
   const needsReconnect = ["disconnected", "failed", "qr_timeout", "error", "connecting", "reconnecting"].includes(bot.status);
@@ -73,6 +73,10 @@ export function BotCard({ bot, onConfigure, onShowQr, onSendDM, onDelete, deleti
 
         {canSendDM && onSendDM && (
           <ActionButton success onClick={() => onSendDM(bot)} icon={MessageSquare} label="Send message" />
+        )}
+
+        {onOpenPage && (
+          <ActionButton onClick={() => onOpenPage(bot)} icon={FolderKanban} label="Open page" />
         )}
 
         <ActionButton onClick={() => onConfigure(bot)} icon={Settings2} label="Configure" />

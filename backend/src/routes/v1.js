@@ -82,18 +82,40 @@ function getConversationContactJid(row) {
   return meta.sender_jid || meta.chat_jid || meta.from || meta.to || null;
 }
 
-function normalizeConversationRow(row) {
+function normalizeConversationRow(row, { contact = null, unreadCount = 0 } = {}) {
   const meta = row?.metadata ?? {};
   const body = String(meta.body ?? row?.details ?? "").trim();
+  const isGroup = Boolean(
+    meta.isGroup ||
+    String(meta.chat_jid ?? meta.from ?? meta.to ?? "").includes("@g.us")
+  );
+  const contactJid = getConversationContactJid(row);
+  const chatJid = meta.chat_jid || meta.from || meta.to || null;
+  const rawTitle = contact?.display_name || meta.pushName || meta.displayName || meta.notifyName || "";
+  const fallbackTitle = isGroup
+    ? String(chatJid ?? "Group").replace("@g.us", "")
+    : String(contact?.phone_number || meta.sender_number || contactJid || chatJid || "Unknown")
+      .replace("@s.whatsapp.net", "")
+      .replace("@lid", "");
+  const title = String(rawTitle || fallbackTitle).trim();
+
   return {
     id: row.id,
     bot_id: row.bot_id,
     conversation_key: getConversationKey(row),
+    title,
     preview: body.slice(0, 200),
     metadata: meta,
     created_at: row.created_at,
+    last_message_at: row.created_at,
     direction: meta.direction || (row.event_type === "message_received" ? "inbound" : "outbound"),
-    unread: true,
+    unread: unreadCount > 0,
+    unread_count: unreadCount,
+    is_group: isGroup,
+    contact_jid: contactJid,
+    chat_jid: chatJid,
+    phone_number: contact?.phone_number || meta.sender_number || null,
+    payload_type: meta.payload_type || meta.type || "text",
   };
 }
 
@@ -826,19 +848,35 @@ router.get("/conversations", async (req, res) => {
     const contactJids = [...new Set(rows.map((row) => getConversationContactJid(row)).filter(Boolean))];
     const botIds = [...new Set(rows.map((row) => row.bot_id).filter(Boolean))];
     const archivedPairs = new Set();
+    const contactMap = new Map();
+    const rowIds = rows.map((row) => row.id).filter(Boolean);
+    const readSet = new Set();
 
     if (contactJids.length > 0 && botIds.length > 0) {
       const { data: contacts } = await supabase
         .from("bot_contacts")
-        .select("bot_id, contact_jid, archived_at, deleted_at")
+        .select("bot_id, contact_jid, phone_number, display_name, archived_at, deleted_at")
         .eq("user_id", req.user.sub)
         .in("bot_id", botIds)
         .in("contact_jid", contactJids);
 
       for (const contact of contacts ?? []) {
+        contactMap.set(`${contact.bot_id}:${contact.contact_jid}`, contact);
         if (contact.archived_at || contact.deleted_at) {
           archivedPairs.add(`${contact.bot_id}:${contact.contact_jid}`);
         }
+      }
+    }
+
+    if (rowIds.length > 0) {
+      const { data: reads } = await supabase
+        .from("conversation_reads")
+        .select("bot_activity_id")
+        .eq("user_id", req.user.sub)
+        .in("bot_activity_id", rowIds);
+
+      for (const read of reads ?? []) {
+        if (read?.bot_activity_id) readSet.add(read.bot_activity_id);
       }
     }
 
@@ -847,26 +885,26 @@ router.get("/conversations", async (req, res) => {
       const contactJid = getConversationContactJid(r);
       if (contactJid && archivedPairs.has(`${r.bot_id}:${contactJid}`)) continue;
       const key = getConversationKey(r);
-      if (!convMap.has(key)) convMap.set(key, r);
+      const existing = convMap.get(key);
+      const isUnreadInbound = (r.event_type === "message_received" || r.metadata?.direction === "inbound") && !readSet.has(r.id);
+
+      if (!existing) {
+        convMap.set(key, {
+          row: r,
+          unreadCount: isUnreadInbound ? 1 : 0,
+        });
+        continue;
+      }
+
+      if (isUnreadInbound) existing.unreadCount += 1;
     }
 
     const conversations = [...convMap.values()]
       .slice(offset, offset + limit)
-      .map(normalizeConversationRow);
-
-    // Fetch read markers by bot_activity id to mark unread state
-    try {
-      const ids = conversations.map((c) => c.id).filter(Boolean);
-      if (ids.length > 0) {
-        const { data: reads } = await supabase
-          .from("conversation_reads")
-          .select("bot_activity_id")
-          .eq("user_id", req.user.sub)
-          .in("bot_activity_id", ids);
-        const readSet = new Set((reads ?? []).map((r) => r.bot_activity_id));
-        for (const c of conversations) c.unread = !readSet.has(c.id);
-      }
-    } catch (e) { /* ignore read fetch errors — default unread true */ }
+      .map(({ row, unreadCount }) => normalizeConversationRow(row, {
+        contact: contactMap.get(`${row.bot_id}:${getConversationContactJid(row)}`) ?? null,
+        unreadCount,
+      }));
 
     return res.json({ conversations, count: conversations.length, offset });
   } catch (err) {
@@ -908,6 +946,11 @@ router.get("/conversations/thread", async (req, res) => {
         metadata: row.metadata ?? {},
         direction: row.metadata?.direction || (row.event_type === "message_received" ? "inbound" : "outbound"),
         body: row.metadata?.body ?? row.details ?? "",
+        payload_type: row.metadata?.payload_type || row.metadata?.type || "text",
+        is_group: Boolean(row.metadata?.isGroup),
+        chat_jid: row.metadata?.chat_jid || row.metadata?.from || row.metadata?.to || null,
+        sender_jid: row.metadata?.sender_jid || row.metadata?.from || null,
+        sender_name: row.metadata?.pushName || row.metadata?.displayName || row.metadata?.notifyName || null,
       }));
 
     return res.json({ messages, count: messages.length, conversation_key: conversationKey });

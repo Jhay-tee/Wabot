@@ -7,9 +7,17 @@ yarn-error.log*
 # Environment variables
 .env
 .env.local
+.env.development.local
+.env.test.local
 .env.*.local
+.env.*
+!.env.example
 backend/.env
+backend/.env.*
+!backend/.env.example
 frontend/.env
+frontend/.env.*
+!frontend/.env.example
 .agents
 .local
 attached_assets
@@ -34,6 +42,10 @@ build/
 out/
 frontend/dist/
 backend/dist/
+.next/
+.nuxt/
+.svelte-kit/
+.vite/
 
 # Supabase session/auth snapshots
 *.supabase
@@ -43,21 +55,35 @@ backend/sessions/
 backend/.vercel/
 frontend/.vercel/
 .vercel/
+.supabase/
 
 # Deployment / platform state
 .env.production
 .env.staging
 .turbo/
+.cache/
+.tmp/
+.wrangler/
+.netlify/
 
 # IDE/editor files
 .vscode/
 .idea/
 *.swp
+.eslintcache
 
 # Coverage reports
 coverage/
 *.lcov
+htmlcov/
 
 # Temporary files
 tmp/
 *.tmp
+.aider*
+.aider.tags.cache.v4/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.tsbuildinfo

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { BookOpen, Bot, CreditCard, KeyRound, LayoutGrid, Logs as LogsIcon, Menu, MessageSquare, MoonStar, Settings as SettingsIcon, Shield, SunMedium, X } from "lucide-react";
 import { useAuth } from "../context/AuthContext.jsx";
 import { useTheme } from "../context/ThemeContext.jsx";
@@ -13,6 +13,7 @@ import { Logs } from "./dashboard/Logs.jsx";
 import { ApiKeys } from "./dashboard/ApiKeys.jsx";
 import { Billing } from "./dashboard/Billing.jsx";
 import { Settings } from "./dashboard/Settings.jsx";
+import BotWorkspace from "./dashboard/BotWorkspace.jsx";
 import { ResendVerificationModal } from "../components/auth/ResendVerificationModal.jsx";
 import Admin from "./Admin.jsx";
 
@@ -35,6 +36,7 @@ const EXTERNAL_LINKS = [{ href: "/docs", icon: BookOpen, label: "API Docs" }];
 export default function Dashboard() {
   const auth = useAuth();
   const navigate = useNavigate();
+  const { botId } = useParams();
   const { data, loading, refresh } = useDashboard();
 
   const [tab, setTab] = useState("overview");
@@ -65,6 +67,12 @@ export default function Dashboard() {
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
+
+  useEffect(() => {
+    if (botId) {
+      setTab("bots");
+    }
+  }, [botId]);
 
   /* Open verification modal for unverified users */
   useEffect(() => {
@@ -150,6 +158,7 @@ export default function Dashboard() {
                   : "text-[var(--text2)] hover:bg-white/5 hover:text-[var(--text)]"
               }`}
               onClick={() => {
+                if (botId) navigate("/dashboard");
                 setTab(id);
                 setSidebar(false);
               }}
@@ -215,18 +224,20 @@ export default function Dashboard() {
         </header>
 
         <div className="px-4 py-6 md:px-6">
-          {tab === "overview" && (
+          {botId ? (
+            <BotWorkspace user={user} onRefreshDashboard={refresh} />
+          ) : tab === "overview" && (
             <Overview
               data={data}
               onGoToBots={() => setTab("bots")}
               onResendVerification={() => setShowVerifyModal(true)}
             />
           )}
-          {tab === "conversations" && <Conversations />}
-          {tab === "bots" && <Bots data={data} onRefresh={refresh} />}
-          {tab === "logs" && <Logs activity={data.activity} bots={data.bots} />}
-          {tab === "apikeys" && <ApiKeys user={user} />}
-          {tab === "billing" && (
+          {!botId && tab === "conversations" && <Conversations bots={data.bots} />}
+          {!botId && tab === "bots" && <Bots data={data} onRefresh={refresh} />}
+          {!botId && tab === "logs" && <Logs activity={data.activity} bots={data.bots} />}
+          {!botId && tab === "apikeys" && <ApiKeys user={user} />}
+          {!botId && tab === "billing" && (
             <Billing
               user={user}
               onUpgrade={handleUpgrade}
@@ -236,10 +247,10 @@ export default function Dashboard() {
               managing={managing}
             />
           )}
-          {tab === "settings" && (
+          {!botId && tab === "settings" && (
             <Settings user={user} onUserUpdated={(updated) => auth.patchUser(updated)} />
           )}
-          {tab === "admin" && <Admin />}
+          {!botId && tab === "admin" && <Admin />}
         </div>
       </main>
     </div>

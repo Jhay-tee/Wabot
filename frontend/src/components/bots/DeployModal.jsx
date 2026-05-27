@@ -92,6 +92,20 @@ export function DeployModal({ user, onClose, onDeployed }) {
     methodRef.current = method;
   }, [method]);
 
+  useEffect(() => {
+    if (method === "code") {
+      setQrUrl(null);
+      setQrExpired(false);
+      clearTimeout(firstPollRef.current);
+      clearInterval(pollRef.current);
+      clearInterval(cdRef.current);
+      return;
+    }
+
+    setPairCode(null);
+    setPairExpiresAt(null);
+  }, [method]);
+
   useEffect(() => () => {
     esRef.current?.close();
     clearTimeout(timeoutRef.current);
@@ -129,11 +143,15 @@ export function DeployModal({ user, onClose, onDeployed }) {
     clearInterval(pollRef.current);
     clearInterval(cdRef.current);
     try { es?.close(); } catch (e) {}
+    setLoading(false);
+    setError("");
+    setPairCode(null);
+    setPairExpiresAt(null);
+    setQrUrl(null);
     setStep("form");
     setShowMethodSelect(false);
-    try { onClose(); } catch (e) {}
     try { onDeployed(); } catch (e) {}
-  }, [onDeployed, onClose]);
+  }, [onDeployed]);
 
   const doPoll = useCallback(async () => {
     if (connectedRef.current || methodRef.current !== "qr") return;
@@ -163,6 +181,11 @@ export function DeployModal({ user, onClose, onDeployed }) {
           markQr(msg.qrUrl);
         }
         if (msg.type === "pair_code" && methodRef.current === "code") {
+          setQrUrl(null);
+          setQrExpired(false);
+          clearTimeout(firstPollRef.current);
+          clearInterval(pollRef.current);
+          clearInterval(cdRef.current);
           codeReceivedRef.current = true;
           if (typeof msg.code === "string") {
             setPairCode(msg.code);
@@ -236,6 +259,9 @@ export function DeployModal({ user, onClose, onDeployed }) {
       } else if (method === "code") {
         setQrUrl(null);
         setQrExpired(false);
+        clearTimeout(firstPollRef.current);
+        clearInterval(pollRef.current);
+        clearInterval(cdRef.current);
         // Ask the backend to request a pairing code — response comes via SSE AND HTTP
         const cleanPhone = normalizedPairPhone;
         botsApi.createPairingCode(botId, cleanPhone)
@@ -251,13 +277,13 @@ export function DeployModal({ user, onClose, onDeployed }) {
             }
           })
           .catch((err) => {
-            setError(err.message || "Could not get pairing code. You can use QR code instead.");
+            setError(err.message || "Could not get a pairing code right now. You can use QR mode instead.");
             setConnectionStep("waiting");
           });
       }
 
     } catch (err) {
-      setError(err.message);
+      setError(err.message || "Could not deploy this bot right now. Please try again.");
       setShowMethodSelect(true);
     } finally {
       setLoading(false);

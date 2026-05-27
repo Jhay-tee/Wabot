@@ -222,6 +222,24 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   }, [qrMethod]);
 
   useEffect(() => {
+    if (qrMethod === "code") {
+      setQrUrl(null);
+      setQrExpired(false);
+      clearTimeout(qrFirstRef.current);
+      clearInterval(qrPollRef.current);
+      clearInterval(qrCdRef.current);
+      if (!pairingCode) {
+        setShowPhoneInput(true);
+      }
+      return;
+    }
+
+    setPairingCode(null);
+    setPairingExpiresAt(null);
+    setShowPhoneInput(false);
+  }, [pairingCode, qrMethod]);
+
+  useEffect(() => {
     setBot(initialBot);
     setTab(initialBot._openQr ? "qr" : "info");
     setForm({
@@ -299,6 +317,9 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
     setPairingExpiresAt(expiresAt);
     setQrMethod("code");  // Switch to pairing code display
     setQrUrl(null);       // Clear QR code
+    clearTimeout(qrFirstRef.current);
+    clearInterval(qrPollRef.current);
+    clearInterval(qrCdRef.current);
   }, []);
 
   /* SSE + HTTP polling fallback for QR tab */
@@ -385,7 +406,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       setMsg({ text: "Pairing code generated successfully!", ok: true });
       setTimeout(() => setMsg({ text: "", ok: false }), 3000);
     } catch (err) {
-      setMsg({ text: err.message || "Could not generate pairing code", ok: false });
+      setMsg({ text: err.message || "Could not generate a pairing code right now.", ok: false });
     } finally {
       setGeneratingCode(false);
     }
@@ -406,7 +427,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       setMsg({ text: "Pairing code refreshed!", ok: true });
       setTimeout(() => setMsg({ text: "", ok: false }), 2000);
     } catch (err) {
-      setMsg({ text: err.message || "Could not refresh pairing code", ok: false });
+      setMsg({ text: err.message || "Could not refresh the pairing code right now.", ok: false });
     } finally {
       setGeneratingCode(false);
     }
@@ -528,7 +549,9 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
 
   /* ── Save ────────────────────────────────────────────────── */
   const save = async () => {
-    setSaving(true); setMsg({ text: "", ok: false });
+    if (saving) return;
+    setSaving(true);
+    setMsg({ text: "", ok: false });
     try {
       const payload = { ...form };
 
@@ -561,21 +584,21 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       setAiKeyCleared(false);
       setAiKeySensitive(updated.ai_config?.is_sensitive ?? false);
       setAiKeyTest({ status: "idle", msg: "" });
+      setSaving(false);
       setMsg({ text: "Saved successfully.", ok: true });
-      onSaved(updated);
+      onSaved?.(updated);
 
       // Auto-clear success message after 2 seconds
       setTimeout(() => {
         setMsg({ text: "", ok: false });
       }, 2000);
     } catch (err) {
+      setSaving(false);
       setMsg({ text: err.message, ok: false });
       // Auto-clear error message after 4 seconds
       setTimeout(() => {
         setMsg({ text: "", ok: false });
       }, 4000);
-    } finally {
-      setSaving(false);
     }
   };
 

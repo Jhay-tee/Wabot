@@ -151,6 +151,53 @@ function truncateText(value = "", max = 240) {
   return compactWhitespace(value).slice(0, max);
 }
 
+function jidToReadableHandle(jid = "") {
+  const normalized = normalizeJid(jid);
+  if (!normalized) return "";
+  return normalized
+    .replace("@s.whatsapp.net", "")
+    .replace("@g.us", "")
+    .replace("@lid", "");
+}
+
+function extractContextInfo(value = null) {
+  const ctx = value?.contextInfo ?? value?.messageContextInfo ?? {};
+  return {
+    quotedMsg: ctx?.quotedMessage ?? null,
+    mentionedJid: Array.isArray(ctx?.mentionedJid) ? ctx.mentionedJid : [],
+    quotedParticipant: ctx?.participant ?? null,
+    stanzaId: ctx?.stanzaId ?? null,
+  };
+}
+
+function extractQuotedPreview(quotedMsg = null) {
+  if (!quotedMsg || typeof quotedMsg !== "object") return "";
+  try {
+    const { text, type, extra } = extractMessageBody({ message: quotedMsg });
+    const preview = compactWhitespace(text || "");
+    if (preview) return preview;
+    if (type === "image") return `quoted image${extra?.caption ? `: ${extra.caption}` : ""}`;
+    if (type === "video") return `quoted video${extra?.caption ? `: ${extra.caption}` : ""}`;
+    if (type === "document") return `quoted document${extra?.fileName ? `: ${extra.fileName}` : ""}`;
+    if (type === "voice_note") return "quoted voice note";
+    if (type === "audio") return "quoted audio";
+    if (type === "sticker") return "quoted sticker";
+    return type ? `quoted ${type}` : "";
+  } catch {
+    return "";
+  }
+}
+
+function buildExtraWithContext(extra = {}, context = {}) {
+  return {
+    ...extra,
+    mentionedJid: context.mentionedJid ?? [],
+    quotedMsg: context.quotedMsg ?? null,
+    quotedParticipant: context.quotedParticipant ?? null,
+    stanzaId: context.stanzaId ?? null,
+  };
+}
+
 function normalizePhoneDigits(value = "") {
   return String(value ?? "").replace(/[^\d+]/g, "").trim();
 }
@@ -247,75 +294,205 @@ function resolveMediaSource(url) {
   return { url: value };
 }
 
+function buildContextualMessageSummary({ body = "", msgType = "", extra = {} } = {}) {
+  const parts = [];
+  const cleanBody = compactWhitespace(body);
+  const mentions = Array.isArray(extra?.mentionedJid)
+    ? extra.mentionedJid.map((jid) => jidToReadableHandle(jid)).filter(Boolean)
+    : [];
+  const quotedPreview = extractQuotedPreview(extra?.quotedMsg);
+  const quotedBy = jidToReadableHandle(extra?.quotedParticipant);
+
+  if (extra?.isViewOnce) parts.push("This was a view-once message.");
+  if (quotedPreview) {
+    parts.push(`It replied to ${quotedBy ? `@${quotedBy}` : "another message"} saying: "${truncateText(quotedPreview, 160)}".`);
+  }
+  if (mentions.length > 0) {
+    parts.push(`Mentioned: ${mentions.map((value) => `@${value}`).join(", ")}.`);
+  }
+
+  switch (msgType) {
+    case "text":
+      if (cleanBody) parts.push(`Message text: ${cleanBody}`);
+      break;
+    case "image":
+      parts.push("The user sent an image.");
+      if (extra?.caption) parts.push(`Caption: ${compactWhitespace(extra.caption)}`);
+      if (extra?.width && extra?.height) parts.push(`Dimensions: ${extra.width}x${extra.height}.`);
+      break;
+    case "video":
+      parts.push("The user sent a video.");
+      if (extra?.caption) parts.push(`Caption: ${compactWhitespace(extra.caption)}`);
+      if (extra?.seconds) parts.push(`Duration: ${extra.seconds} seconds.`);
+      if (extra?.gifPlayback) parts.push("It may behave like a GIF.");
+      break;
+    case "document":
+      parts.push(`The user sent a document${extra?.fileName ? ` named "${extra.fileName}"` : ""}.`);
+      if (extra?.mimetype) parts.push(`Type: ${extra.mimetype}.`);
+      if (extra?.pageCount) parts.push(`Pages: ${extra.pageCount}.`);
+      if (extra?.fileLength) parts.push(`Size: ${extra.fileLength} bytes.`);
+      if (cleanBody && cleanBody !== extra?.fileName) parts.push(`Caption or note: ${cleanBody}`);
+      break;
+    case "voice_note":
+      parts.push("The user sent a voice note.");
+      if (extra?.seconds) parts.push(`Duration: ${extra.seconds} seconds.`);
+      parts.push("Audio transcription is not available yet, so respond based on the metadata and ask for text if exact content matters.");
+      break;
+    case "audio":
+      parts.push("The user sent an audio file.");
+      if (extra?.seconds) parts.push(`Duration: ${extra.seconds} seconds.`);
+      parts.push("Audio transcription is not available yet, so respond based on the metadata and ask for text if exact content matters.");
+      break;
+    case "sticker":
+      parts.push("The user sent a sticker.");
+      if (extra?.isAnimated) parts.push("It is animated.");
+      if (extra?.isAvatar) parts.push("It is an avatar-style sticker.");
+      break;
+    case "location":
+      parts.push("The user shared a location.");
+      if (extra?.name) parts.push(`Name: ${extra.name}.`);
+      if (extra?.address) parts.push(`Address: ${extra.address}.`);
+      if (Number.isFinite(extra?.lat) && Number.isFinite(extra?.lng)) {
+        parts.push(`Coordinates: ${extra.lat}, ${extra.lng}.`);
+      }
+      break;
+    case "contact":
+      parts.push(`The user shared a contact${extra?.displayName ? `: ${extra.displayName}` : ""}.`);
+      break;
+    case "contacts":
+      parts.push(`The user shared ${extra?.count ?? 0} contacts.`);
+      if (Array.isArray(extra?.contacts) && extra.contacts.length > 0) {
+        const names = extra.contacts.map((contact) => contact?.displayName).filter(Boolean).slice(0, 5);
+        if (names.length > 0) parts.push(`Contacts: ${names.join(", ")}.`);
+      }
+      break;
+    case "reaction":
+      parts.push(`The user reacted with ${cleanBody || extra?.text || "an emoji"}.`);
+      break;
+    case "list_reply":
+      parts.push(`The user selected a list option: ${cleanBody || "unknown option"}.`);
+      if (extra?.title) parts.push(`List title: ${extra.title}.`);
+      if (extra?.description) parts.push(`Description: ${extra.description}.`);
+      break;
+    case "button_reply":
+      parts.push(`The user pressed a button: ${cleanBody || extra?.displayText || "unknown button"}.`);
+      if (extra?.displayText) parts.push(`Button label: ${extra.displayText}.`);
+      break;
+    case "template_reply":
+      parts.push(`The user selected a template reply: ${cleanBody || extra?.displayText || "unknown reply"}.`);
+      if (extra?.displayText) parts.push(`Template label: ${extra.displayText}.`);
+      break;
+    case "order":
+      parts.push("The user sent an order-related WhatsApp message.");
+      if (extra?.itemCount != null) parts.push(`Item count: ${extra.itemCount}.`);
+      if (extra?.orderTitle) parts.push(`Order title: ${extra.orderTitle}.`);
+      break;
+    case "poll":
+      parts.push("The user sent a poll-related message.");
+      if (extra?.name) parts.push(`Poll name: ${extra.name}.`);
+      if (extra?.selectableCount != null) parts.push(`Selectable options: ${extra.selectableCount}.`);
+      break;
+    case "system":
+      parts.push("A system/protocol WhatsApp event was received.");
+      if (extra?.protocolType != null) parts.push(`Protocol type: ${extra.protocolType}.`);
+      break;
+    case "unknown":
+    default:
+      if (cleanBody) parts.push(cleanBody);
+      else parts.push("The user sent a WhatsApp message type that could not be fully parsed.");
+      break;
+  }
+
+  return compactWhitespace(parts.join(" "));
+}
+
 /* ── Extract readable text from any WhatsApp message type ───── */
 function extractMessageBody(msg) {
   const m = msg.message;
   if (!m) return { text: "", type: "unknown", extra: {} };
 
+  const isViewOnce = Boolean(m.viewOnceMessage || m.viewOnceMessageV2 || m.viewOnceMessageV2Extension);
   const inner = m.viewOnceMessage?.message
     ?? m.viewOnceMessageV2?.message
+    ?? m.viewOnceMessageV2Extension?.message
     ?? m.ephemeralMessage?.message
     ?? m;
 
   if (inner.conversation)
-    return { text: inner.conversation.trim(), type: "text", extra: {} };
+    return { text: inner.conversation.trim(), type: "text", extra: { isViewOnce } };
 
-  if (inner.extendedTextMessage)
-    return { text: (inner.extendedTextMessage.text ?? "").trim(), type: "text", extra: {
-      quotedMsg:         inner.extendedTextMessage.contextInfo?.quotedMessage ?? null,
-      mentionedJid:      inner.extendedTextMessage.contextInfo?.mentionedJid ?? [],
-      quotedParticipant: inner.extendedTextMessage.contextInfo?.participant ?? null
-    }};
+  if (inner.extendedTextMessage) {
+    const context = extractContextInfo(inner.extendedTextMessage);
+    return { text: (inner.extendedTextMessage.text ?? "").trim(), type: "text", extra: buildExtraWithContext({
+      isViewOnce,
+    }, context) };
+  }
 
-  if (inner.imageMessage)
-    return { text: (inner.imageMessage.caption ?? "").trim(), type: "image", extra: {
+  if (inner.imageMessage) {
+    const context = extractContextInfo(inner.imageMessage);
+    return { text: (inner.imageMessage.caption ?? "").trim(), type: "image", extra: buildExtraWithContext({
       caption: inner.imageMessage.caption,
       mimetype: inner.imageMessage.mimetype,
       width: inner.imageMessage.width ?? null,
       height: inner.imageMessage.height ?? null,
       mediaKeyTimestamp: inner.imageMessage.mediaKeyTimestamp ?? null,
-    }};
+      isViewOnce,
+    }, context) };
+  }
 
-  if (inner.videoMessage)
-    return { text: (inner.videoMessage.caption ?? "").trim(), type: "video", extra: {
+  if (inner.videoMessage) {
+    const context = extractContextInfo(inner.videoMessage);
+    return { text: (inner.videoMessage.caption ?? "").trim(), type: "video", extra: buildExtraWithContext({
       caption: inner.videoMessage.caption,
       mimetype: inner.videoMessage.mimetype ?? null,
       seconds: inner.videoMessage.seconds ?? null,
       gifPlayback: inner.videoMessage.gifPlayback ?? false,
-    }};
+      isViewOnce,
+    }, context) };
+  }
 
-  if (inner.documentMessage)
-    return { text: (inner.documentMessage.caption ?? inner.documentMessage.fileName ?? "").trim(), type: "document", extra: {
+  if (inner.documentMessage) {
+    const context = extractContextInfo(inner.documentMessage);
+    return { text: (inner.documentMessage.caption ?? inner.documentMessage.fileName ?? "").trim(), type: "document", extra: buildExtraWithContext({
       fileName: inner.documentMessage.fileName,
       mimetype: inner.documentMessage.mimetype,
       fileLength: inner.documentMessage.fileLength ?? null,
       pageCount: inner.documentMessage.pageCount ?? null,
-    }};
+      isViewOnce,
+    }, context) };
+  }
 
-  if (inner.audioMessage)
-    return { text: "", type: inner.audioMessage.ptt ? "voice_note" : "audio", extra: {
+  if (inner.audioMessage) {
+    const context = extractContextInfo(inner.audioMessage);
+    return { text: "", type: inner.audioMessage.ptt ? "voice_note" : "audio", extra: buildExtraWithContext({
       mimetype: inner.audioMessage.mimetype ?? null,
       seconds: inner.audioMessage.seconds ?? null,
       ptt: Boolean(inner.audioMessage.ptt),
-    } };
+      isViewOnce,
+    }, context) };
+  }
 
   if (inner.stickerMessage)
     return { text: "", type: "sticker", extra: {
       isAnimated: Boolean(inner.stickerMessage.isAnimated),
       isAvatar: Boolean(inner.stickerMessage.isAvatar),
+      isViewOnce,
     } };
 
   if (inner.locationMessage)
     return { text: "📍 Location shared", type: "location", extra: {
       lat:  inner.locationMessage.degreesLatitude,
       lng:  inner.locationMessage.degreesLongitude,
-      name: inner.locationMessage.name
+      name: inner.locationMessage.name,
+      address: inner.locationMessage.address ?? null,
+      isViewOnce,
     }};
 
   if (inner.contactMessage)
     return { text: inner.contactMessage.displayName ?? "Contact shared", type: "contact", extra: {
       displayName: inner.contactMessage.displayName ?? null,
       vcard: inner.contactMessage.vcard ?? null,
+      isViewOnce,
     } };
 
   if (inner.contactsArrayMessage)
@@ -325,31 +502,56 @@ function extractMessageBody(msg) {
         displayName: contact.displayName ?? null,
         vcard: contact.vcard ?? null,
       })),
+      isViewOnce,
     } };
 
   if (inner.reactionMessage)
-    return { text: inner.reactionMessage.text ?? "👍", type: "reaction", extra: {} };
+    return { text: inner.reactionMessage.text ?? "👍", type: "reaction", extra: {
+      key: inner.reactionMessage.key ?? null,
+      isViewOnce,
+    } };
 
   if (inner.listResponseMessage)
     return { text: inner.listResponseMessage.singleSelectReply?.selectedRowId ?? "", type: "list_reply", extra: {
-      title: inner.listResponseMessage.title
+      title: inner.listResponseMessage.title,
+      description: inner.listResponseMessage.description ?? null,
+      isViewOnce,
     }};
 
   if (inner.buttonsResponseMessage)
     return { text: inner.buttonsResponseMessage.selectedButtonId ?? "", type: "button_reply", extra: {
-      displayText: inner.buttonsResponseMessage.selectedDisplayText
+      displayText: inner.buttonsResponseMessage.selectedDisplayText,
+      isViewOnce,
     }};
 
   if (inner.templateButtonReplyMessage)
-    return { text: inner.templateButtonReplyMessage.selectedId ?? "", type: "template_reply", extra: {} };
+    return { text: inner.templateButtonReplyMessage.selectedId ?? "", type: "template_reply", extra: {
+      displayText: inner.templateButtonReplyMessage.selectedDisplayText ?? null,
+      isViewOnce,
+    } };
 
   if (inner.orderMessage)
     return { text: "🛒 Order received", type: "order", extra: {
-      itemCount: inner.orderMessage.itemCount
+      itemCount: inner.orderMessage.itemCount,
+      orderTitle: inner.orderMessage.orderTitle ?? null,
+      sellerJid: inner.orderMessage.sellerJid ?? null,
+      token: inner.orderMessage.token ?? null,
+      isViewOnce,
     }};
 
   if (inner.pollUpdateMessage || inner.pollCreationMessage)
-    return { text: "📊 Poll", type: "poll", extra: {} };
+    return { text: "📊 Poll", type: "poll", extra: {
+      name: inner.pollCreationMessage?.name ?? null,
+      selectableCount: inner.pollCreationMessage?.selectableOptionsCount ?? null,
+      isViewOnce,
+    } };
+
+  if (inner.protocolMessage)
+    return { text: "", type: "system", extra: {
+      protocolType: inner.protocolMessage.type ?? null,
+      editedMessage: inner.protocolMessage.editedMessage ?? null,
+      isViewOnce,
+    } };
 
   return { text: "", type: "unknown", extra: {} };
 }
@@ -598,6 +800,66 @@ export class BotInstance {
       logger.error({ err, botId: this.botId, to }, "sendMessage failed");
       throw err;
     }
+  }
+
+  async _getStatusAudienceJids() {
+    const { data, error } = await supabase
+      .from("bot_contacts")
+      .select("contact_jid")
+      .eq("user_id", this.userId)
+      .eq("bot_id", this.botId)
+      .is("archived_at", null)
+      .is("deleted_at", null)
+      .order("last_message_at", { ascending: false })
+      .limit(5000);
+
+    if (error) throw error;
+
+    return [...new Set((data ?? [])
+      .map((row) => normalizeJid(row.contact_jid))
+      .filter((jid) => jid && !isGroupJid(jid) && !isBroadcastJid(jid)))];
+  }
+
+  async postStatus(message, options = {}) {
+    if (!this.socket) throw new Error("Bot is not connected.");
+    if (this.status !== "connected") throw new Error("Bot is not connected. Status posting requires an active WhatsApp session.");
+
+    const audience = await this._getStatusAudienceJids();
+    if (audience.length === 0) {
+      throw new Error("No active contacts available for status delivery yet. This bot needs at least one contact before posting a status.");
+    }
+
+    const normalized = typeof message === "string"
+      ? { payload: { text: message.trim() }, label: "Text status", metadata: { payload_type: "text" } }
+      : this._normalizeOutboundMessagePayload(message);
+
+    const sendOptions = {};
+    if (Array.isArray(options.statusJidList) && options.statusJidList.length > 0) {
+      sendOptions.statusJidList = options.statusJidList;
+    } else {
+      sendOptions.statusJidList = audience;
+    }
+
+    if (normalized.metadata?.payload_type === "text") {
+      if (options.backgroundColor) sendOptions.backgroundColor = options.backgroundColor;
+      if (Number.isInteger(options.font)) sendOptions.font = options.font;
+    }
+
+    await this.socket.sendMessage("status@broadcast", normalized.payload, sendOptions);
+    this._queueUsage({ totalMessages: 1, lastActivity: new Date().toISOString() });
+
+    await this._log("status_posted", `${normalized.label} posted to WhatsApp status`, {
+      direction: "outbound",
+      audience_count: sendOptions.statusJidList.length,
+      channel: "status",
+      body: extractPreview(normalized.payload).slice(0, 2000),
+      ...normalized.metadata,
+    });
+
+    return {
+      audienceCount: sendOptions.statusJidList.length,
+      payloadType: normalized.metadata?.payload_type || "text",
+    };
   }
 
   /* ── Connection update ────────────────────────────────────── */
@@ -1914,21 +2176,7 @@ export class BotInstance {
   }
 
   _buildMediaAiInput({ body = "", msgType = "", extra = {} } = {}) {
-    if (body?.trim()) return body.trim();
-
-    switch (msgType) {
-      case "image":
-        return compactWhitespace(`The user sent an image.${extra?.caption ? ` Caption: ${extra.caption}` : ""} Tell them the image was received and ask for a short description if needed.`);
-      case "video":
-        return compactWhitespace(`The user sent a video.${extra?.caption ? ` Caption: ${extra.caption}` : ""} Duration: ${extra?.seconds ?? "unknown"} seconds. Reply naturally and request a summary if analysis is needed.`);
-      case "document":
-        return compactWhitespace(`The user sent a document named ${extra?.fileName ?? "a file"} with type ${extra?.mimetype ?? "unknown"}. If you cannot inspect the content, say the document was received and ask what they need from it.`);
-      case "voice_note":
-      case "audio":
-        return "The user sent a voice note or audio file. We could not transcribe it yet. Acknowledge receipt and ask them to resend as text if they need a detailed answer.";
-      default:
-        return "";
-    }
+    return buildContextualMessageSummary({ body, msgType, extra });
   }
 
   async _sendMediaProcessingFallback(jid, msgType) {

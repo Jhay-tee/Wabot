@@ -13,6 +13,7 @@ import botsRouter from "./routes/bots.js";
 import v1Router from "./routes/v1.js";
 import { dashboardRealtime } from "./services/realtime/DashboardRealtime.js";
 import { contactLifecycleService } from "./services/maintenance/ContactLifecycleService.js";
+import { statusPostScheduler } from "./services/maintenance/StatusPostScheduler.js";
 import { botManager } from "./services/whatsapp/BotManager.js";
 import { logger } from "./utils/logger.js";
 
@@ -49,8 +50,8 @@ app.use(helmet({
 app.use(compression());
 app.use(hpp());
 
-const jsonParser = express.json({ limit: "1mb" });
-const urlencodedParser = express.urlencoded({ extended: true, limit: "1mb" });
+const jsonParser = express.json({ limit: "25mb" });
+const urlencodedParser = express.urlencoded({ extended: true, limit: "25mb" });
 
 app.use((req, res, next) => {
   if (req.path === "/api/billing/webhook") return next();
@@ -116,12 +117,14 @@ async function shutdown(signal) {
   );
   await Promise.allSettled(stops);
   await contactLifecycleService.shutdown();
+  await statusPostScheduler.shutdown();
   process.exit(0);
 }
 
 async function bootstrap() {
   await dashboardRealtime.initialize();
   await contactLifecycleService.initialize();
+  await statusPostScheduler.initialize();
   await botManager.initialize();
 
   server = app.listen(env.port, () => {

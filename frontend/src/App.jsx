@@ -55,6 +55,7 @@ export default function App() {
         <Route path="/login"     element={<GuestRoute><Login /></GuestRoute>} />
         <Route path="/signup"    element={<GuestRoute><Signup /></GuestRoute>} />
         <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
+        <Route path="/dashboard/bots/:botId" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
         <Route path="/admin"     element={<AdminRoute><Admin /></AdminRoute>} />
         <Route path="*"          element={<Navigate to="/" replace />} />
       </Routes>

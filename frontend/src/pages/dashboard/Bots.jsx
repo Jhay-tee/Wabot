@@ -1,4 +1,5 @@
-import { useState }       from "react";
+import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Bot, Plus } from "lucide-react";
 import { BotCard }        from "../../components/bots/BotCard.jsx";
 import { DeployModal }    from "../../components/bots/DeployModal.jsx";
@@ -8,7 +9,31 @@ import { Alert }          from "../../components/ui/Alert.jsx";
 import { EmptyState }     from "../../components/ui/EmptyState.jsx";
 import { botsApi }        from "../../api/bots.js";
 
+function setModalHash(nextHash) {
+  const normalized = nextHash ? `#${nextHash}` : "";
+  if (window.location.hash === normalized) return;
+  const nextUrl = `${window.location.pathname}${window.location.search}${normalized}`;
+  window.history.pushState(null, "", nextUrl);
+  window.dispatchEvent(new HashChangeEvent("hashchange"));
+}
+
+function parseModalHash(hashValue) {
+  const hash = hashValue.replace(/^#/, "");
+  if (!hash) return { type: null, botId: null };
+  if (hash === "deploy") return { type: "deploy", botId: null };
+
+  const [type, ...rest] = hash.split(":");
+  const botId = rest.join(":") || null;
+
+  if (type === "config" || type === "qr" || type === "dm") {
+    return { type, botId };
+  }
+
+  return { type: null, botId: null };
+}
+
 export function Bots({ data, onRefresh }) {
+  const navigate = useNavigate();
   const { user, bots, stats } = data;
   const [showDeploy, setShowDeploy] = useState(false);
   const [configBot,  setConfigBot]  = useState(null);
@@ -20,7 +45,41 @@ export function Bots({ data, onRefresh }) {
   const maxBots = stats?.planLimit ?? (isPro ? 50 : 1);
   const atLimit = bots.length >= maxBots;
 
-  const handleDeployed = () => { setShowDeploy(false); onRefresh(); };
+  useEffect(() => {
+    const syncModalFromHash = () => {
+      const { type, botId } = parseModalHash(window.location.hash);
+      const targetBot = botId ? bots.find((item) => item.id === botId) ?? null : null;
+
+      setShowDeploy(type === "deploy");
+      setConfigBot(
+        type === "config" && targetBot ? targetBot
+          : type === "qr" && targetBot ? { ...targetBot, _openQr: true }
+          : null
+      );
+      setDmBot(type === "dm" && targetBot ? targetBot : null);
+    };
+
+    syncModalFromHash();
+    window.addEventListener("hashchange", syncModalFromHash);
+    return () => window.removeEventListener("hashchange", syncModalFromHash);
+  }, [bots]);
+
+  const closeModal = () => setModalHash("");
+
+  const openDeploy = () => setModalHash("deploy");
+  const openConfig = (bot, openQr = false) => {
+    if (!bot?.id) return;
+    setModalHash(`${openQr ? "qr" : "config"}:${bot.id}`);
+  };
+  const openDm = (bot) => {
+    if (!bot?.id) return;
+    setModalHash(`dm:${bot.id}`);
+  };
+
+  const handleDeployed = () => {
+    closeModal();
+    onRefresh();
+  };
 
   const handleDelete = async (bot) => {
     if (!window.confirm(`Delete "${bot.bot_name}"? This disconnects it from WhatsApp and cannot be undone.`)) return;
@@ -31,22 +90,25 @@ export function Bots({ data, onRefresh }) {
     finally { setDeleting(null); }
   };
 
-  const handleShowQr = (bot) => setConfigBot({ ...bot, _openQr: true });
+  const handleShowQr = (bot) => openConfig(bot, true);
 
   return (
     <>
       {showDeploy && (
-        <DeployModal user={user} onClose={() => setShowDeploy(false)} onDeployed={handleDeployed} />
+        <DeployModal user={user} onClose={closeModal} onDeployed={handleDeployed} />
       )}
       {configBot && (
         <BotConfigModal
           bot={configBot}
           user={user}
-          onClose={() => { setConfigBot(null); onRefresh(); }}
-          onSaved={(updated) => setConfigBot((b) => ({ ...b, ...updated }))}
+          onClose={() => { closeModal(); onRefresh(); }}
+          onSaved={(updated) => {
+            setConfigBot((b) => (b ? { ...b, ...updated } : b));
+            onRefresh();
+          }}
         />
       )}
-      {dmBot && <SendDMModal bot={dmBot} onClose={() => setDmBot(null)} />}
+      {dmBot && <SendDMModal bot={dmBot} onClose={closeModal} />}
 
       <div className="flex flex-col gap-5">
         <div className="flex flex-col gap-4 rounded-[28px] border border-white/10 bg-[var(--card)] p-5 shadow-lg md:flex-row md:items-center md:justify-between">
@@ -62,7 +124,7 @@ export function Bots({ data, onRefresh }) {
           </div>
           <button
             className="inline-flex items-center justify-center gap-2 rounded-2xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-            onClick={() => setShowDeploy(true)}
+            onClick={openDeploy}
             disabled={atLimit}
             title={atLimit ? "Upgrade to deploy more bots" : undefined}
           >
@@ -84,16 +146,17 @@ export function Bots({ data, onRefresh }) {
           <div className="rounded-[28px] border border-white/10 bg-[var(--card)] p-6 shadow-lg">
             <EmptyState icon={<Bot size={28} />} title="No bots deployed yet"
               desc='Click "Deploy bot" to launch your first WhatsApp bot. Choose DM or Group mode.'
-              action={<button className="inline-flex items-center gap-2 rounded-2xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white transition hover:opacity-90" onClick={() => setShowDeploy(true)}><Bot size={16} /> Deploy bot</button>}
+              action={<button className="inline-flex items-center gap-2 rounded-2xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white transition hover:opacity-90" onClick={openDeploy}><Bot size={16} /> Deploy bot</button>}
             />
           </div>
         ) : (
           <div className="grid gap-4 xl:grid-cols-2 2xl:grid-cols-3">
             {bots.map((bot) => (
               <BotCard key={bot.id} bot={bot}
-                onConfigure={setConfigBot}
+                onOpenPage={(targetBot) => navigate(`/dashboard/bots/${targetBot.id}`)}
+                onConfigure={openConfig}
                 onShowQr={handleShowQr}
-                onSendDM={setDmBot}
+                onSendDM={openDm}
                 onDelete={handleDelete}
                 deleting={deleting}
               />

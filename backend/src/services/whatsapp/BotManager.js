@@ -499,6 +499,15 @@ class BotManager {
     return inst.requestPairingCode(cleanPhone);
   }
 
+  async postStatus(botId, message, options = {}) {
+    const inst = this.instances.get(botId);
+    if (!inst) throw new Error("Bot instance not found.");
+    if (typeof inst.postStatus !== "function") {
+      throw new Error("Status posting is not available for this bot instance.");
+    }
+    return inst.postStatus(message, options);
+  }
+
   /* ── SSE ──────────────────────────────────────────────────── */
 
   addSseClient(botId, res) {

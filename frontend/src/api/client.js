@@ -24,6 +24,23 @@ export class ApiError extends Error {
   }
 }
 
+function sanitizeApiMessage(message, status) {
+  const fallback = status >= 500
+    ? "Something went wrong on the server. Please try again."
+    : "Something went wrong. Please try again.";
+
+  const text = String(message ?? "").trim();
+  if (!text) return fallback;
+  if (status === 0) return "Network error. Unable to reach the server. Check your connection and API URL.";
+  if (status >= 500) return fallback;
+
+  if (/(supabase|service[_ -]?role|rls|postgres|sql|stack|trace|syntaxerror|referenceerror|typeerror|jwt|token|econn|enotfound|eai_again|baileys|internal server error)/i.test(text)) {
+    return fallback;
+  }
+
+  return text;
+}
+
 export async function apiFetch(path, options = {}) {
   const token = localStorage.getItem("wabot_token");
 
@@ -43,7 +60,12 @@ export async function apiFetch(path, options = {}) {
   let data;
   try { data = await res.json(); } catch { data = {}; }
 
-  if (!res.ok) throw new ApiError(data.error || `Request failed (${res.status})`, res.status);
+  if (!res.ok) {
+    throw new ApiError(
+      sanitizeApiMessage(data.error || `Request failed (${res.status})`, res.status),
+      res.status
+    );
+  }
   return data;
 }
 

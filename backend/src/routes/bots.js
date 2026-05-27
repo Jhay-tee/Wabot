@@ -41,6 +41,7 @@ const BOOL_FIELDS = ["auto_reply_enabled"];
 const JSON_FIELDS = ["keyword_triggers", "sales_agent_config", "commands_config", "group_management_config"];
 const ALLOWED_AI_PROVIDERS = new Set(AI_PROVIDERS.map((provider) => provider.id));
 const PAIRING_STATUSES = new Set(["awaiting_code", "code_generated", "awaiting_link", "awaiting_pairing"]);
+const STATUS_POST_TYPES = new Set(["scheduled", "processing", "posted", "failed", "cancelled"]);
 
 function normalizeOptionalUrl(value, label) {
   const raw = String(value ?? "").trim();
@@ -133,6 +134,57 @@ function hasSendPayloadContent(payload) {
   return false;
 }
 
+function sanitizeBotForClient(bot) {
+  const ai = normalizeAiConfig(bot.ai_config ?? {});
+  const safeAi = ai.encrypted_key
+    ? { ...ai, encrypted_key: undefined, has_key: true }
+    : ai;
+
+  return {
+    ...bot,
+    status: botManager.getStatus(bot.id) || bot.status,
+    ai_config: safeAi,
+  };
+}
+
+function normalizeScheduleTime(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) throw new Error("publish_at must be a valid ISO date/time.");
+  return date.toISOString();
+}
+
+function normalizeStatusPostOptions(body = {}) {
+  const options = {};
+  if (body.backgroundColor) options.backgroundColor = String(body.backgroundColor).trim().slice(0, 32);
+  if (body.background_color) options.backgroundColor = String(body.background_color).trim().slice(0, 32);
+  if (body.font !== undefined && body.font !== null && body.font !== "") {
+    const parsed = Number(body.font);
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 10) {
+      throw new Error("font must be an integer between 0 and 10.");
+    }
+    options.font = parsed;
+  }
+  return options;
+}
+
+function mapStatusPostRow(row) {
+  return {
+    id: row.id,
+    bot_id: row.bot_id,
+    status: STATUS_POST_TYPES.has(row.status) ? row.status : "scheduled",
+    caption: row.caption ?? "",
+    payload: row.payload ?? {},
+    media_type: row.media_type ?? row.payload?.media?.type ?? null,
+    publish_at: row.publish_at,
+    posted_at: row.posted_at,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    error_message: row.error_message ?? null,
+  };
+}
+
 /* ── GET /api/bots/ai-providers (must be before /:id routes) ─── */
 router.get("/ai-providers", (_req, res) => {
   return res.json({
@@ -197,6 +249,23 @@ router.get("/dashboard", async (req, res) => {
       msgLimit:      limits.maxMsgMonth
     }
   });
+});
+
+/* ── GET /api/bots/:id ──────────────────────────────────────── */
+router.get("/:id", async (req, res) => {
+  const userId = req.user.sub;
+  const { id } = req.params;
+
+  const { data: bot, error } = await supabase
+    .from("bots")
+    .select("id, user_id, bot_name, description, status, bot_type, messages_count, messages_this_month, auto_reply_enabled, auto_reply_message, webhook_url, webhook_secret, keyword_triggers, sales_agent_config, commands_config, ai_config, group_management_config, website_url, catalog_unavail_msg, created_at, last_activity")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: "Could not load bot." });
+  if (!bot || bot.user_id !== userId) return res.status(404).json({ error: "Bot not found." });
+
+  return res.json({ bot: sanitizeBotForClient(bot) });
 });
 
 /* ── GET /api/bots/dashboard/events (SSE) ───────────────────── */
@@ -355,7 +424,8 @@ router.post("/:id/reconnect", async (req, res) => {
     await botManager.reconnect(id, userId);
     return res.json({ ok: true, message: "Reconnect initiated. Open QR or pairing mode and wait for the new auth payload." });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    logger.error({ err, botId: id }, "Reconnect route failed");
+    return res.status(500).json({ error: "Could not reconnect this bot right now. Please try again." });
   }
 });
 
@@ -374,8 +444,206 @@ router.post("/:id/request-pairing", async (req, res) => {
     return res.json({ ok: true, code, expiresAt });
   } catch (err) {
     logger.warn({ err, botId: id }, "Pairing code request route failed");
-    return res.status(500).json({ error: err?.message ?? "Could not request pairing code." });
+    const message = String(err?.message ?? "").trim();
+    if (/invalid phone number/i.test(message)) {
+      return res.status(400).json({ error: "Enter a valid WhatsApp phone number with country code." });
+    }
+    if (/already connected/i.test(message)) {
+      return res.status(409).json({ error: "This bot is already connected, so a pairing code is not needed." });
+    }
+    if (/does not support pairing codes/i.test(message)) {
+      return res.status(409).json({ error: "Pairing code is not available for this connection. Use QR mode instead." });
+    }
+    return res.status(500).json({ error: "Could not request a pairing code right now. Please try again." });
   }
+});
+
+/* ── GET /api/bots/:id/status-posts ─────────────────────────── */
+router.get("/:id/status-posts", async (req, res) => {
+  const userId = req.user.sub;
+  const { id } = req.params;
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+
+  const { data: bot } = await supabase
+    .from("bots")
+    .select("id, user_id")
+    .eq("id", id)
+    .maybeSingle();
+  if (!bot || bot.user_id !== userId) return res.status(404).json({ error: "Bot not found." });
+
+  const { data, error } = await supabase
+    .from("bot_status_posts")
+    .select("id, bot_id, status, caption, payload, media_type, publish_at, posted_at, created_at, updated_at, error_message")
+    .eq("user_id", userId)
+    .eq("bot_id", id)
+    .order("publish_at", { ascending: true })
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) return res.status(500).json({ error: "Could not load status posts." });
+  return res.json({ posts: (data ?? []).map(mapStatusPostRow) });
+});
+
+/* ── POST /api/bots/:id/status-posts ────────────────────────── */
+router.post("/:id/status-posts", async (req, res) => {
+  const userId = req.user.sub;
+  const { id } = req.params;
+
+  const { data: bot } = await supabase
+    .from("bots")
+    .select("id, user_id, bot_name, status")
+    .eq("id", id)
+    .maybeSingle();
+  if (!bot || bot.user_id !== userId) return res.status(404).json({ error: "Bot not found." });
+
+  let payload;
+  let statusOptions;
+  let publishAt;
+  try {
+    payload = extractSendPayload(req.body ?? {});
+    statusOptions = normalizeStatusPostOptions(req.body ?? {});
+    publishAt = normalizeScheduleTime(req.body?.publish_at);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  if (!hasSendPayloadContent(payload)) {
+    return res.status(400).json({ error: "A text or media payload is required." });
+  }
+
+  const caption = typeof payload === "string"
+    ? payload.slice(0, 4096)
+    : String(payload?.text ?? payload?.media?.caption ?? "").slice(0, 4096);
+  const mediaType = typeof payload === "string" ? "text" : (payload.media?.type ?? (payload.text ? "text" : null));
+
+  if (publishAt && new Date(publishAt).getTime() <= Date.now() + 10_000) {
+    return res.status(400).json({ error: "Scheduled posts must be at least 10 seconds in the future." });
+  }
+
+  const baseInsert = {
+    user_id: userId,
+    bot_id: id,
+    caption: caption || null,
+    payload: typeof payload === "string" ? { text: payload } : payload,
+    media_type: mediaType,
+    publish_at: publishAt ?? new Date().toISOString(),
+    status_options: statusOptions,
+  };
+
+  if (publishAt) {
+    const { data: scheduled, error } = await supabase
+      .from("bot_status_posts")
+      .insert({
+        ...baseInsert,
+        status: "scheduled",
+      })
+      .select("id, bot_id, status, caption, payload, media_type, publish_at, posted_at, created_at, updated_at, error_message")
+      .single();
+
+    if (error) return res.status(500).json({ error: "Could not schedule status post." });
+
+    await supabase.from("bot_activity").insert({
+      user_id: userId,
+      bot_id: id,
+      event_type: "status_post_scheduled",
+      details: `Scheduled a status post for "${bot.bot_name}"`,
+      metadata: { publish_at: publishAt, media_type: mediaType },
+    }).catch(() => {});
+
+    return res.status(201).json({ post: mapStatusPostRow(scheduled), message: "Status post scheduled." });
+  }
+
+  const { data: created, error: createError } = await supabase
+    .from("bot_status_posts")
+    .insert({
+      ...baseInsert,
+      status: "processing",
+      processing_started_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+
+  if (createError || !created) {
+    return res.status(500).json({ error: "Could not create status post." });
+  }
+
+  try {
+    const result = await botManager.postStatus(id, payload, statusOptions);
+    const postedAt = new Date().toISOString();
+    const { data: posted } = await supabase
+      .from("bot_status_posts")
+      .update({
+        status: "posted",
+        posted_at: postedAt,
+        processing_started_at: null,
+        audience_count: result.audienceCount,
+        error_message: null,
+      })
+      .eq("id", created.id)
+      .select("id, bot_id, status, caption, payload, media_type, publish_at, posted_at, created_at, updated_at, error_message")
+      .single();
+
+    await supabase.from("bot_activity").insert({
+      user_id: userId,
+      bot_id: id,
+      event_type: "status_posted",
+      details: `Posted a WhatsApp status for "${bot.bot_name}"`,
+      metadata: { media_type: mediaType, audience_count: result.audienceCount },
+    }).catch(() => {});
+
+    return res.status(201).json({
+      post: posted ? mapStatusPostRow(posted) : null,
+      message: "Status posted successfully.",
+    });
+  } catch (err) {
+    await supabase
+      .from("bot_status_posts")
+      .update({
+        status: "failed",
+        processing_started_at: null,
+        error_message: err.message ?? "Status post failed.",
+      })
+      .eq("id", created.id);
+
+    return res.status(409).json({ error: err.message ?? "Status post failed." });
+  }
+});
+
+/* ── DELETE /api/bots/:id/status-posts/:postId ──────────────── */
+router.delete("/:id/status-posts/:postId", async (req, res) => {
+  const userId = req.user.sub;
+  const { id, postId } = req.params;
+
+  const { data: post, error } = await supabase
+    .from("bot_status_posts")
+    .select("id, user_id, bot_id, status")
+    .eq("id", postId)
+    .eq("bot_id", id)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: "Could not load scheduled post." });
+  if (!post || post.user_id !== userId) return res.status(404).json({ error: "Scheduled post not found." });
+  if (post.status !== "scheduled") {
+    return res.status(409).json({ error: "Only scheduled posts can be deleted before publishing." });
+  }
+
+  const { error: deleteError } = await supabase
+    .from("bot_status_posts")
+    .delete()
+    .eq("id", postId)
+    .eq("status", "scheduled");
+
+  if (deleteError) return res.status(500).json({ error: "Could not delete scheduled post." });
+
+  await supabase.from("bot_activity").insert({
+    user_id: userId,
+    bot_id: id,
+    event_type: "status_post_deleted",
+    details: "Deleted a scheduled status post before publication",
+    metadata: { post_id: postId },
+  }).catch(() => {});
+
+  return res.status(204).send();
 });
 
 /* ── POST /api/bots/:id/send ─────────────────────────────────── */

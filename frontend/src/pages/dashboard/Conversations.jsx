@@ -1,439 +1,570 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Paperclip, RefreshCw, Search, Send, Smile, Users } from "lucide-react";
 import { botsApi } from "../../api/bots.js";
 import { Spinner } from "../../components/ui/Spinner.jsx";
 
-const DISMISSED_KEY = "wabot:convs-dismissed";
+const POLL_MS = 12000;
 
-function loadDismissed() {
-  try {
-    const raw = localStorage.getItem(DISMISSED_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch (e) { return []; }
-}
-
-function saveDismissed(arr) {
-  try { localStorage.setItem(DISMISSED_KEY, JSON.stringify(arr)); } catch {}
-}
-
-function formatTimestamp(date) {
+function formatSidebarTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
   const now = new Date();
-  const then = new Date(date);
-  const diffMs = now - then;
-  const diffMins = Math.floor(diffMs / 60000);
-  const diffHours = Math.floor(diffMs / 3600000);
-  const diffDays = Math.floor(diffMs / 86400000);
-
-  if (diffMins < 1) return "Just now";
-  if (diffMins < 60) return `${diffMins} min ago`;
-  if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? "" : "s"} ago`;
-  if (diffDays < 7) return `${diffDays} day${diffDays === 1 ? "" : "s"} ago`;
-  return then.toLocaleDateString();
+  const sameDay = date.toDateString() === now.toDateString();
+  if (sameDay) {
+    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+  return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-export function Conversations() {
+function formatBubbleTime(value) {
+  if (!value) return "";
+  return new Date(value).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function getConversationTarget(conversation) {
+  return conversation?.chat_jid || conversation?.metadata?.chat_jid || conversation?.contact_jid || conversation?.metadata?.from || conversation?.metadata?.to || "";
+}
+
+function getMessagePreview(message) {
+  const body = String(message?.body ?? "").trim();
+  if (body) return body;
+
+  switch (message?.payload_type) {
+    case "image":
+      return "Photo";
+    case "video":
+      return "Video";
+    case "audio":
+    case "voice_note":
+      return "Voice note";
+    case "document":
+      return "Document";
+    case "location":
+      return "Location";
+    case "contact":
+    case "contacts":
+      return "Contact";
+    default:
+      return "Unsupported message";
+  }
+}
+
+function getConversationTitle(conversation) {
+  return conversation?.title || conversation?.phone_number || "Unknown";
+}
+
+function getConversationSubtitle(conversation) {
+  if (conversation?.is_group) return "Group chat";
+  if (conversation?.phone_number) return `+${conversation.phone_number}`;
+  return "Direct message";
+}
+
+export function Conversations({ bots = [] }) {
+  const hasBots = bots.length > 0;
+  const [activeBotId, setActiveBotId] = useState("all");
   const [loading, setLoading] = useState(true);
-  const [convs, setConvs] = useState([]);
-  const [offset, setOffset] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+  const [threadLoading, setThreadLoading] = useState(false);
+  const [conversations, setConversations] = useState([]);
   const [selected, setSelected] = useState(null);
-  const [reply, setReply] = useState("");
-  const [sending, setSending] = useState(false);
-  const [result, setResult] = useState(null);
-  const [view, setView] = useState("dm");
-  const [dismissed, setDismissed] = useState(() => loadDismissed());
-  const [persistRead, setPersistRead] = useState(false);
-  const [searchTerm, setSearchTerm] = useState("");
   const [threadMessages, setThreadMessages] = useState([]);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [sending, setSending] = useState(false);
+  const [composer, setComposer] = useState("");
+  const [result, setResult] = useState(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [view, setView] = useState("all");
 
-  const touchState = useRef({});
   const fileRef = useRef(null);
-  const messagesEndRef = useRef(null);
-
-  // Load conversations
-  useEffect(() => {
-    let mounted = true;
-    setLoading(true);
-    botsApi.v1Conversations(undefined, 50, offset)
-      .then((d) => {
-        if (!mounted) return;
-        setConvs(d.conversations ?? []);
-        setLoading(false);
-      })
-      .catch(() => { if (mounted) setLoading(false); });
-    return () => mounted = false;
-  }, [offset]);
-
-  // Save dismissed to localStorage
-  useEffect(() => { saveDismissed(dismissed); }, [dismissed]);
+  const endRef = useRef(null);
+  const refreshTimerRef = useRef(null);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ block: "end" });
-  }, [threadMessages]);
+    if (!hasBots) {
+      setActiveBotId("all");
+      return;
+    }
 
-  // Load thread when conversation is selected
-  const loadThread = useCallback(async (conversation) => {
-    if (!conversation) return;
+    const stillExists = activeBotId === "all" || bots.some((bot) => bot.id === activeBotId);
+    if (!stillExists) {
+      setActiveBotId(bots[0].id);
+    }
+  }, [activeBotId, bots, hasBots]);
+
+  const loadConversations = useCallback(async (silent = false) => {
+    if (!hasBots) {
+      setConversations([]);
+      setLoading(false);
+      return;
+    }
+
+    if (silent) {
+      setRefreshing(true);
+    } else {
+      setLoading(true);
+    }
+
     try {
-      const data = await botsApi.v1ConversationThread(
-        conversation.bot_id,
-        conversation.conversation_key,
-        200
-      );
-      setThreadMessages(data.messages || []);
+      const data = await botsApi.v1Conversations(activeBotId === "all" ? undefined : activeBotId, 200, 0);
+      const next = data.conversations ?? [];
+      setConversations(next);
+      setSelected((current) => {
+        if (!current) return current;
+        const replacement = next.find((item) => item.conversation_key === current.conversation_key && item.bot_id === current.bot_id);
+        return replacement ?? null;
+      });
     } catch (err) {
-      console.error("Failed to load thread:", err);
+      setResult({ ok: false, text: err.message || "Could not load conversations." });
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, [activeBotId, hasBots]);
+
+  const loadThread = useCallback(async (conversation) => {
+    if (!conversation) {
+      setThreadMessages([]);
+      return;
+    }
+
+    setThreadLoading(true);
+    try {
+      const data = await botsApi.v1ConversationThread(conversation.bot_id, conversation.conversation_key, 300);
+      const messages = data.messages ?? [];
+      setThreadMessages(messages);
+
+      if (conversation.unread) {
+        const unreadIds = messages
+          .filter((message) => message.direction === "inbound")
+          .map((message) => message.id)
+          .filter(Boolean);
+
+        const idsToMark = unreadIds.length > 0 ? unreadIds : [conversation.id];
+        setConversations((current) => current.map((item) => (
+          item.bot_id === conversation.bot_id && item.conversation_key === conversation.conversation_key
+            ? { ...item, unread: false, unread_count: 0 }
+            : item
+        )));
+
+        try {
+          await botsApi.v1MarkConversationsRead(idsToMark);
+        } catch {}
+      }
+    } catch (err) {
+      setResult({ ok: false, text: err.message || "Could not load thread." });
+    } finally {
+      setThreadLoading(false);
     }
   }, []);
 
-  const open = (c) => {
-    setSelected(c);
-    setReply("");
-    setResult(null);
-    setThreadMessages([]);
-    loadThread(c);
-  };
-  
-  const close = () => { 
-    setSelected(null); 
-    setReply(""); 
-    setResult(null);
-    setThreadMessages([]);
-  };
+  useEffect(() => {
+    loadConversations();
+  }, [loadConversations]);
 
-  const isGroupConv = (c) => {
-    if (c?.metadata?.isGroup !== undefined) return Boolean(c.metadata.isGroup);
-    if (c?.metadata?.from) return String(c.metadata.from).includes("@g.") || String(c.metadata.from).includes("@g.us");
-    return String(c?.details ?? "").includes("@g.") || String(c?.details ?? "").includes("@g.us");
-  };
-
-  const getSenderName = (c) => {
-    if (c?.metadata?.from) {
-      const from = String(c.metadata.from);
-      return from.replace("@s.whatsapp.net", "").replace("@g.us", "").split("@")[0];
-    }
-    return c?.details?.split(" ")[0] || "Unknown";
-  };
-
-  const getPreviewText = (c) => {
-    if (c?.metadata?.body) return c.metadata.body.slice(0, 60);
-    if (c?.details) return c.details.slice(0, 60);
-    return "No message preview";
-  };
-
-  // Filter conversations
-  const visibleConvs = convs
-    .filter((c) => c.event_type === "message_received")
-    .filter((c) => !dismissed.includes(c.id))
-    .filter((c) => {
-      if (view === "all") return true;
-      return view === "group" ? isGroupConv(c) : !isGroupConv(c);
-    })
-    .filter((c) => {
-      if (!searchTerm) return true;
-      const searchLower = searchTerm.toLowerCase();
-      return getSenderName(c).toLowerCase().includes(searchLower) ||
-             getPreviewText(c).toLowerCase().includes(searchLower);
-    });
-
-  const dismiss = (id) => {
-    setDismissed((s) => {
-      const next = Array.from(new Set([...(s || []), id]));
-      saveDismissed(next);
-      return next;
-    });
-    setConvs((s) => s.filter((c) => c.id !== id));
-    if (persistRead) {
-      botsApi.v1MarkConversationsRead([id]).catch(() => {});
-    }
-    if (selected?.id === id) close();
-  };
-
-  const markVisibleRead = async () => {
-    const ids = visibleConvs.map((c) => c.id);
-    setDismissed((s) => Array.from(new Set([...(s || []), ...ids])));
-    setConvs((s) => s.filter((c) => !ids.includes(c.id)));
-    if (persistRead && ids.length) {
-      await botsApi.v1MarkConversationsRead(ids).catch(() => {});
-    }
-  };
-
-  // Touch handlers for swipe-to-dismiss
-  const handleTouchStart = (e, id) => {
-    const t = e.touches?.[0];
-    if (!t) return;
-    touchState.current[id] = { startX: t.clientX, deltaX: 0 };
-  };
-  
-  const handleTouchMove = (e, id) => {
-    const t = e.touches?.[0];
-    if (!t || !touchState.current[id]) return;
-    touchState.current[id].deltaX = t.clientX - touchState.current[id].startX;
-    const el = document.getElementById(`conv-${id}`);
-    if (el) {
-      const dx = Math.max(-160, Math.min(0, touchState.current[id].deltaX));
-      el.style.transform = `translateX(${dx}px)`;
-      el.style.transition = "transform 0s";
-    }
-  };
-  
-  const handleTouchEnd = (e, id) => {
-    const state = touchState.current[id];
-    if (!state) return;
-    const el = document.getElementById(`conv-${id}`);
-    const dx = state.deltaX;
-    if (el) {
-      el.style.transition = "transform 200ms ease";
-      if (dx <= -80) {
-        el.style.transform = "translateX(-100%)";
-        setTimeout(() => dismiss(id), 180);
-      } else {
-        el.style.transform = "translateX(0)";
+  useEffect(() => {
+    clearInterval(refreshTimerRef.current);
+    refreshTimerRef.current = setInterval(() => {
+      loadConversations(true);
+      if (selected) {
+        loadThread(selected);
       }
-    }
-    delete touchState.current[id];
-  };
+    }, POLL_MS);
 
-  const doReply = async () => {
-    if (!selected) return;
-    setSending(true); 
+    return () => clearInterval(refreshTimerRef.current);
+  }, [loadConversations, loadThread, selected]);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ block: "end" });
+  }, [threadMessages]);
+
+  const visibleConversations = useMemo(() => {
+    const needle = searchTerm.trim().toLowerCase();
+    return conversations
+      .filter((conversation) => {
+        if (view === "groups") return conversation.is_group;
+        if (view === "unread") return conversation.unread;
+        return true;
+      })
+      .filter((conversation) => {
+        if (!needle) return true;
+        const haystacks = [
+          getConversationTitle(conversation),
+          getConversationSubtitle(conversation),
+          conversation.preview,
+          conversation.phone_number,
+        ].filter(Boolean).map((value) => String(value).toLowerCase());
+        return haystacks.some((value) => value.includes(needle));
+      });
+  }, [conversations, searchTerm, view]);
+
+  const selectedBot = activeBotId === "all" ? null : bots.find((bot) => bot.id === activeBotId) ?? null;
+
+  const openConversation = useCallback((conversation) => {
+    setSelected(conversation);
+    setComposer("");
     setResult(null);
-    
-    const to = selected.metadata?.chat_jid || selected.metadata?.from || selected.details;
-    const textMsg = reply.trim();
-    
-    if (!textMsg && !fileRef.current?.files?.[0]) {
-      setResult({ ok: false, text: "Please enter a message or attach a file" });
-      setSending(false);
+    loadThread(conversation);
+  }, [loadThread]);
+
+  const sendReply = useCallback(async () => {
+    if (!selected) return;
+
+    const textValue = composer.trim();
+    const file = fileRef.current?.files?.[0];
+    if (!textValue && !file) {
+      setResult({ ok: false, text: "Type a message or attach a file first." });
       return;
     }
-    
-    try {
-      const file = fileRef.current?.files?.[0];
-      if (file) {
-        // Check file size (max 16MB)
-        if (file.size > 16 * 1024 * 1024) {
-          throw new Error("File too large. Max 16MB.");
-        }
-        
-        const reader = await new Promise((resolve, reject) => {
-          const r = new FileReader();
-          r.onload = () => resolve(r.result);
-          r.onerror = reject;
-          r.readAsDataURL(file);
-        });
-        
-        const mediaType = file.type.startsWith("image/") ? "image" : 
-                         file.type.startsWith("video/") ? "video" : "document";
-        
-        await botsApi.sendDM(selected.bot_id, { 
-          to, 
-          message: { 
-            media: { 
-              type: mediaType, 
-              url: reader, 
-              caption: textMsg, 
-              fileName: file.name, 
-              mimetype: file.type 
-            } 
-          }
-        });
-        
-        // Clear file input after send
-        if (fileRef.current) fileRef.current.value = "";
-      } else {
-        await botsApi.sendDM(selected.bot_id, { to, message: textMsg });
-      }
-      
-      setResult({ ok: true, text: "✓ Reply sent successfully" });
-      setReply("");
-      await loadThread(selected);
-      
-      // Clear success message after 3 seconds
-      setTimeout(() => setResult(null), 3000);
-    } catch (err) {
-      setResult({ ok: false, text: err?.message || "Failed to send reply" });
-    } finally { 
-      setSending(false); 
-    }
-  };
 
-  if (loading) return (
-    <div style={{ display: "flex", justifyContent: "center", alignItems: "center", height: 400 }}>
-      <Spinner size="lg" />
-    </div>
-  );
+    setSending(true);
+    setResult(null);
+
+    try {
+      const to = getConversationTarget(selected);
+      if (!to) throw new Error("This conversation has no valid WhatsApp destination.");
+
+      if (file) {
+        if (file.size > 16 * 1024 * 1024) {
+          throw new Error("File too large. Maximum size is 16MB.");
+        }
+
+        const readerResult = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+
+        const mediaType = file.type.startsWith("image/")
+          ? "image"
+          : file.type.startsWith("video/")
+            ? "video"
+            : file.type.startsWith("audio/")
+              ? "audio"
+              : "document";
+
+        await botsApi.sendDM(selected.bot_id, {
+          to,
+          message: {
+            media: {
+              type: mediaType,
+              url: readerResult,
+              caption: textValue,
+              fileName: file.name,
+              mimetype: file.type,
+            },
+          },
+        });
+      } else {
+        await botsApi.sendDM(selected.bot_id, { to, message: textValue });
+      }
+
+      setComposer("");
+      if (fileRef.current) fileRef.current.value = "";
+      await Promise.all([loadConversations(true), loadThread(selected)]);
+      setResult({ ok: true, text: "Message sent." });
+      setTimeout(() => setResult(null), 2500);
+    } catch (err) {
+      setResult({ ok: false, text: err.message || "Failed to send message." });
+    } finally {
+      setSending(false);
+    }
+  }, [composer, loadConversations, loadThread, selected]);
+
+  if (!hasBots) {
+    return (
+      <div className="rounded-[30px] border border-white/10 bg-[var(--card)] p-10 text-center shadow-lg">
+        <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-3xl bg-[var(--accent-dim)] text-[var(--accent)]">
+          <Users size={28} />
+        </div>
+        <h2 className="mt-5 text-2xl font-semibold text-[var(--text)]">No bot inboxes yet</h2>
+        <p className="mx-auto mt-3 max-w-xl text-sm text-[var(--text2)]">
+          Deploy and connect a bot first. As soon as a WhatsApp session starts receiving messages, its own conversations workspace will appear here.
+        </p>
+      </div>
+    );
+  }
 
   return (
-    <div className="grid h-[calc(100dvh-8.5rem)] gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
-      <section className={`flex min-h-0 flex-col overflow-hidden rounded-[28px] border border-white/10 bg-[var(--card)] ${selected ? "hidden xl:flex" : "flex"}`}>
-        <div className="border-b border-white/10 bg-[var(--card2)] p-4">
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="inline-flex rounded-2xl border border-white/10 bg-black/10 p-1">
-              <button className={`rounded-xl px-3 py-2 text-sm ${view === "dm" ? "bg-[var(--accent)] text-white" : "text-[var(--text2)]"}`} onClick={() => setView("dm")}>DMs</button>
-              <button className={`rounded-xl px-3 py-2 text-sm ${view === "group" ? "bg-[var(--accent)] text-white" : "text-[var(--text2)]"}`} onClick={() => setView("group")}>Groups</button>
-              <button className={`rounded-xl px-3 py-2 text-sm ${view === "all" ? "bg-[var(--accent)] text-white" : "text-[var(--text2)]"}`} onClick={() => setView("all")}>All</button>
-            </div>
-            <div className="min-w-[180px] flex-1">
-              <input
-                type="text"
-                className="input h-11"
-                placeholder="Search conversations"
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-              />
-            </div>
-            <div className="flex gap-2">
-              <button className="btn btn-ghost" onClick={() => setOffset(Math.max(0, offset - 50))} title="Previous" disabled={offset === 0}>←</button>
-              <button className="btn btn-ghost" onClick={() => setOffset(offset + 50)} title="Next">→</button>
-            </div>
+    <div className="flex h-[calc(100dvh-8.5rem)] min-h-[680px] flex-col gap-4">
+      <section className="rounded-[30px] border border-white/10 bg-[var(--card)] p-4 shadow-lg">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div>
+            <div className="text-[11px] uppercase tracking-[0.26em] text-[var(--text3)]">Conversations</div>
+            <h2 className="mt-2 text-2xl font-semibold text-[var(--text)]">
+              {selectedBot ? `${selectedBot.bot_name} inbox` : "All bot inboxes"}
+            </h2>
+            <p className="mt-2 text-sm text-[var(--text2)]">
+              A WhatsApp-style workspace for messages, media, unread tracking, and replies, separated by bot session.
+            </p>
           </div>
 
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-xs text-[var(--text3)]">
-            <div>{visibleConvs.length} conversation{visibleConvs.length !== 1 ? "s" : ""}</div>
-            <label className="flex items-center gap-2">
-              <input type="checkbox" checked={persistRead} onChange={(e) => setPersistRead(e.target.checked)} />
-              <span>Persist reads</span>
-            </label>
-            <button className="btn btn-ghost btn-sm" onClick={markVisibleRead}>Mark all read</button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              className="inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-2 text-sm text-[var(--text2)] transition hover:border-[var(--border-accent)] hover:text-[var(--text)]"
+              onClick={() => loadConversations(true)}
+              disabled={refreshing}
+            >
+              {refreshing ? <Spinner size="sm" /> : <RefreshCw size={15} />}
+              Refresh
+            </button>
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-3">
-          {visibleConvs.length === 0 && (
-            <div className="rounded-[24px] border border-dashed border-white/10 bg-black/10 p-8 text-center text-sm text-[var(--text3)]">
-              {searchTerm ? "No matching conversations" : "No conversations yet"}
-            </div>
-          )}
-
-          {visibleConvs.map((c) => (
-            <div
-              id={`conv-${c.id}`}
-              key={c.id}
-              className={`mb-2 cursor-pointer rounded-[22px] border p-4 transition ${selected?.id === c.id ? "border-[var(--border-accent)] bg-[var(--accent-dim)]" : "border-white/10 bg-black/10 hover:bg-white/5"}`}
-              style={{ touchAction: "pan-y", transition: "transform 0.2s ease, background 0.2s ease" }}
-              onClick={() => open(c)}
-              onTouchStart={(e) => handleTouchStart(e, c.id)}
-              onTouchMove={(e) => handleTouchMove(e, c.id)}
-              onTouchEnd={(e) => handleTouchEnd(e, c.id)}
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            className={`rounded-2xl px-4 py-2 text-sm font-medium transition ${activeBotId === "all" ? "bg-[var(--accent)] text-white" : "border border-white/10 bg-white/5 text-[var(--text2)] hover:text-[var(--text)]"}`}
+            onClick={() => setActiveBotId("all")}
+          >
+            All bots
+          </button>
+          {bots.map((bot) => (
+            <button
+              key={bot.id}
+              className={`rounded-2xl px-4 py-2 text-sm font-medium transition ${activeBotId === bot.id ? "bg-[var(--accent)] text-white" : "border border-white/10 bg-white/5 text-[var(--text2)] hover:text-[var(--text)]"}`}
+              onClick={() => setActiveBotId(bot.id)}
             >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0 flex items-center gap-3">
-                  <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[var(--accent-dim)] text-sm font-semibold text-[var(--accent)]">
-                    {getSenderName(c).slice(0, 1).toUpperCase()}
-                  </div>
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-semibold text-[var(--text)]">{getSenderName(c)}</div>
-                    <div className="truncate text-[11px] uppercase tracking-[0.18em] text-[var(--text3)]">{c.bot_id?.slice(0, 8)}...</div>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-[var(--text3)]">{formatTimestamp(c.created_at)}</span>
-                  <button className="btn btn-ghost btn-sm" onClick={(ev) => { ev.stopPropagation(); dismiss(c.id); }}>
-                    Dismiss
-                  </button>
-                </div>
-              </div>
-              <div className="mt-2 line-clamp-2 text-sm text-[var(--text2)]">
-                {getPreviewText(c)}
-              </div>
-            </div>
+              {bot.bot_name}
+            </button>
           ))}
         </div>
       </section>
 
-      <section className={`min-h-0 overflow-hidden rounded-[28px] border border-white/10 bg-[var(--card)] ${selected ? "flex" : "hidden xl:flex"} flex-col`}>
-        {!selected && (
-          <div className="m-4 flex flex-1 items-center justify-center rounded-[24px] border border-dashed border-white/10 bg-black/10 p-10 text-center text-[var(--text3)]">
-            <div>
-              <div className="mb-3 text-5xl">💬</div>
-              <div className="text-base font-medium text-[var(--text)]">Select a conversation to open the thread</div>
-              <p className="mt-2 text-sm">Messages, attachments, timestamps, and replies stay in one place.</p>
+      <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[380px_minmax(0,1fr)]">
+        <section className={`min-h-0 overflow-hidden rounded-[30px] border border-white/10 bg-[var(--card)] shadow-lg ${selected ? "hidden xl:flex" : "flex"} flex-col`}>
+          <div className="border-b border-white/10 bg-[linear-gradient(135deg,var(--accent-dim),rgba(255,255,255,0.03))] p-4">
+            <div className="flex items-center gap-3">
+              <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[var(--accent)] text-white">
+                <Search size={18} />
+              </div>
+              <div className="flex-1">
+                <div className="text-sm font-semibold text-[var(--text)]">Inbox</div>
+                <div className="text-xs text-[var(--text3)]">
+                  {visibleConversations.length} chat{visibleConversations.length === 1 ? "" : "s"} visible
+                </div>
+              </div>
+            </div>
+
+            <div className="relative mt-4">
+              <Search size={16} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-[var(--text3)]" />
+              <input
+                type="text"
+                className="input h-12 pl-11"
+                placeholder="Search chats"
+                value={searchTerm}
+                onChange={(event) => setSearchTerm(event.target.value)}
+              />
+            </div>
+
+            <div className="mt-4 flex gap-2">
+              {[
+                { id: "all", label: "All" },
+                { id: "unread", label: "Unread" },
+                { id: "groups", label: "Groups" },
+              ].map((option) => (
+                <button
+                  key={option.id}
+                  className={`rounded-full px-4 py-2 text-xs font-semibold transition ${view === option.id ? "bg-[var(--accent)] text-white" : "border border-white/10 bg-white/5 text-[var(--text2)]"}`}
+                  onClick={() => setView(option.id)}
+                >
+                  {option.label}
+                </button>
+              ))}
             </div>
           </div>
-        )}
 
-        {selected && (
-          <>
-            <div className="border-b border-white/10 bg-[var(--card2)] px-4 py-4">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-base font-semibold text-[var(--text)]">
-                    {getSenderName(selected)} {isGroupConv(selected) && <span className="text-sm text-[var(--text3)]">(Group)</span>}
-                  </div>
-                  <div className="text-xs uppercase tracking-[0.18em] text-[var(--text3)]">
-                    Bot: {selected.bot_id}
-                  </div>
-                </div>
-                <button className="btn btn-ghost btn-sm" onClick={close}>Close</button>
+          <div className="min-h-0 flex-1 overflow-y-auto bg-[var(--card)]">
+            {loading ? (
+              <div className="flex h-full items-center justify-center">
+                <Spinner size="lg" />
               </div>
-            </div>
-
-            <div className="min-h-0 flex-1 overflow-y-auto bg-[linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0))] p-4">
-              {threadMessages.length === 0 && (
-                <div className="flex h-full items-center justify-center text-sm text-[var(--text3)]">No messages in this thread yet.</div>
-              )}
-              {threadMessages.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`mb-3 flex ${msg.direction === "outbound" ? "justify-end" : "justify-start"}`}
-                >
-                  <div className={`max-w-[85%] rounded-[22px] border px-4 py-3 shadow-sm xl:max-w-[72%] ${msg.direction === "outbound" ? "border-[var(--border-accent)] bg-[var(--accent-dim)]" : "border-white/10 bg-[var(--bg2)]"}`}>
-                    <div className="whitespace-pre-wrap text-sm text-[var(--text)]">
-                      {msg.body || "Unsupported message"}
-                    </div>
-                    <div className="mt-2 text-[11px] text-[var(--text3)]">
-                      {formatTimestamp(msg.created_at)}
-                    </div>
-                  </div>
-                </div>
-              ))}
-              <div ref={messagesEndRef} />
-            </div>
-
-            <div className="border-t border-white/10 bg-[var(--card)] p-4">
-              <div className="field">
-                <label className="field-label">Reply message</label>
-                <textarea
-                  className="input min-h-[120px] resize-y"
-                  rows={5}
-                  placeholder="Type your reply here..."
-                  value={reply}
-                  onChange={(e) => setReply(e.target.value)}
-                />
+            ) : visibleConversations.length === 0 ? (
+              <div className="m-4 rounded-[26px] border border-dashed border-white/10 bg-black/10 p-8 text-center text-sm text-[var(--text3)]">
+                No conversations match this view yet.
               </div>
-
-              <div className="field mt-4">
-                <label className="field-label">Attach file (optional)</label>
-                <input
-                  ref={fileRef}
-                  type="file"
-                  accept="image/*,video/*,application/pdf,.doc,.docx"
-                  className="text-sm text-[var(--text2)]"
-                />
-                <div className="mt-1 text-xs text-[var(--text3)]">
-                  Max 16MB. Supports images, videos, PDFs, and documents.
-                </div>
-              </div>
-
-              {result && (
-                <div className={`alert mt-4 ${result.ok ? "alert-success" : "alert-error"}`} style={{ marginBottom: 0 }}>
-                  {result.text}
-                </div>
-              )}
-
-              <div className="mt-4 flex flex-wrap gap-3">
+            ) : (
+              visibleConversations.map((conversation) => (
                 <button
-                  className="btn btn-primary"
-                  disabled={sending || (!reply.trim() && !fileRef.current?.files?.[0])}
-                  onClick={doReply}
+                  key={`${conversation.bot_id}:${conversation.conversation_key}`}
+                  className={`flex w-full items-start gap-3 border-b border-white/5 px-4 py-4 text-left transition ${selected?.conversation_key === conversation.conversation_key && selected?.bot_id === conversation.bot_id ? "bg-[var(--accent-dim)]" : "hover:bg-white/5"}`}
+                  onClick={() => openConversation(conversation)}
                 >
-                  {sending ? <><Spinner size="sm" /> Sending...</> : "📤 Send reply"}
+                  <div className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-full text-sm font-semibold ${conversation.unread ? "bg-[var(--accent)] text-white" : "bg-white/10 text-[var(--text)]"}`}>
+                    {getConversationTitle(conversation).slice(0, 1).toUpperCase()}
+                  </div>
+
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className={`truncate text-sm font-semibold ${conversation.unread ? "text-[var(--text)]" : "text-[var(--text)]/90"}`}>
+                          {getConversationTitle(conversation)}
+                        </div>
+                        <div className="mt-0.5 truncate text-xs text-[var(--text3)]">
+                          {activeBotId === "all" ? bots.find((bot) => bot.id === conversation.bot_id)?.bot_name ?? "Bot" : getConversationSubtitle(conversation)}
+                        </div>
+                      </div>
+                      <div className="shrink-0 text-right">
+                        <div className={`text-[11px] ${conversation.unread ? "text-[var(--accent)]" : "text-[var(--text3)]"}`}>
+                          {formatSidebarTime(conversation.last_message_at)}
+                        </div>
+                        {conversation.unread_count > 0 && (
+                          <div className="mt-2 inline-flex min-w-[1.5rem] items-center justify-center rounded-full bg-[var(--accent)] px-2 py-1 text-[11px] font-semibold text-white">
+                            {conversation.unread_count > 99 ? "99+" : conversation.unread_count}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className={`mt-2 truncate text-sm ${conversation.unread ? "font-medium text-[var(--text2)]" : "text-[var(--text3)]"}`}>
+                      {conversation.is_group ? "Group · " : ""}
+                      {conversation.preview || "No preview yet"}
+                    </div>
+                  </div>
                 </button>
-                <button className="btn btn-secondary" onClick={close}>Cancel</button>
+              ))
+            )}
+          </div>
+        </section>
+
+        <section className={`min-h-0 overflow-hidden rounded-[30px] border border-white/10 bg-[var(--card)] shadow-lg ${selected ? "flex" : "hidden xl:flex"} flex-col`}>
+          {!selected ? (
+            <div className="flex h-full flex-col items-center justify-center bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.08),transparent_55%),linear-gradient(180deg,rgba(255,255,255,0.02),rgba(0,0,0,0.05))] p-10 text-center">
+              <div className="flex h-20 w-20 items-center justify-center rounded-full bg-[var(--accent-dim)] text-[var(--accent)]">
+                <Users size={34} />
               </div>
+              <h3 className="mt-6 text-2xl font-semibold text-[var(--text)]">Open a chat</h3>
+              <p className="mt-3 max-w-md text-sm text-[var(--text2)]">
+                Pick a bot on the left, choose a thread, and reply from a workspace designed to feel familiar to WhatsApp users while keeping your app’s theme.
+              </p>
             </div>
-          </>
-        )}
-      </section>
+          ) : (
+            <>
+              <div className="border-b border-white/10 bg-[linear-gradient(135deg,var(--accent-dim),rgba(255,255,255,0.03))] px-4 py-4">
+                <div className="flex items-center gap-3">
+                  <button
+                    className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-white/10 bg-white/5 text-[var(--text2)] xl:hidden"
+                    onClick={() => setSelected(null)}
+                  >
+                    ←
+                  </button>
+
+                  <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[var(--accent)] text-sm font-semibold text-white">
+                    {getConversationTitle(selected).slice(0, 1).toUpperCase()}
+                  </div>
+
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-base font-semibold text-[var(--text)]">{getConversationTitle(selected)}</div>
+                    <div className="truncate text-xs text-[var(--text3)]">
+                      {bots.find((bot) => bot.id === selected.bot_id)?.bot_name ?? "Bot"} · {getConversationSubtitle(selected)}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="min-h-0 flex-1 overflow-y-auto bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.06),transparent_40%),linear-gradient(180deg,rgba(255,255,255,0.02),rgba(0,0,0,0.06))] px-4 py-5">
+                {threadLoading ? (
+                  <div className="flex h-full items-center justify-center">
+                    <Spinner size="lg" />
+                  </div>
+                ) : threadMessages.length === 0 ? (
+                  <div className="flex h-full items-center justify-center text-sm text-[var(--text3)]">
+                    No messages in this thread yet.
+                  </div>
+                ) : (
+                  threadMessages.map((message) => {
+                    const outbound = message.direction === "outbound";
+                    return (
+                      <div key={message.id} className={`mb-3 flex ${outbound ? "justify-end" : "justify-start"}`}>
+                        <div
+                          className={`max-w-[88%] rounded-[18px] px-4 py-3 shadow-sm xl:max-w-[72%] ${
+                            outbound
+                              ? "rounded-br-md bg-[var(--accent)] text-white"
+                              : "rounded-bl-md border border-white/10 bg-[var(--card2)] text-[var(--text)]"
+                          }`}
+                        >
+                          <div className="whitespace-pre-wrap break-words text-sm">
+                            {getMessagePreview(message)}
+                          </div>
+                          <div className={`mt-2 text-[11px] ${outbound ? "text-white/70" : "text-[var(--text3)]"}`}>
+                            {formatBubbleTime(message.created_at)}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+                <div ref={endRef} />
+              </div>
+
+              <div className="border-t border-white/10 bg-[var(--card)] p-4">
+                {result && (
+                  <div className={`mb-3 rounded-2xl border px-4 py-3 text-sm ${result.ok ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-100" : "border-rose-500/20 bg-rose-500/10 text-rose-100"}`}>
+                    {result.text}
+                  </div>
+                )}
+
+                <div className="rounded-[26px] border border-white/10 bg-[var(--bg2)] p-3">
+                  <div className="flex items-end gap-3">
+                    <button
+                      className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/5 text-[var(--text2)] transition hover:text-[var(--text)]"
+                      onClick={() => setPickerOpen((open) => !open)}
+                      type="button"
+                    >
+                      <Paperclip size={18} />
+                    </button>
+
+                    <div className="flex-1">
+                      <textarea
+                        className="w-full resize-none border-0 bg-transparent px-1 py-2 text-sm text-[var(--text)] outline-none placeholder:text-[var(--text3)]"
+                        rows={pickerOpen ? 4 : 2}
+                        placeholder="Type a message"
+                        value={composer}
+                        onChange={(event) => setComposer(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" && !event.shiftKey) {
+                            event.preventDefault();
+                            if (!sending) sendReply();
+                          }
+                        }}
+                      />
+                    </div>
+
+                    <button
+                      className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/5 text-[var(--text2)] transition hover:text-[var(--text)]"
+                      type="button"
+                    >
+                      <Smile size={18} />
+                    </button>
+
+                    <button
+                      className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                      onClick={sendReply}
+                      disabled={sending || (!composer.trim() && !fileRef.current?.files?.[0])}
+                      type="button"
+                    >
+                      {sending ? <Spinner size="sm" /> : <Send size={18} />}
+                    </button>
+                  </div>
+
+                  {pickerOpen && (
+                    <div className="mt-3 rounded-2xl border border-dashed border-white/10 bg-white/5 p-3">
+                      <input
+                        ref={fileRef}
+                        type="file"
+                        accept="image/*,video/*,audio/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
+                        className="block w-full text-sm text-[var(--text2)] file:mr-3 file:rounded-full file:border-0 file:bg-[var(--accent)] file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
+                      />
+                      <div className="mt-2 text-xs text-[var(--text3)]">
+                        Send photos, videos, audio, PDFs, and office documents up to 16MB.
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+        </section>
+      </div>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 
 const SECTIONS = [
@@ -14,7 +14,7 @@ const SECTIONS = [
   { id: "ai",            label: "AI integration"       },
   { id: "limitations",   label: "WhatsApp limitations" },
   { id: "antispm",       label: "Safety & anti-spam"   },
-  { id: "qrtrouble",     label: "QR troubleshooting"   },
+  { id: "qrtrouble",     label: "Connection troubleshooting" },
   { id: "errors",        label: "Errors"               },
   { id: "faq",           label: "FAQ"                  },
 ];
@@ -31,7 +31,7 @@ const FAQ = [
   },
   {
     q: "How long does the QR code last?",
-    a: "Each QR code is valid for approximately 20 seconds. WaBot automatically generates a fresh one when it expires. You have a 10-minute window to complete the scan."
+    a: "Each QR code is valid for about 60 seconds. WaBot refreshes it automatically when it expires, and you have up to 10 minutes to complete the connection."
   },
   {
     q: "Will my bot reconnect after a server restart?",
@@ -47,7 +47,7 @@ const FAQ = [
   },
   {
     q: "How do I disconnect a bot from WhatsApp?",
-    a: "Delete the bot from your dashboard. This terminates the session and clears the stored credentials. To reconnect, deploy a new bot and scan the QR code again."
+    a: "You can remove the session from WhatsApp Linked Devices or delete the bot from your dashboard. To reconnect later, open the bot's QR / Pairing tab and use either QR code or pairing code."
   },
   {
     q: "Is my WhatsApp session data encrypted?",
@@ -62,7 +62,7 @@ const FAQ = [
 const LIMITATIONS = [
   { icon: "⚡", title: "Rate limits", desc: "WhatsApp limits how fast you can send messages. Sending too many messages too quickly is a primary reason accounts get banned. WaBot enforces a minimum 1.5-second gap between outgoing messages." },
   { icon: "🔗", title: "No broadcast lists", desc: "Bulk sending to broadcast lists via the API is not supported and will likely result in a ban. For bulk messaging, use the official WhatsApp Business API." },
-  { icon: "🖼", title: "Media messages", desc: "Bots can receive image, video, audio, and document messages but automated replies to media content are limited. Text-based auto-replies are the most stable." },
+  { icon: "🖼", title: "Media messages", desc: "Bots can receive and classify text, images, videos, audio, voice notes, documents, mentions, replies, and view-once wrappers. Full literal transcription or image understanding still depends on the AI/media pipeline you configure." },
   { icon: "📵", title: "Groups you are not admin in", desc: "Group management commands (.kick, .lock, .warn etc.) only work if the bot's WhatsApp account is a group admin. Regular member bots cannot moderate groups." },
   { icon: "🔄", title: "Session expiry", desc: "If your phone is offline for an extended period, WhatsApp may invalidate the linked session. The bot will be put into a disconnected state and require a new QR scan." },
   { icon: "📋", title: "Message history", desc: "The bot only processes messages received while it is running. Historical messages are not replayed on restart." },
@@ -80,14 +80,16 @@ const SAFETY_RULES = [
 const QR_STEPS = [
   { step: 1, title: "Open WhatsApp on your phone", detail: "Make sure your phone has an active internet connection." },
   { step: 2, title: "Go to Linked Devices", detail: "On iOS: Settings → Linked Devices. On Android: three-dot menu → Linked Devices." },
-  { step: 3, title: "Tap 'Link a Device'", detail: "Point your phone camera at the QR code shown in WaBot." },
-  { step: 4, title: "Wait for confirmation", detail: "The QR screen will automatically close and the bot status will change to 'connected'." },
+  { step: 3, title: "Choose QR or phone-number pairing", detail: "In WaBot, choose either QR Code or Pairing Code before you continue." },
+  { step: 4, title: "Complete the link", detail: "Scan the QR code or tap 'Link with phone number' in WhatsApp and enter the pairing code." },
+  { step: 5, title: "Wait for confirmation", detail: "The modal closes automatically and the bot status changes to connected once WhatsApp finishes linking." },
 ];
 
 const QR_ERRORS = [
-  { err: "QR code expired before scan", fix: "WaBot automatically generates a new code every ~20 seconds. Wait for the fresh QR and scan quickly." },
+  { err: "QR code expired before scan", fix: "WaBot automatically refreshes the QR code. Wait for the next one and scan it quickly." },
+  { err: "Pairing code never appeared", fix: "Confirm you selected Pairing Code mode, entered a full phone number with country code, and wait a few seconds for WhatsApp to return the code." },
   { err: "Scan worked but bot stays 'connecting'", fix: "Wait 10–15 seconds. If it stays stuck, delete the bot and deploy again." },
-  { err: "QR timed out (2-minute timeout)", fix: "Click 'Reconnect' in the bot settings QR tab to generate a fresh code." },
+  { err: "Connection window timed out", fix: "Open the bot's QR / Pairing tab and click reconnect to request a fresh QR code or pairing code." },
   { err: "Bot was working but suddenly disconnected", fix: "Check WhatsApp → Linked Devices. If WaBot is not listed, delete and redeploy the bot." },
 ];
 
@@ -131,9 +133,6 @@ function FaqItem({ q, a }) {
 }
 
 export default function Docs() {
-  // Use a generic placeholder instead of exposing the actual backend URL
-  const apiBase = "/api/v1";
-
   const snippets = {
     curlSend: `curl -X POST "/api/v1/messages/send" \\
   -H "Authorization: Bearer wbk_YOUR_API_KEY" \\
@@ -207,7 +206,7 @@ Authorization: Bearer wbk_YOUR_API_KEY`,
   "ai_config": {
     "enabled": true,
     "provider": "openai",
-    "model": "gpt-4o-mini",
+    "model": "gpt-4.1-mini",
     "api_key": "sk-...",
     "system_prompt": "You are a helpful WhatsApp assistant.",
     "dm_trigger_mode": "all",
@@ -262,7 +261,7 @@ Authorization: Bearer wbk_YOUR_API_KEY`,
               <div className="docs-meta-tile"><div className="docs-meta-label">Auth</div><div className="docs-meta-value">Bearer wbk_ key</div></div>
               <div className="docs-meta-tile"><div className="docs-meta-label">Free</div><div className="docs-meta-value">30 req / min</div></div>
               <div className="docs-meta-tile"><div className="docs-meta-label">Pro</div><div className="docs-meta-value">300 req / min</div></div>
-              <div className="docs-meta-tile"><div className="docs-meta-label">Billing</div><div className="docs-meta-value">Paystack · ₦1,500 / mo</div></div>
+              <div className="docs-meta-tile"><div className="docs-meta-label">Pairing</div><div className="docs-meta-value">QR code or pairing code</div></div>
             </div>
           </div>
 
@@ -272,7 +271,7 @@ Authorization: Bearer wbk_YOUR_API_KEY`,
             <section id="overview" className="docs-section">
               <h2>Overview</h2>
               <p>Base path: <code className="inline-code">/api/v1</code>. All developer endpoints live under <code className="inline-code">/api/v1</code>.</p>
-              <p>Authentication accepts either a dashboard JWT or a generated API key that starts with <code className="inline-code">wbk_</code>.</p>
+              <p>Authentication accepts either a dashboard JWT or a generated API key that starts with <code className="inline-code">wbk_</code>. Bot setup, conversations, pairing, and status-post management live in the dashboard API under <code className="inline-code">/api/bots</code>.</p>
             </section>
 
             <hr className="docs-divider" />
@@ -302,7 +301,7 @@ Authorization: Bearer wbk_YOUR_API_KEY`,
                   </div>
                 ))}
               </div>
-              <p>Monthly message counters reset at the start of each billing period. AI features require the Pro plan.</p>
+              <p>Monthly message counters reset at the start of each billing period. AI features and broadcast messaging require the Pro plan.</p>
             </section>
 
             <hr className="docs-divider" />
@@ -370,8 +369,9 @@ Authorization: Bearer wbk_YOUR_API_KEY`,
               <div className="docs-steps">
                 <div className="docs-step"><div className="docs-step-num">1</div><div><strong>Name and configure your bot</strong> — Choose a name, select DM or Group mode.</div></div>
                 <div className="docs-step"><div className="docs-step-num">2</div><div><strong>Accept the safety warning</strong> — Acknowledge WhatsApp automation risks.</div></div>
-                <div className="docs-step"><div className="docs-step-num">3</div><div><strong>Scan the QR code</strong> — WhatsApp → Linked Devices → Link a Device.</div></div>
-                <div className="docs-step"><div className="docs-step-num">4</div><div><strong>Configure and go live</strong> — Set up auto-replies, triggers, and webhooks.</div></div>
+                <div className="docs-step"><div className="docs-step-num">3</div><div><strong>Choose a connection method</strong> — Use QR Code or Pairing Code, depending on how you want to link the WhatsApp number.</div></div>
+                <div className="docs-step"><div className="docs-step-num">4</div><div><strong>Complete the WhatsApp link</strong> — Scan the QR or enter the pairing code from Linked Devices.</div></div>
+                <div className="docs-step"><div className="docs-step-num">5</div><div><strong>Configure and go live</strong> — Set up auto-replies, triggers, AI, webhooks, status posts, and conversations.</div></div>
               </div>
             </section>
 
@@ -381,8 +381,9 @@ Authorization: Bearer wbk_YOUR_API_KEY`,
               <div className="docs-eyebrow pro">Pro feature</div>
               <h2>AI integration</h2>
               <div className="docs-providers-grid">
-                <div className="docs-provider"><div className="docs-provider-name">OpenAI</div><div className="docs-provider-models">gpt-4o, gpt-4o-mini, gpt-3.5-turbo</div></div>
-                <div className="docs-provider"><div className="docs-provider-name">Google Gemini</div><div className="docs-provider-models">gemini-1.5-pro, gemini-1.5-flash</div></div>
+                <div className="docs-provider"><div className="docs-provider-name">OpenAI</div><div className="docs-provider-models">gpt-4.1, gpt-4.1-mini, gpt-4o, gpt-4o-mini</div></div>
+                <div className="docs-provider"><div className="docs-provider-name">Google Gemini</div><div className="docs-provider-models">gemini-2.5-pro, gemini-2.5-flash, gemini-2.0-flash</div></div>
+                <div className="docs-provider"><div className="docs-provider-name">Groq</div><div className="docs-provider-models">llama-3.3-70b-versatile, llama-3.1-70b-versatile, mixtral-8x7b-32768</div></div>
               </div>
               <CodeBlock code={snippets.aiConfig} />
             </section>
@@ -418,7 +419,7 @@ Authorization: Bearer wbk_YOUR_API_KEY`,
 
             <section id="qrtrouble" className="docs-section">
               <div className="docs-eyebrow">Troubleshooting</div>
-              <h2>QR code issues</h2>
+              <h2>Connection issues</h2>
               {QR_ERRORS.map((e) => (
                 <div key={e.err} className="docs-qr-error">
                   <div className="docs-qr-error-title">⚠ {e.err}</div>
@@ -440,7 +441,7 @@ Authorization: Bearer wbk_YOUR_API_KEY`,
                 <div><code className="inline-code">401</code> <span>Missing, invalid, or expired token / API key.</span></div>
                 <div><code className="inline-code">403</code> <span>Plan-gated feature (AI config, Pro-only endpoints).</span></div>
                 <div><code className="inline-code">404</code> <span>Bot, template, or subscription not found.</span></div>
-                <div><code className="inline-code">409</code> <span>Bot exists but is not connected yet.</span></div>
+                <div><code className="inline-code">409</code> <span>Bot state conflict, such as not being connected yet or the selected link flow no longer being valid.</span></div>
                 <div><code className="inline-code">429</code> <span>Rate limit or monthly usage limit reached.</span></div>
                 <div><code className="inline-code">503</code> <span>Service not configured on this backend.</span></div>
               </div>

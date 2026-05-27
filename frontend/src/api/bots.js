@@ -3,6 +3,7 @@ import { apiFetch, BASE } from "./client.js";
 export const botsApi = {
   /* Dashboard data */
   dashboard:       ()                       => apiFetch("/bots/dashboard"),
+  get:             (id)                     => apiFetch(`/bots/${id}`),
 
   /* Bot lifecycle */
   deploy:          (body)                   => apiFetch("/bots/deploy",          { method: "POST",   body: JSON.stringify(body) }),
@@ -24,6 +25,9 @@ export const botsApi = {
 
   /* Send DM from dashboard */
   sendDM:          (id, payload)            => apiFetch(`/bots/${id}/send`,      { method: "POST",   body: JSON.stringify(payload) }),
+  listStatusPosts: (id, limit = 50)         => apiFetch(`/bots/${id}/status-posts?limit=${limit}`),
+  createStatusPost:(id, body)               => apiFetch(`/bots/${id}/status-posts`, { method: "POST", body: JSON.stringify(body) }),
+  deleteStatusPost:(id, postId)             => apiFetch(`/bots/${id}/status-posts/${postId}`, { method: "DELETE" }),
 
   /* AI config (Pro) */
   saveAiConfig:    (id, aiConfig)           => apiFetch(`/bots/${id}`,           { method: "PATCH",  body: JSON.stringify({ ai_config: aiConfig }) }),
