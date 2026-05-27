@@ -33,7 +33,7 @@ import { supabase }      from "../../lib/supabase.js";
 import { logger }        from "../../utils/logger.js";
 import { env }           from "../../config/env.js";
 import { getAiCompletion, decryptApiKey } from "../ai/AiService.js";
-import { sanitizeUserPrompt, buildSystemBlock, redactForLogs } from "../ai/PromptCompiler.js";
+import { redactForLogs } from "../ai/PromptCompiler.js";
 import { compilePrompt } from "../ai/PromptEngine.js";
 
 const PLAN_MSG_LIMITS = { free: 1_000, paid: 100_000 };
@@ -81,6 +81,8 @@ const AI_RECENT_TURNS_LIMIT = 8;
 const AI_SUMMARY_MAX_CHARS = 1_800;
 const SEND_RETRY_ATTEMPTS = 3;
 const SEND_RETRY_BASE_DELAY_MS = 1_250;
+const PAIRING_SOCKET_SETTLE_MS = 2_500;
+const PAIRING_REQUEST_TIMEOUT_MS = 45_000;
 const QR_AUTH_STATUSES = new Set(["awaiting_qr", "awaiting_qr_scan", "qr_generated"]);
 const PAIRING_AUTH_STATUSES = new Set(["awaiting_code", "awaiting_pairing", "code_generated", "awaiting_link"]);
 
@@ -204,6 +206,43 @@ function normalizePhoneDigits(value = "") {
 
 function extractPhoneFromJid(jid = "") {
   return normalizeJid(jid).split("@")[0]?.replace(/[^\d]/g, "") ?? "";
+}
+
+function formatPhoneForHumans(value = "") {
+  const digits = String(value ?? "").replace(/[^\d]/g, "");
+  if (!digits) return "";
+  return `+${digits}`;
+}
+
+function formatActorLabel({ jid = "", phone = "", fallback = "" } = {}) {
+  const readablePhone = formatPhoneForHumans(phone || extractPhoneFromJid(jid));
+  if (readablePhone) return readablePhone;
+  const handle = jidToReadableHandle(jid);
+  if (handle) return handle;
+  return String(fallback ?? "").trim();
+}
+
+function looksLikeLeadIntent(text = "") {
+  const normalized = compactWhitespace(text).toLowerCase();
+  if (!normalized) return false;
+  return [
+    "price",
+    "pricing",
+    "cost",
+    "buy",
+    "order",
+    "interested",
+    "enquiry",
+    "inquiry",
+    "available",
+    "catalog",
+    "service",
+    "product",
+    "call me",
+    "contact me",
+    "need help",
+    "want",
+  ].some((token) => normalized.includes(token));
 }
 
 function looksLikeImageGenerationPrompt(text = "") {
@@ -621,6 +660,7 @@ export class BotInstance {
     this._pairingCodeInFlight   = false;
     this._lastPairingCode       = null;
     this._lastPairingCodeExpiresAt = null;
+    this._pairingRequestNonce   = 0;
     this._socketStartedAt       = Date.now();
 
     /* ── Group management in-memory state ─────────────────── */
@@ -740,7 +780,12 @@ export class BotInstance {
         this.socket.ev.on("group-participants.update", this._socketListeners.onGroupParticipants);
       } catch (err) {
         logger.error({ err, botId: this.botId }, "BotInstance.start failed");
-        if (!this._destroyed) this._scheduleReconnect();
+        if (err?.code === "BOT_NOT_FOUND") {
+          await this._setStatus("disconnected");
+          await this._log("bot_missing", "Bot record no longer exists; skipping WhatsApp startup");
+        } else if (!this._destroyed) {
+          this._scheduleReconnect();
+        }
       } finally {
         this._startPromise = null;
       }
@@ -876,21 +921,12 @@ export class BotInstance {
 
     if (qr) {
       this._socketReadyForPairing = true;
-
-      // Display gate: decide BEFORE doing any heavy QR work or emitting to UI.
-      const shouldRenderQR = this._shouldShowQR(qr);
-      if (!shouldRenderQR) {
-        // Suppress QR entirely when pairing flow is active or a code exists.
-        // NOTE: do NOT emit pairing code here — emission must be controlled
-        // exclusively by _doPairingCodeRequest / _emitPairingCode to avoid
-        // double-emission races during reconnect storms.
-        this.qrCode = null;
-        this._clearQrTimeout();
-        await this._setStatus(this._lastPairingCodeExpiresAt ? "awaiting_link" : "awaiting_code");
-        logger.info({ botId: this.botId }, "QR suppressed by display gate — pairing_code or pairing_mode active");
-        // If pairing-mode active, kick off the deferred pairing request if not already running.
-        if (this._isPairingMode && this._pairingPhone && !this._pairingCodeInFlight) {
-          this._doPairingCodeRequest().catch((err) => {
+      if (this._shouldUsePairingFlow()) {
+        this._clearVisibleQr();
+        await this._setStatus(this._lastPairingCode ? "awaiting_link" : "awaiting_pairing");
+        logger.info({ botId: this.botId, phone: this._pairingPhone }, "QR payload suppressed because pairing-code mode is active");
+        if (!this._pairingCodeInFlight) {
+          this._doPairingCodeRequest(this._pairingRequestNonce).catch((err) => {
             logger.error({ err, botId: this.botId }, "Deferred pairing code request failed");
           });
         }
@@ -898,17 +934,6 @@ export class BotInstance {
       }
 
       try {
-        // Double-check before expensive rendering to avoid a race where a code arrives
-        // between the initial gate check and QR generation.
-        if (!this._shouldShowQR(qr)) {
-          // Same as above: avoid emitting here. Let pairing logic emit when ready.
-          this.qrCode = null;
-          this._clearQrTimeout();
-          await this._setStatus(this._lastPairingCodeExpiresAt ? "awaiting_link" : "awaiting_code");
-          logger.info({ botId: this.botId }, "QR suppressed by display gate (post-check)");
-          return;
-        }
-
         this.qrCode = await QRCode.toDataURL(qr);
         this._emitPairingCode(null, null);
         for (const cb of this._onQR) cb(this.qrCode);
@@ -975,9 +1000,6 @@ export class BotInstance {
     if (!this.socket)                   throw new Error("Bot socket not started. Please wait a moment and try again.");
     if (!this.socket.requestPairingCode) throw new Error("This Baileys version does not support pairing codes.");
     if (this.status === "connected")     throw new Error("Bot is already connected. Pairing code is no longer needed.");
-    if (QR_AUTH_STATUSES.has(this.status) && this.qrCode) {
-      logger.info({ botId: this.botId }, "Switching auth flow to pairing-code mode before authentication completes");
-    }
 
     const cleanPhone = String(phone).replace(/[^\d]/g, "");
     if (!/^\d{10,15}$/.test(cleanPhone)) {
@@ -996,15 +1018,14 @@ export class BotInstance {
       socketReadyForPairing: this._socketReadyForPairing,
     }, "Preparing pairing code request");
 
+    this._pairingRequestNonce += 1;
     this._clearPairingState({ clearLastCode: true, clearMode: false });
     this._setAuthMode("pairing_code");
     this._pairingPhone  = cleanPhone;
-    this.qrCode         = null;
-    this._clearQrTimeout();
-    for (const cb of this._onQR) {
-      try { cb(null); } catch {}
-    }
-    await this._setStatus("awaiting_code");
+    this._clearVisibleQr();
+    await this._setStatus(this._socketReadyForPairing ? "awaiting_pairing" : "awaiting_code");
+
+    const requestNonce = this._pairingRequestNonce;
     this._pairingRequestPromise = new Promise((resolve, reject) => {
       const tid = setTimeout(() => {
         logger.warn({ botId: this.botId, phone: cleanPhone }, "Pairing code request timed out");
@@ -1012,15 +1033,15 @@ export class BotInstance {
         this._pairingCodeReject  = null;
         this._pairingRequestPromise = null;
         this._clearPairingState({ clearLastCode: true });
-        reject(new Error("Pairing code request timed out (30 s). Reconnect the bot and try again."));
-      }, 30_000);
+        reject(new Error("Pairing code request timed out. Reconnect the bot and try again."));
+      }, PAIRING_REQUEST_TIMEOUT_MS);
 
-      this._pairingCodeResolve = (code) => {
+      this._pairingCodeResolve = (payload) => {
         clearTimeout(tid);
         this._pairingCodeResolve = null;
         this._pairingCodeReject  = null;
         this._pairingRequestPromise = null;
-        resolve(code);
+        resolve(payload);
       };
       this._pairingCodeReject = (err) => {
         clearTimeout(tid);
@@ -1032,7 +1053,7 @@ export class BotInstance {
       };
 
       if (this._socketReadyForPairing && !this._pairingCodeInFlight) {
-        this._doPairingCodeRequest();
+        this._doPairingCodeRequest(requestNonce);
       }
     });
 
@@ -1040,35 +1061,34 @@ export class BotInstance {
   }
 
   /* ── Internal: call Baileys and emit the pairing code ─────── */
-  async _doPairingCodeRequest() {
+  async _doPairingCodeRequest(requestNonce = this._pairingRequestNonce) {
     if (this._pairingCodeInFlight) return;
     const phone = this._pairingPhone;
     if (!phone || !this.socket?.requestPairingCode) return;
 
     this._pairingCodeInFlight = true;
 
-    // ✅ FIX: 1500 ms stabilisation delay — Baileys emits the QR event at the
-    //         moment the WebSocket handshake finishes, but WhatsApp's server
-    //         needs a short window before it accepts a pairing-code request.
-    //         Calling requestPairingCode() too quickly causes an immediate
-    //         disconnect / "bad request" rejection from WhatsApp.
-    await new Promise(r => setTimeout(r, 1500));
-
-    // ✅ FIX: the mode may have been cancelled or the socket may have closed
-    //         during the delay — bail out rather than sending a stale request
-    if (!this._isPairingMode || !this._pairingPhone || !this.socket) {
-      this._pairingCodeInFlight = false;
-      return;
-    }
-
     try {
+      await this._setStatus("awaiting_pairing");
+      await this._sleep(PAIRING_SOCKET_SETTLE_MS);
+
+      if (requestNonce !== this._pairingRequestNonce || !this._shouldUsePairingFlow()) {
+        return;
+      }
+
       logger.info({ botId: this.botId, phone, socketReadyForPairing: this._socketReadyForPairing }, "Calling requestPairingCode()");
       const code = await this.socket.requestPairingCode(phone);
       if (!code) throw new Error("Baileys returned an empty pairing code.");
       const expiresAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+
+      if (requestNonce !== this._pairingRequestNonce) {
+        logger.info({ botId: this.botId, phone }, "Ignoring stale pairing code result");
+        return;
+      }
+
       this._emitPairingCode(code, expiresAt);
       await this._setStatus("code_generated");
-      if (this._pairingCodeResolve) this._pairingCodeResolve(code);
+      if (this._pairingCodeResolve) this._pairingCodeResolve({ code, expiresAt });
       await this._setStatus("awaiting_link");
     } catch (err) {
       logger.error({ err, botId: this.botId, phone }, "Pairing code request failed");
@@ -1097,6 +1117,14 @@ export class BotInstance {
     this._isPairingMode = this._authMode === "pairing_code";
   }
 
+  _clearVisibleQr() {
+    this.qrCode = null;
+    this._clearQrTimeout();
+    for (const cb of this._onQR) {
+      try { cb(null); } catch {}
+    }
+  }
+
   _clearPairingState({ clearLastCode = false, clearMode = true } = {}) {
     if (clearMode) this._setAuthMode("qr");
     this._socketReadyForPairing = false;
@@ -1104,14 +1132,11 @@ export class BotInstance {
     if (clearLastCode) this._emitPairingCode(null, null);
   }
 
-  /* ── Display gate for QR rendering ────────────────────── */
-  _shouldShowQR(qr) {
-    if (!qr) return false;
-    const hasPairingCode = typeof this._lastPairingCode === "string" && this._lastPairingCode.trim().length > 0;
-    const isPairingMode = this._isPairingMode === true;
-    // NEVER show QR if pairing is active or a pairing code exists
-    if (hasPairingCode || isPairingMode) return false;
-    return true;
+  _shouldUsePairingFlow() {
+    return this._isPairingMode === true
+      && typeof this._pairingPhone === "string"
+      && this._pairingPhone.length > 0
+      && this._socketReadyForPairing === true;
   }
 
   _rejectPairing(err) {
@@ -1370,6 +1395,54 @@ export class BotInstance {
     return Array.isArray(ai.assistant_admin_numbers) && ai.assistant_admin_numbers.includes(senderPhone);
   }
 
+  async _sendAssistantLeadSummary(jid) {
+    const { data, error } = await supabase
+      .from("assistant_leads")
+      .select("name, phone, message, created_at")
+      .eq("user_id", this.userId)
+      .eq("bot_id", this.botId)
+      .order("created_at", { ascending: false })
+      .limit(20);
+    if (error) throw error;
+
+    const lines = (data ?? []).length
+      ? ["*Recent leads:*", ...data.map((lead, index) => `${index + 1}. ${lead.name || "Unknown"} | ${formatPhoneForHumans(lead.phone) || "No phone"} | ${truncateText(lead.message, 80)} | ${new Date(lead.created_at).toLocaleString()}`)]
+      : ["No leads captured yet."];
+    await this._sendTrackedMessage(jid, { text: lines.join("\n") }, {
+      eventType: "assistant_leads_sent",
+      details: "Assistant leads summary sent",
+      metadata: { channel: "assistant_mode" },
+    });
+  }
+
+  async _sendAssistantLogs(jid) {
+    const { data, error } = await supabase
+      .from("bot_activity")
+      .select("event_type, details, metadata, created_at")
+      .eq("user_id", this.userId)
+      .eq("bot_id", this.botId)
+      .order("created_at", { ascending: false })
+      .limit(60);
+    if (error) throw error;
+    const rows = (data ?? []).slice(0, 50).map((r, i) => {
+      const when = new Date(r.created_at).toLocaleString();
+      const meta = r.metadata ?? {};
+      const who = formatActorLabel({
+        jid: meta.sender_jid || meta.from || meta.to || "",
+        phone: meta.sender_number || "",
+        fallback: "-",
+      });
+      const preview = String(meta.body ?? r.details ?? "").slice(0, 120).replace(/\n/g, " ");
+      return `${i + 1}. [${r.event_type}] ${when} — ${who}: ${preview}`;
+    });
+    const payloadText = rows.length ? ["Recent activity (most recent first):", ...rows].join("\n") : "No recent activity found.";
+    await this._sendTrackedMessage(jid, { text: payloadText }, {
+      eventType: "assistant_logs_sent",
+      details: "Assistant delivered recent logs to admin",
+      metadata: { channel: "assistant_mode" },
+    });
+  }
+
   async _storeAssistantLead({ conversationId, senderJid, profile = {} } = {}) {
     const phone = compactWhitespace(profile.phone ?? extractPhoneFromJid(senderJid));
     const name = compactWhitespace(profile.name ?? "");
@@ -1405,53 +1478,19 @@ export class BotInstance {
     const trimmedBody = compactWhitespace(body);
     if (!trimmedBody) return false;
 
-    if (trimmedBody.toLowerCase() === "/leads") {
-      if (!this._isAssistantAdmin(senderJid)) return false;
-      const { data, error } = await supabase
-        .from("assistant_leads")
-        .select("name, phone, message, created_at")
-        .eq("user_id", this.userId)
-        .eq("bot_id", this.botId)
-        .order("created_at", { ascending: false })
-        .limit(20);
-      if (error) throw error;
+    const isAdmin = this._isAssistantAdmin(senderJid);
+    const lowerBody = trimmedBody.toLowerCase();
+    const wantsLeadsSummary = /(^\/leads$)|\b(leads?|enquir(?:y|ies)|inquiries?|customers?|prospects?)\b/.test(lowerBody);
+    const wantsLogsSummary = /(^\/logs$)|(^\/ai logs$)|\b(logs?|activity|recent chats?|recent messages?)\b/.test(lowerBody);
 
-      const lines = (data ?? []).length
-        ? ["*Recent leads:*", ...data.map((lead, index) => `${index + 1}. ${lead.name || "Unknown"} | ${lead.phone || "No phone"} | ${truncateText(lead.message, 80)} | ${new Date(lead.created_at).toLocaleString()}`)]
-        : ["No leads captured yet."];
-      await this._sendTrackedMessage(jid, { text: lines.join("\n") }, {
-        eventType: "assistant_leads_sent",
-        details: "Assistant leads summary sent",
-        metadata: { channel: "assistant_mode" },
-      });
+    if (wantsLeadsSummary && isAdmin) {
+      await this._sendAssistantLeadSummary(jid);
       return true;
     }
 
-    // Admin-only: retrieve recent bot activity/logs for this conversation
-    if (trimmedBody.toLowerCase() === "/logs" || trimmedBody.toLowerCase() === "/ai logs") {
-      if (!this._isAssistantAdmin(senderJid)) return false;
+    if (wantsLogsSummary && isAdmin) {
       try {
-        const { data, error } = await supabase
-          .from("bot_activity")
-          .select("event_type, details, metadata, created_at")
-          .eq("user_id", this.userId)
-          .eq("bot_id", this.botId)
-          .order("created_at", { ascending: false })
-          .limit(60);
-        if (error) throw error;
-        const rows = (data ?? []).slice(0, 50).map((r, i) => {
-          const when = new Date(r.created_at).toLocaleString();
-          const meta = r.metadata ?? {};
-          const who = meta.sender_jid ? (meta.sender_number ? `${meta.sender_number}` : meta.sender_jid.replace(/@.*/, "")) : (meta.from || meta.to || "-");
-          const preview = String(meta.body ?? r.details ?? "").slice(0, 120).replace(/\n/g, " ");
-          return `${i + 1}. [${r.event_type}] ${when} — ${who}: ${preview}`;
-        });
-        const payloadText = rows.length ? ["Recent activity (most recent first):", ...rows].join("\n") : "No recent activity found.";
-        await this._sendTrackedMessage(jid, { text: payloadText }, {
-          eventType: "assistant_logs_sent",
-          details: "Assistant delivered recent logs to admin",
-          metadata: { channel: "assistant_mode" },
-        });
+        await this._sendAssistantLogs(jid);
         return true;
       } catch (err) {
         logger.warn({ err, botId: this.botId }, "Failed to fetch logs for admin");
@@ -1464,7 +1503,11 @@ export class BotInstance {
       }
     }
 
-    if (this._isAssistantAdmin(senderJid)) {
+    if (isAdmin) {
+      return false;
+    }
+
+    if (!looksLikeLeadIntent(trimmedBody)) {
       return false;
     }
 
@@ -2119,7 +2162,8 @@ export class BotInstance {
     }
 
     if (!normalizedBody && !["list_reply", "button_reply", "template_reply"].includes(msgType)) {
-      if (["voice_note", "audio", "image", "video", "document"].includes(msgType)) {
+      if (["voice_note", "audio", "image", "video", "document", "location", "contact", "contacts"].includes(msgType)) {
+        if (await this._handleAiResponse(jid, this._buildMediaAiInput({ body, msgType, extra }), extra, isGroup, { messageId, conversationId, msgType, senderJid })) return;
         await this._sendMediaProcessingFallback(jid, msgType);
       }
       return;
@@ -2157,8 +2201,8 @@ export class BotInstance {
     if (await this._handleCommand(jid, normalizedBody)) return;
     if (await this._handleKeywordTrigger(jid, normalizedBody)) return;
     if (await this._handleSalesAgent(jid, normalizedBody)) return;
-  if (await this._handleAssistantMode(jid, normalizedBody, { conversationId, senderJid, extra, isGroup: false })) return;
-  if (await this._handleAiResponse(jid, normalizedBody, extra, false, { messageId, conversationId, msgType, senderJid })) return;
+    if (await this._handleAssistantMode(jid, normalizedBody, { conversationId, senderJid, extra, isGroup: false })) return;
+    if (await this._handleAiResponse(jid, normalizedBody, extra, false, { messageId, conversationId, msgType, senderJid })) return;
 
     if (this.config.auto_reply_enabled && this.config.auto_reply_message && this.socket) {
       try {
@@ -2564,7 +2608,7 @@ export class BotInstance {
     const products = sac.products ?? [];
 
     if (override.custom_response) {
-      await this._sendTrackedMessage(jid, { text: override.custom_response }, {
+      await this._sendAutomatedReply(jid, { text: override.custom_response }, {
         eventType: "message_sent",
         details: `Command ${cmd} custom response`,
         metadata: { channel: "command", command: cmdKey }
@@ -2607,11 +2651,11 @@ export class BotInstance {
 
     if (reply) {
       try {
-        await this._sendTrackedMessage(jid, { text: reply }, {
+        await this._sendAutomatedReply(jid, { text: reply }, {
           eventType: "message_sent",
           details: `Command ${cmd}`,
           metadata: { channel: "command", command: cmdKey }
-        });
+        }, { channel: "command" });
         await this._log("command_handled", `Command ${cmd}`);
       } catch (err) {
         logger.error({ err }, "Command reply failed");
@@ -2788,13 +2832,22 @@ export class BotInstance {
       const catalog  = products.length
         ? `\n\nProducts:\n${products.map((p) => `- ${p.name}: ₦${p.price || "?"} — ${p.description || ""}`).join("\n")}`
         : "";
+      const assistantName = String(ai.assistant_name ?? "Medara").trim() || "Medara";
 
-      // Build structured messages (roles) instead of concatenating a single systemPrompt.
-      // Roles: multiple system messages (safety, admin context, bot config), developer (bot personality), then user.
-      const baseRules = `You are a helpful WhatsApp assistant for a business. Be concise and friendly. Answer in 1-3 sentences maximum.`;
+      const baseRules = [
+        `You are ${assistantName}, a WhatsApp assistant for this business.`,
+        "Follow the configured BOT_CONFIG closely.",
+        "If BOT_CONFIG is blank, use the default business-assistant behavior already provided in the system instructions.",
+        "Be warm, clear, and practical instead of overly defensive.",
+        "For normal customers, help naturally and only collect lead details when it makes sense.",
+        "For verified admins, behave like a trusted internal assistant and answer operational questions naturally.",
+        "Keep replies concise, but do not ignore clear system-prompt instructions about tone or role.",
+        "Never introduce yourself as an AI, language model, chatbot, or virtual assistant unless the user explicitly asks.",
+        `If asked who you are, say you are ${assistantName}, the business assistant for this WhatsApp line.`,
+      ].join(" ");
       const configPrompt = isGroup ? (ai.group_system_prompt || null) : (ai.system_prompt || null);
-  const userCustomPrompt = (ai.user_custom_prompt && String(ai.user_custom_prompt).trim()) || null;
-  const assistantAdminNumbers = Array.isArray(ai.assistant_admin_numbers) ? ai.assistant_admin_numbers : [];
+      const userCustomPrompt = (ai.user_custom_prompt && String(ai.user_custom_prompt).trim()) || null;
+      const assistantAdminNumbers = Array.isArray(ai.assistant_admin_numbers) ? ai.assistant_admin_numbers : [];
 
       const memoryBlock = await this._buildAiConversationMemory(context.conversationId ?? null, messageId);
       const userMessageBody = memoryBlock
@@ -2810,7 +2863,8 @@ export class BotInstance {
         baseRules,
         botConfig: configPrompt,
         catalog,
-        adminMeta: { assistantAdminNumbers },
+        adminMeta: { assistantAdminNumbers, isAdmin, senderNumber, assistantName },
+        assistantName,
         userCustomPrompt: userCustomPrompt,
         userMessage: userMessageBody,
       });
@@ -2834,11 +2888,11 @@ export class BotInstance {
       }
       const wantsImageResponse = ai.provider === "gemini" && looksLikeImageGenerationPrompt(body);
 
-  typingSession = await this._startTypingPresence(normalizedJid);
+      typingSession = await this._startTypingPresence(normalizedJid);
       const initialDelayMs = this._sampleDelay(300, 1_200);
       await this._sleep(initialDelayMs);
 
-  const jobId = `${this.botId}:${messageId ?? normalizedJid}:${ai.provider}:${body.trim().slice(0, 120)}`;
+      const jobId = `${this.botId}:${messageId ?? normalizedJid}:${ai.provider}:${body.trim().slice(0, 120)}`;
       logger.info({
         botId: this.botId,
         jid: normalizedJid,
@@ -2849,7 +2903,7 @@ export class BotInstance {
       }, "Queueing AI job");
 
       const generationStartedAt = Date.now();
-  const aiReply = await this._enqueueAiTask(jobId, async () => {
+      const aiReply = await this._enqueueAiTask(jobId, async () => {
         logger.info({
           botId: this.botId,
           provider: ai.provider,
@@ -2863,19 +2917,19 @@ export class BotInstance {
         }, "AI provider initialized");
         // Enforce AI mode dependency and ensure the system prompt is always passed.
         // ai_config is the canonical source of modes for this bot.
-        const { resolveAiModes } = await import('../ai/AiService.js');
+        const { resolveAiModes } = await import("../ai/AiService.js");
         const modes = resolveAiModes(ai);
 
-        // Build system prompt: DM uses system_prompt, group uses group_system_prompt when present
         const configPrompt = isGroup ? (ai.group_system_prompt || ai.system_prompt || "") : (ai.system_prompt || "");
+        const adminBehaviorNote = isAdmin
+          ? `Verified admin ${formatPhoneForHumans(senderNumber) || "unknown"} is speaking to you. Treat them like the boss/operator and answer directly.`
+          : "This sender is not a verified admin. Be helpful, but do not expose internal-only information.";
 
         const callOpts = {
           provider: ai.provider,
           apiKey,
           model: ai.model,
-          // always include the system prompt so both modes share the same base instructions
-          systemPrompt: configPrompt,
-          // For backward compatibility we still pass messages when the prompt compiler requires it
+          systemPrompt: [configPrompt, adminBehaviorNote].filter(Boolean).join("\n\n"),
           messages,
           metadata: {
             botId: this.botId,
@@ -2883,9 +2937,9 @@ export class BotInstance {
             messageId,
             jobId,
             isAdmin,
-            assistant_admin_numbers: assistantAdminNumbers,
             sender_number: senderNumber,
             sender_jid: senderJid,
+            assistant_name: assistantName,
             assistantMode: modes.assistantActive,
           },
           responseModalities: wantsImageResponse ? ["TEXT", "IMAGE"] : undefined,
@@ -3036,6 +3090,23 @@ export class BotInstance {
       await this._stopTypingPresence(typingSession ?? normalizedJid);
     }
     return false;
+  }
+
+  async _sendAutomatedReply(jid, payload, logMeta = {}, options = {}) {
+    const normalizedJid = normalizeJid(jid);
+    let typingSession = null;
+    try {
+      typingSession = await this._startTypingPresence(normalizedJid);
+      await this._waitForReplyWindow(options.channel ?? "command", {
+        text: extractPreview(payload),
+        queueDepth: this._aiJobs.length + this._activeAiJobs,
+        jid: normalizedJid,
+        channel: options.channel ?? "command",
+      });
+      await this._sendTrackedMessage(normalizedJid, payload, logMeta);
+    } finally {
+      await this._stopTypingPresence(typingSession ?? normalizedJid);
+    }
   }
 
   _enqueueAiTask(jobId, task) {

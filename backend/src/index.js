@@ -124,8 +124,8 @@ async function shutdown(signal) {
 async function bootstrap() {
   await dashboardRealtime.initialize();
   await contactLifecycleService.initialize();
-  await statusPostScheduler.initialize();
   await botManager.initialize();
+  await statusPostScheduler.initialize();
 
   server = app.listen(env.port, () => {
     logger.info({ port: env.port, env: env.nodeEnv }, "WaBot API listening");

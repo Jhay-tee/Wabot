@@ -8,6 +8,7 @@ import { logger } from "../../utils/logger.js";
 
 const ALGORITHM = "aes-256-gcm";
 const AI_TIMEOUT_MS = 25_000;
+const AI_RETRY_ATTEMPTS = 3;
 const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_MODELS = [
   "gemini-2.5-pro",
@@ -139,7 +140,6 @@ export const AI_PROVIDERS = [
  * @returns {Promise<{text:string, media:null|{type:string, data:string, mimetype:string, caption?:string}}>}
  */
 export async function getAiCompletion({ provider, apiKey, model, systemPrompt, userMessage, messages = undefined, metadata = {}, responseModalities = undefined }) {
-  const signal = AbortSignal.timeout(AI_TIMEOUT_MS);
   const providerId = provider?.toLowerCase?.() ?? "";
   const resolvedModel = providerId === "gemini" ? resolveGeminiModel(model) : model;
 
@@ -150,19 +150,49 @@ export async function getAiCompletion({ provider, apiKey, model, systemPrompt, u
     ...metadata,
   }, "AI request sent");
 
-  switch (providerId) {
-    case "openai":
-      return callOpenAI({ apiKey, model: model || "gpt-4o-mini", systemPrompt, userMessage, messages, signal, metadata });
+  for (let attempt = 1; attempt <= AI_RETRY_ATTEMPTS; attempt += 1) {
+    const signal = AbortSignal.timeout(AI_TIMEOUT_MS);
+    try {
+      switch (providerId) {
+        case "openai":
+          return await callOpenAI({ apiKey, model: model || "gpt-4o-mini", systemPrompt, userMessage, messages, signal, metadata });
 
-    case "gemini":
-      return callGemini({ apiKey, model: resolvedModel, systemPrompt, userMessage, messages, signal, metadata, responseModalities });
+        case "gemini":
+          return await callGemini({ apiKey, model: resolvedModel, systemPrompt, userMessage, messages, signal, metadata, responseModalities });
 
-    case "groq":
-      return callGroq({ apiKey, model: model || "llama-3.3-70b-versatile", systemPrompt, userMessage, messages, signal, metadata });
+        case "groq":
+          return await callGroq({ apiKey, model: model || "llama-3.3-70b-versatile", systemPrompt, userMessage, messages, signal, metadata });
 
-    default:
-      throw new Error(`Unknown AI provider: "${provider}". Supported: openai, gemini, groq`);
+        default:
+          throw new Error(`Unknown AI provider: "${provider}". Supported: openai, gemini, groq`);
+      }
+    } catch (err) {
+      if (attempt >= AI_RETRY_ATTEMPTS || !isRetryableAiError(err)) throw err;
+      const retryInMs = 750 * attempt;
+      logger.warn({ err: err?.message, provider: providerId, model: resolvedModel, attempt, retryInMs, ...metadata }, "Retrying temporary AI provider failure");
+      await new Promise((resolve) => setTimeout(resolve, retryInMs));
+    }
   }
+}
+
+function isRetryableAiError(err) {
+  const message = String(err?.message ?? err ?? "").toLowerCase();
+  return [
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "timeout",
+    "timed out",
+    "temporar",
+    "rate limit",
+    "quota",
+    "overloaded",
+    "unavailable",
+    "try again",
+    "resource exhausted",
+  ].some((token) => message.includes(token));
 }
 
 /**

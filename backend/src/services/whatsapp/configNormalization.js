@@ -116,6 +116,7 @@ export function normalizeAiConfig(input = {}) {
   const assistantAdminNumbers = Array.isArray(source.assistant_admin_numbers)
     ? [...new Set(source.assistant_admin_numbers.map((value) => String(value ?? "").replace(/[^\d]/g, "")).filter(Boolean))]
     : [];
+  const assistantName = String(source.assistant_name ?? "Medara").trim().slice(0, 80) || "Medara";
 
   return {
     ...source,
@@ -134,6 +135,7 @@ export function normalizeAiConfig(input = {}) {
     memory_char_limit: clampInt(source.memory_char_limit, 0, 6000, 1200),
     summary_char_limit: clampInt(source.summary_char_limit, 0, 4000, 1200),
     assistant_enabled: Boolean(source.assistant_enabled),
+    assistant_name: assistantName,
     assistant_admin_numbers: assistantAdminNumbers,
     is_sensitive: Boolean(source.is_sensitive),
     has_key: Boolean(source.has_key || source.encrypted_key),

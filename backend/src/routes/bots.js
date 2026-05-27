@@ -439,8 +439,11 @@ router.post("/:id/request-pairing", async (req, res) => {
   if (!bot || bot.user_id !== userId) return res.status(404).json({ error: "Bot not found." });
 
   try {
-    const code = await botManager.requestPairingCode(id, phone);
-    const expiresAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+    const result = await botManager.requestPairingCode(id, phone);
+    const code = typeof result === "string" ? result : result?.code ?? null;
+    const expiresAt = typeof result === "string"
+      ? new Date(Date.now() + 2 * 60 * 1000).toISOString()
+      : result?.expiresAt ?? null;
     return res.json({ ok: true, code, expiresAt });
   } catch (err) {
     logger.warn({ err, botId: id }, "Pairing code request route failed");
@@ -650,7 +653,7 @@ router.delete("/:id/status-posts/:postId", async (req, res) => {
 /* 
  * Dashboard manual message send.
  * - Updates monthly counter (counts toward user's plan limit)
- * - Does NOT save message content to database (persist: false)
+ * - Saves message content so dashboard conversations stay in sync
  * - Returns 429 if monthly limit reached
  */
 router.post("/:id/send", async (req, res) => {
@@ -697,8 +700,7 @@ router.post("/:id/send", async (req, res) => {
   }
 
   try {
-    // Use countOnly: true to update counter but NOT save message content
-    await botManager.sendMessage(id, to, message, { persist: false, countOnly: true });
+    await botManager.sendMessage(id, to, message, { persist: true, countOnly: false });
     
     return res.json({ ok: true, message: "Message sent." });
   } catch (err) {

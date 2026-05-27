@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BadgeCheck,
   Bot,
@@ -103,6 +103,7 @@ function buildTabs(isPro, botType) {
 
 export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   const isPro = user?.plan_tier === "paid";
+  const initialAuthMethod = initialBot._preferredAuthMethod === "code" ? "code" : "qr";
   const [bot, setBot]   = useState(initialBot);
   const [tab, setTab]   = useState(initialBot._openQr ? "qr" : "info");
   const [form, setForm] = useState({
@@ -124,7 +125,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
           memory_char_limit: 1200,
           ...bot.ai_config,
         }
-      : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
+      : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", assistant_name: "Medara", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
     group_management_config: typeof bot.group_management_config === "object" && bot.group_management_config
       ? bot.group_management_config
       : {
@@ -146,12 +147,13 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   const [showBulk,      setShowBulk]      = useState(false);
 
   /* QR / Pairing code state */
-  const [qrMethod, setQrMethod] = useState("qr");
+  const [qrMethod, setQrMethod] = useState(initialAuthMethod);
   const [pairingCode, setPairingCode] = useState(null);
   const [pairingExpiresAt, setPairingExpiresAt] = useState(null);
   const [showPhoneInput, setShowPhoneInput] = useState(false);
   const [pairCountry, setPairCountry] = useState("NG");
   const [phoneNumberInput, setPhoneNumberInput] = useState("");
+  const [requestedPairPhone, setRequestedPairPhone] = useState("");
   const [generatingCode, setGeneratingCode] = useState(false);
 
   const [saving,        setSaving]        = useState(false);
@@ -168,6 +170,9 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   const qrFirstRef   = useRef(null);
   const qrCdRef      = useRef(null);
   const qrMethodRef  = useRef(qrMethod);
+  const autoPairRef  = useRef(null);
+  const pairingStatuses = useMemo(() => new Set(["awaiting_code", "awaiting_pairing", "code_generated", "awaiting_link"]), []);
+  const qrStatuses = useMemo(() => new Set(["awaiting_qr", "awaiting_qr_scan", "qr_generated"]), []);
 
   const TABS = buildTabs(isPro, bot.bot_type);
   const selectedPairCountry = getCountryByCode(pairCountry);
@@ -205,7 +210,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
           memory_char_limit: 1200,
           ...bot.ai_config,
         }
-      : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
+      : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", assistant_name: "Medara", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
     group_management_config: typeof bot.group_management_config === "object" && bot.group_management_config
       ? bot.group_management_config
       : {
@@ -242,6 +247,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   useEffect(() => {
     setBot(initialBot);
     setTab(initialBot._openQr ? "qr" : "info");
+    setQrMethod(initialBot._preferredAuthMethod === "code" ? "code" : "qr");
     setForm({
       bot_name:            initialBot.bot_name          ?? "",
       description:         initialBot.description       ?? "",
@@ -261,7 +267,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
             memory_char_limit: 1200,
             ...initialBot.ai_config,
           }
-        : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
+        : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", assistant_name: "Medara", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
       group_management_config: typeof initialBot.group_management_config === "object" && initialBot.group_management_config
         ? initialBot.group_management_config
         : {
@@ -281,6 +287,8 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
     setAiKeySensitive(initialBot.ai_config?.is_sensitive ?? false);
     setAiKeyTest({ status: "idle", msg: "" });
     setPhoneNumberInput("");
+    setRequestedPairPhone(initialBot._autoRequestPairPhone ?? "");
+    autoPairRef.current = initialBot._autoRequestPairPhone ?? null;
     setMsg({ text: "", ok: false });
   }, [initialBot]);
 
@@ -313,6 +321,11 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   }, [startQrCountdown]);
 
   const receivePairingCode = useCallback((code, expiresAt) => {
+    if (!code) {
+      setPairingCode(null);
+      setPairingExpiresAt(null);
+      return;
+    }
     setPairingCode(code);
     setPairingExpiresAt(expiresAt);
     setQrMethod("code");  // Switch to pairing code display
@@ -350,6 +363,14 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
         }
         if (d.type === "status") {
           setBot((b) => ({ ...b, status: d.status }));
+          if (pairingStatuses.has(d.status)) {
+            setQrMethod("code");
+            setQrUrl(null);
+            setQrExpired(false);
+          }
+          if (qrStatuses.has(d.status) && qrMethodRef.current !== "qr") {
+            setQrUrl(null);
+          }
           if (d.status === "connected") {
             setPairingCode(null);
             setPairingExpiresAt(null);
@@ -384,24 +405,27 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       clearInterval(qrPollRef.current);
       clearInterval(qrCdRef.current);
     };
-  }, [tab, bot.id, qrMethod, receiveQr, receivePairingCode]);
+  }, [tab, bot.id, pairingStatuses, qrMethod, qrStatuses, receiveQr, receivePairingCode]);
 
   /* ── Pairing code functions ───────────────────────────────── */
   const requestNewPairingCode = () => {
+    setPairingCode(null);
+    setPairingExpiresAt(null);
     setShowPhoneInput(true);
     setPhoneNumberInput("");
   };
 
   const generateNewPairingCode = async () => {
     if (!normalizedPairPhone) return;
+    setRequestedPairPhone(normalizedPairPhone);
     setGeneratingCode(true);
     setShowPhoneInput(false);
     setQrMethod("code");
     setQrUrl(null);
     try {
       const resp = await botsApi.createPairingCode(bot.id, normalizedPairPhone);
-      setPairingCode(resp.code);
-      setPairingExpiresAt(resp.expiresAt);
+      setPairingCode(typeof resp.code === "string" ? resp.code : resp.code?.code ?? null);
+      setPairingExpiresAt(resp.expiresAt ?? resp.code?.expiresAt ?? null);
       setQrMethod("code");
       setMsg({ text: "Pairing code generated successfully!", ok: true });
       setTimeout(() => setMsg({ text: "", ok: false }), 3000);
@@ -413,7 +437,8 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   };
 
   const refreshPairingCode = async () => {
-    if (!normalizedPairPhone) {
+    const phoneForRefresh = requestedPairPhone || normalizedPairPhone;
+    if (!phoneForRefresh) {
       setShowPhoneInput(true);
       return;
     }
@@ -421,9 +446,9 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
     setQrMethod("code");
     setQrUrl(null);
     try {
-      const resp = await botsApi.createPairingCode(bot.id, normalizedPairPhone);
-      setPairingCode(resp.code);
-      setPairingExpiresAt(resp.expiresAt);
+      const resp = await botsApi.createPairingCode(bot.id, phoneForRefresh);
+      setPairingCode(typeof resp.code === "string" ? resp.code : resp.code?.code ?? null);
+      setPairingExpiresAt(resp.expiresAt ?? resp.code?.expiresAt ?? null);
       setMsg({ text: "Pairing code refreshed!", ok: true });
       setTimeout(() => setMsg({ text: "", ok: false }), 2000);
     } catch (err) {
@@ -432,6 +457,33 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
       setGeneratingCode(false);
     }
   };
+
+  useEffect(() => {
+    const autoPairPhone = autoPairRef.current;
+    if (tab !== "qr" || qrMethod !== "code" || !autoPairPhone || generatingCode || pairingCode) return;
+
+    autoPairRef.current = null;
+    setRequestedPairPhone(autoPairPhone);
+    setGeneratingCode(true);
+    setShowPhoneInput(false);
+    setQrUrl(null);
+
+    botsApi.createPairingCode(bot.id, autoPairPhone)
+      .then((resp) => {
+        const nextCode = typeof resp.code === "string" ? resp.code : resp.code?.code ?? null;
+        setPairingCode(nextCode);
+        setPairingExpiresAt(resp.expiresAt ?? resp.code?.expiresAt ?? null);
+        setMsg({ text: "Pairing code generated successfully!", ok: true });
+        setTimeout(() => setMsg({ text: "", ok: false }), 3000);
+      })
+      .catch((err) => {
+        setShowPhoneInput(true);
+        setMsg({ text: err.message || "Could not generate a pairing code right now.", ok: false });
+      })
+      .finally(() => {
+        setGeneratingCode(false);
+      });
+  }, [bot.id, generatingCode, pairingCode, qrMethod, tab]);
 
   /* ── Generic setters ─────────────────────────────────────── */
   const set = (k) => (e) =>
@@ -1597,6 +1649,14 @@ Reply with any command to get started.`}
                       </button>
                     </div>
                   </>
+                ) : generatingCode || pairingStatuses.has(bot.status) ? (
+                  <div style={{ padding: "1.5rem 1rem", display: "flex", flexDirection: "column", alignItems: "center", gap: "0.75rem" }}>
+                    <Spinner size="lg" />
+                    <div style={{ fontWeight: 700, color: "var(--text)" }}>Waiting for pairing code</div>
+                    <div style={{ maxWidth: "340px", fontSize: "0.8125rem", color: "var(--text2)", lineHeight: 1.5 }}>
+                      Keep WhatsApp open on the phone you want to link. We will show only the pairing code here as soon as WhatsApp approves it.
+                    </div>
+                  </div>
                 ) : showPhoneInput ? (
                   <div style={{ width: "100%", marginTop: "1rem" }}>
                     <p style={{ marginBottom: "0.5rem", color: "var(--text2)" }}>Choose a country and enter the local number. We format it automatically.</p>
@@ -1680,7 +1740,7 @@ Reply with any command to get started.`}
                   {reconnecting ? <><Spinner size="sm" /> Reconnecting…</> : "Reconnect"}
                 </button>
               </div>
-            ) : qrUrl ? (
+            ) : qrUrl && qrMethod === "qr" ? (
               // Show QR code
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.625rem", width: "100%" }}>
                 <p style={{ fontSize: "0.8125rem", color: "var(--text2)", textAlign: "center", margin: 0 }}>

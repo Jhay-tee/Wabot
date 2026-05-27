@@ -59,6 +59,25 @@ function getConversationSubtitle(conversation) {
   return "Direct message";
 }
 
+function getMessageSenderLabel(message, conversation) {
+  if (!message) return "";
+  if (message.direction === "outbound") return "You";
+
+  const name = String(message.sender_name ?? "").trim();
+  if (name) return name;
+
+  const senderJid = String(message.sender_jid ?? "").trim();
+  if (senderJid) {
+    return senderJid
+      .replace(/:\d+@/, "@")
+      .replace("@s.whatsapp.net", "")
+      .replace("@lid", "")
+      .replace("@g.us", "");
+  }
+
+  return getConversationTitle(conversation);
+}
+
 export function Conversations({ bots = [] }) {
   const hasBots = bots.length > 0;
   const [activeBotId, setActiveBotId] = useState("all");
@@ -473,6 +492,7 @@ export function Conversations({ bots = [] }) {
                 ) : (
                   threadMessages.map((message) => {
                     const outbound = message.direction === "outbound";
+                    const senderLabel = getMessageSenderLabel(message, selected);
                     return (
                       <div key={message.id} className={`mb-3 flex ${outbound ? "justify-end" : "justify-start"}`}>
                         <div
@@ -482,6 +502,9 @@ export function Conversations({ bots = [] }) {
                               : "rounded-bl-md border border-white/10 bg-[var(--card2)] text-[var(--text)]"
                           }`}
                         >
+                          <div className={`mb-1 text-[11px] font-semibold ${outbound ? "text-white/80" : "text-[var(--accent)]"}`}>
+                            {senderLabel}
+                          </div>
                           <div className="whitespace-pre-wrap break-words text-sm">
                             {getMessagePreview(message)}
                           </div>

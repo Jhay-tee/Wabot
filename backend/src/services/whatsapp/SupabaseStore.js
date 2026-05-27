@@ -31,6 +31,11 @@ function isPlainObject(value) {
   return value && typeof value === "object" && !Array.isArray(value);
 }
 
+function isMissingBotForeignKeyError(error) {
+  return String(error?.code) === "23503"
+    && String(error?.message ?? "").includes("bot_sessions_bot_id_fkey");
+}
+
 /* ----------------- minimal validation (IMPORTANT FIX) ----------------- */
 
 /**
@@ -89,6 +94,16 @@ class BotAuthPersistor {
         logger.error({ err, botId: this.botId }, "auth flush failed");
       });
     }
+  }
+
+  async handleMissingBotReference(reason, error) {
+    this.destroyed = true;
+    authPersistors.delete(this.botId);
+
+    logger.warn(
+      { botId: this.botId, reason, err: error },
+      "Skipping auth persistence because the bot row no longer exists"
+    );
   }
 
   async flush(reason = "update") {
@@ -153,6 +168,12 @@ class BotAuthPersistor {
           "auth persisted"
         );
       }
+    } catch (error) {
+      if (isMissingBotForeignKeyError(error)) {
+        await this.handleMissingBotReference(reason, error);
+        return;
+      }
+      throw error;
     } finally {
       this.isWriting = false;
 
@@ -181,6 +202,19 @@ export async function createSupabaseAuthState(botId) {
   if (existing) {
     existing.destroyed = true;
     authPersistors.delete(botId);
+  }
+
+  const { data: bot, error: botError } = await supabase
+    .from("bots")
+    .select("id")
+    .eq("id", botId)
+    .maybeSingle();
+
+  if (botError) throw botError;
+  if (!bot) {
+    const err = new Error(`Bot ${botId} does not exist, so auth state cannot be restored.`);
+    err.code = "BOT_NOT_FOUND";
+    throw err;
   }
 
   const { data, error } = await supabase

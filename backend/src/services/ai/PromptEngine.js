@@ -2,6 +2,14 @@
 // Produces a messages array with strict partitioning and enforces validations
 
 const DEFAULT_MAX_USER_PROMPT_CHARS = 4000;
+const DEFAULT_BEHAVIOR_PROMPT = [
+  "Act as the business representative for this WhatsApp line.",
+  "Your public name is Medara unless BOT_CONFIG sets a different assistant name.",
+  "Do not say you are an AI, language model, bot, or virtual assistant unless the customer explicitly asks about your identity.",
+  "If asked who you are, say you are Medara, the business assistant for this WhatsApp line.",
+  "Be warm, concise, practical, and honest.",
+  "Do not invent products, pricing, policies, or promises that are not in BOT_CONFIG or CATALOG.",
+].join(" ");
 
 function isLikelyInstructional(text) {
   if (!text) return false;
@@ -34,12 +42,14 @@ function validateUserContext(text) {
   return { ok: true };
 }
 
-function buildSystemBlocks({ baseRules, botConfig, catalog, adminMeta }) {
+function buildSystemBlocks({ baseRules, botConfig, catalog, adminMeta, assistantName = "Medara" }) {
   // Only server-controlled content here. Never include user-provided prompts.
   const sections = [];
+  sections.push(`IDENTITY:\nYou are ${assistantName}, the business WhatsApp assistant. Follow the configured system prompt closely unless it conflicts with safety rules.`);
+  sections.push(`DEFAULT_BEHAVIOR:\n${DEFAULT_BEHAVIOR_PROMPT.replace("Medara", assistantName)}`);
   if (baseRules) sections.push(`SECURITY_RULES:\n${baseRules}`);
   if (adminMeta) sections.push(`ADMIN_CONTEXT:\n${JSON.stringify(adminMeta)}`);
-  if (botConfig) sections.push(`BOT_CONFIG:\n${botConfig}`);
+  sections.push(`BOT_CONFIG:\n${botConfig || "No custom business prompt was configured. Use the default behavior, catalog, and admin context to answer naturally."}`);
   if (catalog) sections.push(`CATALOG:\n${catalog}`);
   return sections.join('\n\n');
 }
@@ -63,10 +73,10 @@ function redactForLogs(text) {
  * @returns {object} { ok, messages, safeLog, debugLog }
  */
 function compilePrompt(opts = {}) {
-  const { baseRules, botConfig, catalog, adminMeta, userCustomPrompt, userMessage } = opts;
+  const { baseRules, botConfig, catalog, adminMeta, userCustomPrompt, userMessage, assistantName } = opts;
 
   // Build system-only block(s)
-  const systemBlock = buildSystemBlocks({ baseRules, botConfig, catalog, adminMeta });
+  const systemBlock = buildSystemBlocks({ baseRules, botConfig, catalog, adminMeta, assistantName });
 
   // Sanitize user-provided context but DO NOT reject — treat as untrusted context-only
   const sanitizedUserContext = sanitizeUserContext(userCustomPrompt || '');

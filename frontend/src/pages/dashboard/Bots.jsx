@@ -40,6 +40,7 @@ export function Bots({ data, onRefresh }) {
   const [dmBot,      setDmBot]      = useState(null);
   const [deleting,   setDeleting]   = useState(null);
   const [deleteErr,  setDeleteErr]  = useState("");
+  const [deployNotice, setDeployNotice] = useState(null);
 
   const isPro   = user?.plan_tier === "paid";
   const maxBots = stats?.planLimit ?? (isPro ? 50 : 1);
@@ -76,9 +77,15 @@ export function Bots({ data, onRefresh }) {
     setModalHash(`dm:${bot.id}`);
   };
 
-  const handleDeployed = () => {
+  const handleDeployed = async (payload) => {
     closeModal();
-    onRefresh();
+    await onRefresh();
+    if (!payload?.bot) return;
+    setDeployNotice({
+      bot: payload.bot,
+      preferredAuthMethod: payload.preferredAuthMethod ?? "qr",
+      preferredPairPhone: payload.preferredPairPhone ?? null,
+    });
   };
 
   const handleDelete = async (bot) => {
@@ -134,6 +141,41 @@ export function Bots({ data, onRefresh }) {
         </div>
 
         {deleteErr && <Alert type="error">{deleteErr}</Alert>}
+
+        {deployNotice && (
+          <Alert type="success">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <strong>{deployNotice.bot.bot_name}</strong> was deployed successfully.
+                <div className="mt-1 text-xs text-current/80">
+                  The new bot card is now visible below. Open its auth panel when you’re ready to continue with {deployNotice.preferredAuthMethod === "code" ? "pairing code" : "QR"} setup.
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  className="inline-flex items-center justify-center rounded-2xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-sm font-semibold text-emerald-100 transition hover:bg-emerald-500/20"
+                  onClick={() => {
+                    setDeployNotice(null);
+                    setConfigBot({
+                      ...deployNotice.bot,
+                      _openQr: true,
+                      _preferredAuthMethod: deployNotice.preferredAuthMethod,
+                      _autoRequestPairPhone: deployNotice.preferredPairPhone,
+                    });
+                  }}
+                >
+                  Open auth panel
+                </button>
+                <button
+                  className="inline-flex items-center justify-center rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-sm font-semibold text-[var(--text)] transition hover:bg-white/10"
+                  onClick={() => setDeployNotice(null)}
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          </Alert>
+        )}
 
         {atLimit && !isPro && (
           <Alert type="info">

@@ -530,9 +530,11 @@ router.patch("/bots/:id/config", async (req, res) => {
       provider:      incoming.provider ?? existing.provider ?? "openai",
       model:         incoming.model    ?? existing.model    ?? null,
       system_prompt: incoming.system_prompt !== undefined ? String(incoming.system_prompt ?? "").trim() : (existing.system_prompt ?? ""),
+      group_system_prompt: incoming.group_system_prompt !== undefined ? String(incoming.group_system_prompt ?? "").trim() : (existing.group_system_prompt ?? ""),
       encrypted_key: existing.encrypted_key ?? null,
       is_sensitive:  existing.is_sensitive  ?? false,
       assistant_enabled: incoming.assistant_enabled !== undefined ? Boolean(incoming.assistant_enabled) : (existing.assistant_enabled ?? false),
+      assistant_name: incoming.assistant_name !== undefined ? String(incoming.assistant_name ?? "").trim() : (existing.assistant_name ?? "Medara"),
       assistant_admin_numbers: Array.isArray(incoming.assistant_admin_numbers)
         ? [...new Set(incoming.assistant_admin_numbers.map((value) => String(value ?? "").replace(/[^\d]/g, "")).filter(Boolean))]
         : (existing.assistant_admin_numbers ?? []),

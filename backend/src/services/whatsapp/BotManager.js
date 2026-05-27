@@ -480,7 +480,7 @@ class BotManager {
    * Request an 8-digit pairing code for a bot (WhatsApp Web style).
    * @param {string} botId - Bot ID
    * @param {string} phone - Phone number (e.g., "628123456789" — no +, no spaces)
-   * @returns {Promise<string>} - 8-digit pairing code
+   * @returns {Promise<{ code: string, expiresAt: string }|string>}
    */
   async requestPairingCode(botId, phone) {
     const inst = this.instances.get(botId);
