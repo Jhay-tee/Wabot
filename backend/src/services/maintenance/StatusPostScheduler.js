@@ -2,7 +2,7 @@ import { supabase } from "../../lib/supabase.js";
 import { botManager } from "../whatsapp/BotManager.js";
 import { logger } from "../../utils/logger.js";
 
-const POLL_MS = 15_000;
+const POLL_MS = 60_000;
 const BATCH_SIZE = 20;
 
 class StatusPostScheduler {

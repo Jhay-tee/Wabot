@@ -237,7 +237,10 @@ router.get("/dashboard", async (req, res) => {
   });
 
   return res.json({
-    user,
+    user: {
+      ...user,
+      isSuperAdmin: user.email?.toLowerCase() === env.superadminEmail?.toLowerCase() && Boolean(env.superadminEmail),
+    },
     bots:     botsWithLiveStatus,
     activity: activity ?? [],
     stats: {
@@ -670,8 +673,6 @@ router.post("/:id/send", async (req, res) => {
 
   if (!to)                         return res.status(400).json({ error: "`to` (phone number) is required." });
   if (!hasSendPayloadContent(message)) return res.status(400).json({ error: "`message` is required." });
-  if (typeof message === "string" && message.length > 4096)
-    return res.status(400).json({ error: "Message too long (max 4 096 chars)." });
   const isRawJid = /@(g\.us|s\.whatsapp\.net|lid)$/i.test(to.trim());
   if (!isRawJid && !/^\+?\d{7,15}$/.test(to.replace(/[\s\-()]/g, "")))
     return res.status(400).json({ error: "Invalid phone number format." });

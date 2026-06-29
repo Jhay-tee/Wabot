@@ -72,6 +72,7 @@ class BotAuthPersistor {
     this.isWriting = false;
     this.needsFlush = false;
     this.destroyed = false;
+    this._flushDebounceTimer = null;
   }
 
   snapshot() {
@@ -89,11 +90,16 @@ class BotAuthPersistor {
 
     this.needsFlush = true;
 
-    if (!this.isWriting) {
+    if (this.isWriting) return;
+
+    if (this._flushDebounceTimer) return;
+
+    this._flushDebounceTimer = setTimeout(() => {
+      this._flushDebounceTimer = null;
       this.flush(reason).catch((err) => {
         logger.error({ err, botId: this.botId }, "auth flush failed");
       });
-    }
+    }, 5_000);
   }
 
   async handleMissingBotReference(reason, error) {

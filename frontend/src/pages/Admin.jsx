@@ -64,8 +64,10 @@ export default function Admin() {
   const [userPage, setUserPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const [userFilter, setUserFilter] = useState("all"); /* all | free | paid */
-  const [tab,      setTab]      = useState("overview"); /* overview | users | activity */
+  const [tab,      setTab]      = useState("overview"); /* overview | users | bots | activity */
   const [refreshed, setRefreshed] = useState(null);
+  const [bots,     setBots]     = useState([]);
+  const [loadingB, setLoadingB] = useState(true);
 
   /* Redirect if not logged in */
   useEffect(() => {
@@ -100,10 +102,19 @@ export default function Admin() {
       .finally(() => setLoadingA(false));
   }, []);
 
+  const loadBots = useCallback(() => {
+    setLoadingB(true);
+    adminApi.bots()
+      .then((d) => setBots(d.bots ?? []))
+      .catch((e) => setError(e.message))
+      .finally(() => setLoadingB(false));
+  }, []);
+
   useEffect(() => {
     loadStats();
     loadUsers(1);
     loadActivity();
+    loadBots();
   }, []);
 
   /* Filter users client-side */
@@ -155,7 +166,7 @@ export default function Admin() {
               Refreshed {timeAgo(refreshed.toISOString())}
             </span>
           )}
-          <button className="btn btn-secondary btn-sm" onClick={() => { loadStats(); loadUsers(userPage); loadActivity(); }}>
+          <button className="btn btn-secondary btn-sm" onClick={() => { loadStats(); loadUsers(userPage); loadActivity(); loadBots(); }}>
             ↻ Refresh
           </button>
           <button className="btn btn-ghost btn-sm" onClick={() => navigate("/dashboard")}>
@@ -170,6 +181,7 @@ export default function Admin() {
           {[
             { id: "overview", label: "📊 Overview" },
             { id: "users",    label: "👥 Users" },
+            { id: "bots",     label: "🤖 Bots" },
             { id: "activity", label: "📡 Activity" },
           ].map((t) => (
             <button key={t.id}
@@ -314,6 +326,51 @@ export default function Admin() {
           </div>
         )}
 
+        {/* ══════════════════════════════ BOTS ══════════════════════════════ */}
+        {tab === "bots" && (
+          <div className="admin-section">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
+              <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>All deployed bots</div>
+              <button className="btn btn-ghost btn-sm" onClick={loadBots}>↻ Reload</button>
+            </div>
+
+            {loadingB ? (
+              <div className="admin-loading"><Spinner /><span>Loading bots…</span></div>
+            ) : bots.length === 0 ? (
+              <div style={{ textAlign: "center", color: "var(--text3)", padding: "3rem" }}>No bots deployed yet.</div>
+            ) : (
+              <div className="admin-table-wrap">
+                <table className="admin-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th>DB status</th>
+                      <th>Live status</th>
+                      <th>Messages</th>
+                      <th>This month</th>
+                      <th>Created</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bots.map((bot) => (
+                      <tr key={bot.id}>
+                        <td style={{ fontWeight: 600 }}>{bot.bot_name}</td>
+                        <td>{bot.bot_type ?? "dm"}</td>
+                        <td>{bot.status ?? "—"}</td>
+                        <td>{bot.liveStatus ?? "—"}</td>
+                        <td>{fmt(bot.messages_count)}</td>
+                        <td>{fmt(bot.messages_this_month)}</td>
+                        <td className="text-muted3">{timeAgo(bot.created_at)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* ══════════════════════════════ ACTIVITY ══════════════════════════════ */}
         {tab === "activity" && (
           <div className="admin-section">
@@ -328,18 +385,24 @@ export default function Admin() {
               <div style={{ textAlign: "center", color: "var(--text3)", padding: "3rem" }}>No activity yet.</div>
             ) : (
               <div className="admin-activity-list">
-                {activity.map((ev) => (
+                {activity.map((ev) => {
+                  const meta = ev.metadata ?? {};
+                  const who = meta.sender_number || meta.pushName || meta.sender_jid || meta.from || meta.to || "";
+                  const preview = String(meta.body ?? ev.details ?? "—").slice(0, 180);
+                  return (
                   <div key={ev.id} className="admin-activity-row">
                     <EventBadge type={ev.event_type} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {ev.details || "—"}
+                        {preview}
                       </div>
-                      <div className="text-xs text-muted3 mono">{ev.bot_id}</div>
+                      <div className="text-xs text-muted3 mono">
+                        {ev.bot_id?.slice(0, 8)}…{who ? ` · ${who}` : ""}
+                      </div>
                     </div>
                     <div className="text-xs text-muted3" style={{ flexShrink: 0 }}>{timeAgo(ev.created_at)}</div>
                   </div>
-                ))}
+                );})}
               </div>
             )}
           </div>

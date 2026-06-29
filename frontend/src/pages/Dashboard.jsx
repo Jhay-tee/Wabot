@@ -53,8 +53,7 @@ export default function Dashboard() {
   const emailVerified = user?.emailVerified ?? user?.email_verified;
   const userEmail = user?.email ?? user?.email_address;
   
-  // Check if user is superadmin (from the /me endpoint)
-  const isSuperAdmin = user?.isSuperAdmin === true;
+  const isSuperAdmin = user?.isSuperAdmin === true || auth.user?.isSuperAdmin === true;
 
   // Build tabs dynamically - add Admin tab only for superadmins
   const TABS = isSuperAdmin ? [...BASE_TABS, ADMIN_TAB] : BASE_TABS;

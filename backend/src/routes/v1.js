@@ -71,6 +71,10 @@ function normalizePhone(value) {
   return String(value ?? "").replace(/[^\d+]/g, "").trim();
 }
 
+function extractPhoneFromJid(jid = "") {
+  return String(jid ?? "").replace(/:\d+@/, "@").split("@")[0]?.replace(/[^\d]/g, "") ?? "";
+}
+
 function getConversationKey(row) {
   const meta = row?.metadata ?? {};
   return meta.conversation_id || meta.chat_jid || meta.from || meta.to || `${row?.bot_id}:${row?.id}`;
@@ -82,6 +86,26 @@ function getConversationContactJid(row) {
   return meta.sender_jid || meta.chat_jid || meta.from || meta.to || null;
 }
 
+function formatConversationTitle(contact, meta, contactJid, isGroup, chatJid) {
+  const rawTitle = contact?.display_name || meta.pushName || meta.displayName || meta.notifyName || "";
+  if (String(rawTitle).trim()) return String(rawTitle).trim();
+
+  if (isGroup) {
+    return String(meta.group_name || chatJid || "Group").replace("@g.us", "");
+  }
+
+  const phone = contact?.phone_number || meta.sender_number || extractPhoneFromJid(contactJid || meta.sender_jid || "");
+  if (phone) return `+${String(phone).replace(/[^\d]/g, "")}`;
+
+  const jidHandle = String(contactJid || meta.sender_jid || meta.chat_jid || "")
+    .replace(/:\d+@/, "@")
+    .replace("@s.whatsapp.net", "")
+    .replace("@lid", "")
+    .replace("@g.us", "");
+
+  return jidHandle || "Unknown contact";
+}
+
 function normalizeConversationRow(row, { contact = null, unreadCount = 0 } = {}) {
   const meta = row?.metadata ?? {};
   const body = String(meta.body ?? row?.details ?? "").trim();
@@ -91,13 +115,8 @@ function normalizeConversationRow(row, { contact = null, unreadCount = 0 } = {})
   );
   const contactJid = getConversationContactJid(row);
   const chatJid = meta.chat_jid || meta.from || meta.to || null;
-  const rawTitle = contact?.display_name || meta.pushName || meta.displayName || meta.notifyName || "";
-  const fallbackTitle = isGroup
-    ? String(chatJid ?? "Group").replace("@g.us", "")
-    : String(contact?.phone_number || meta.sender_number || contactJid || chatJid || "Unknown")
-      .replace("@s.whatsapp.net", "")
-      .replace("@lid", "");
-  const title = String(rawTitle || fallbackTitle).trim();
+  const title = formatConversationTitle(contact, meta, contactJid, isGroup, chatJid);
+  const phoneDigits = contact?.phone_number || meta.sender_number || extractPhoneFromJid(contactJid || "");
 
   return {
     id: row.id,
@@ -114,7 +133,7 @@ function normalizeConversationRow(row, { contact = null, unreadCount = 0 } = {})
     is_group: isGroup,
     contact_jid: contactJid,
     chat_jid: chatJid,
-    phone_number: contact?.phone_number || meta.sender_number || null,
+    phone_number: phoneDigits || null,
     payload_type: meta.payload_type || meta.type || "text",
   };
 }
@@ -295,7 +314,7 @@ async function sendBotMessageViaApi(req, res, messageOverride) {
   }
 
   if (!hasApiPayloadContent(message)) return res.status(400).json({ error: "`message` or `template` is required." });
-  if (typeof message === "string" && message.length > 4096) return res.status(400).json({ error: "Message too long (max 4096 chars)." });
+  if (typeof message === "string" && message.length > 200_000) return res.status(400).json({ error: "Message too long." });
 
   // Check monthly limit with auto-reset
   const limitCheck = await checkMonthlyLimit(userId);
@@ -849,7 +868,6 @@ router.get("/conversations", async (req, res) => {
     const rows = data ?? [];
     const contactJids = [...new Set(rows.map((row) => getConversationContactJid(row)).filter(Boolean))];
     const botIds = [...new Set(rows.map((row) => row.bot_id).filter(Boolean))];
-    const archivedPairs = new Set();
     const contactMap = new Map();
     const rowIds = rows.map((row) => row.id).filter(Boolean);
     const readSet = new Set();
@@ -864,9 +882,6 @@ router.get("/conversations", async (req, res) => {
 
       for (const contact of contacts ?? []) {
         contactMap.set(`${contact.bot_id}:${contact.contact_jid}`, contact);
-        if (contact.archived_at || contact.deleted_at) {
-          archivedPairs.add(`${contact.bot_id}:${contact.contact_jid}`);
-        }
       }
     }
 
@@ -885,7 +900,6 @@ router.get("/conversations", async (req, res) => {
     const convMap = new Map();
     for (const r of rows) {
       const contactJid = getConversationContactJid(r);
-      if (contactJid && archivedPairs.has(`${r.bot_id}:${contactJid}`)) continue;
       const key = getConversationKey(r);
       const existing = convMap.get(key);
       const isUnreadInbound = (r.event_type === "message_received" || r.metadata?.direction === "inbound") && !readSet.has(r.id);
@@ -918,6 +932,7 @@ router.get("/conversations/thread", async (req, res) => {
   const botId = String(req.query.bot_id ?? "").trim();
   const conversationKey = String(req.query.conversation_key ?? "").trim();
   const limit = Math.min(Number(req.query.limit) || 200, 500);
+  const since = String(req.query.since ?? "").trim();
 
   if (!conversationKey) {
     return res.status(400).json({ error: "conversation_key is required." });
@@ -932,6 +947,7 @@ router.get("/conversations/thread", async (req, res) => {
       .order("created_at", { ascending: true })
       .limit(1000);
     if (botId) q = q.eq("bot_id", botId);
+    if (since) q = q.gt("created_at", since);
 
     const { data, error } = await q;
     if (error) return res.status(500).json({ error: "Could not fetch conversation thread." });
@@ -955,7 +971,12 @@ router.get("/conversations/thread", async (req, res) => {
         sender_name: row.metadata?.pushName || row.metadata?.displayName || row.metadata?.notifyName || null,
       }));
 
-    return res.json({ messages, count: messages.length, conversation_key: conversationKey });
+    return res.json({
+      messages,
+      count: messages.length,
+      conversation_key: conversationKey,
+      latest_at: messages.length ? messages[messages.length - 1].created_at : since || null,
+    });
   } catch {
     return res.status(500).json({ error: "Internal error fetching conversation thread." });
   }

@@ -52,11 +52,14 @@ export function Bots({ data, onRefresh }) {
       const targetBot = botId ? bots.find((item) => item.id === botId) ?? null : null;
 
       setShowDeploy(type === "deploy");
-      setConfigBot(
-        type === "config" && targetBot ? targetBot
-          : type === "qr" && targetBot ? { ...targetBot, _openQr: true }
-          : null
-      );
+      setConfigBot((current) => {
+        if (!(type === "config" || type === "qr") || !targetBot) return null;
+        const next = type === "qr" ? { ...targetBot, _openQr: true } : targetBot;
+        if (current?.id === next.id) {
+          return { ...current, ...next, _openQr: type === "qr" ? true : current._openQr };
+        }
+        return next;
+      });
       setDmBot(type === "dm" && targetBot ? targetBot : null);
     };
 

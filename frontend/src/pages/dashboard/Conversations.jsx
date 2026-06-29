@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Paperclip, RefreshCw, Search, Send, Smile, Users } from "lucide-react";
 import { botsApi } from "../../api/bots.js";
+import { openEventStream } from "../../api/client.js";
 import { Spinner } from "../../components/ui/Spinner.jsx";
 
-const POLL_MS = 12000;
+const POLL_MS = 30_000;
+const SSE_DEBOUNCE_MS = 1200;
 
 function formatSidebarTime(value) {
   if (!value) return "";
@@ -19,6 +21,11 @@ function formatSidebarTime(value) {
 function formatBubbleTime(value) {
   if (!value) return "";
   return new Date(value).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function formatPhoneLabel(value) {
+  const digits = String(value ?? "").replace(/[^\d]/g, "");
+  return digits ? `+${digits}` : "";
 }
 
 function getConversationTarget(conversation) {
@@ -50,12 +57,17 @@ function getMessagePreview(message) {
 }
 
 function getConversationTitle(conversation) {
-  return conversation?.title || conversation?.phone_number || "Unknown";
+  const title = String(conversation?.title ?? "").trim();
+  if (title && !title.includes("@")) return title;
+  const phone = formatPhoneLabel(conversation?.phone_number);
+  if (phone) return phone;
+  return title || "Unknown contact";
 }
 
 function getConversationSubtitle(conversation) {
   if (conversation?.is_group) return "Group chat";
-  if (conversation?.phone_number) return `+${conversation.phone_number}`;
+  const phone = formatPhoneLabel(conversation?.phone_number);
+  if (phone) return phone;
   return "Direct message";
 }
 
@@ -68,6 +80,8 @@ function getMessageSenderLabel(message, conversation) {
 
   const senderJid = String(message.sender_jid ?? "").trim();
   if (senderJid) {
+    const phone = formatPhoneLabel(senderJid);
+    if (phone) return phone;
     return senderJid
       .replace(/:\d+@/, "@")
       .replace("@s.whatsapp.net", "")
@@ -76,6 +90,20 @@ function getMessageSenderLabel(message, conversation) {
   }
 
   return getConversationTitle(conversation);
+}
+
+function mergeConversations(current, incoming) {
+  const map = new Map(current.map((item) => [`${item.bot_id}:${item.conversation_key}`, item]));
+  for (const item of incoming) {
+    map.set(`${item.bot_id}:${item.conversation_key}`, { ...map.get(`${item.bot_id}:${item.conversation_key}`), ...item });
+  }
+  return [...map.values()].sort((a, b) => new Date(b.last_message_at) - new Date(a.last_message_at));
+}
+
+function mergeThreadMessages(current, incoming) {
+  const map = new Map(current.map((item) => [item.id, item]));
+  for (const item of incoming) map.set(item.id, item);
+  return [...map.values()].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 }
 
 export function Conversations({ bots = [] }) {
@@ -97,6 +125,13 @@ export function Conversations({ bots = [] }) {
   const fileRef = useRef(null);
   const endRef = useRef(null);
   const refreshTimerRef = useRef(null);
+  const sseTimerRef = useRef(null);
+  const threadSinceRef = useRef(null);
+  const selectedRef = useRef(null);
+
+  useEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
 
   useEffect(() => {
     if (!hasBots) {
@@ -110,7 +145,7 @@ export function Conversations({ bots = [] }) {
     }
   }, [activeBotId, bots, hasBots]);
 
-  const loadConversations = useCallback(async (silent = false) => {
+  const loadConversations = useCallback(async ({ silent = false, merge = false } = {}) => {
     if (!hasBots) {
       setConversations([]);
       setLoading(false);
@@ -126,31 +161,46 @@ export function Conversations({ bots = [] }) {
     try {
       const data = await botsApi.v1Conversations(activeBotId === "all" ? undefined : activeBotId, 200, 0);
       const next = data.conversations ?? [];
-      setConversations(next);
+      setConversations((current) => (merge ? mergeConversations(current, next) : next));
       setSelected((current) => {
         if (!current) return current;
         const replacement = next.find((item) => item.conversation_key === current.conversation_key && item.bot_id === current.bot_id);
-        return replacement ?? null;
+        return replacement ? { ...current, ...replacement } : null;
       });
     } catch (err) {
-      setResult({ ok: false, text: err.message || "Could not load conversations." });
+      if (!silent) setResult({ ok: false, text: err.message || "Could not load conversations." });
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
   }, [activeBotId, hasBots]);
 
-  const loadThread = useCallback(async (conversation) => {
+  const loadThread = useCallback(async (conversation, { silent = false, incremental = false } = {}) => {
     if (!conversation) {
       setThreadMessages([]);
+      threadSinceRef.current = null;
       return;
     }
 
-    setThreadLoading(true);
+    if (!silent) setThreadLoading(true);
     try {
-      const data = await botsApi.v1ConversationThread(conversation.bot_id, conversation.conversation_key, 300);
+      const since = incremental ? threadSinceRef.current : null;
+      const data = await botsApi.v1ConversationThread(
+        conversation.bot_id,
+        conversation.conversation_key,
+        300,
+        since
+      );
       const messages = data.messages ?? [];
-      setThreadMessages(messages);
+
+      setThreadMessages((current) => {
+        if (!incremental || current.length === 0) return messages;
+        return mergeThreadMessages(current, messages);
+      });
+
+      if (messages.length > 0) {
+        threadSinceRef.current = data.latest_at || messages[messages.length - 1].created_at;
+      }
 
       if (conversation.unread) {
         const unreadIds = messages
@@ -170,27 +220,47 @@ export function Conversations({ bots = [] }) {
         } catch {}
       }
     } catch (err) {
-      setResult({ ok: false, text: err.message || "Could not load thread." });
+      if (!silent) setResult({ ok: false, text: err.message || "Could not load thread." });
     } finally {
-      setThreadLoading(false);
+      if (!silent) setThreadLoading(false);
     }
   }, []);
 
+  const refreshOpenViews = useCallback(async ({ silent = true, incremental = true } = {}) => {
+    await loadConversations({ silent, merge: true });
+    const current = selectedRef.current;
+    if (current) {
+      await loadThread(current, { silent, incremental });
+    }
+  }, [loadConversations, loadThread]);
+
   useEffect(() => {
+    threadSinceRef.current = null;
     loadConversations();
   }, [loadConversations]);
 
   useEffect(() => {
     clearInterval(refreshTimerRef.current);
     refreshTimerRef.current = setInterval(() => {
-      loadConversations(true);
-      if (selected) {
-        loadThread(selected);
-      }
+      refreshOpenViews({ silent: true, incremental: true });
     }, POLL_MS);
 
     return () => clearInterval(refreshTimerRef.current);
-  }, [loadConversations, loadThread, selected]);
+  }, [refreshOpenViews]);
+
+  useEffect(() => {
+    const closeStream = openEventStream("/bots/dashboard/events", () => {
+      clearTimeout(sseTimerRef.current);
+      sseTimerRef.current = setTimeout(() => {
+        refreshOpenViews({ silent: true, incremental: true });
+      }, SSE_DEBOUNCE_MS);
+    });
+
+    return () => {
+      clearTimeout(sseTimerRef.current);
+      closeStream();
+    };
+  }, [refreshOpenViews]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
@@ -222,6 +292,7 @@ export function Conversations({ bots = [] }) {
     setSelected(conversation);
     setComposer("");
     setResult(null);
+    threadSinceRef.current = null;
     loadThread(conversation);
   }, [loadThread]);
 
@@ -280,7 +351,7 @@ export function Conversations({ bots = [] }) {
 
       setComposer("");
       if (fileRef.current) fileRef.current.value = "";
-      await Promise.all([loadConversations(true), loadThread(selected)]);
+      await refreshOpenViews({ silent: true, incremental: false });
       setResult({ ok: true, text: "Message sent." });
       setTimeout(() => setResult(null), 2500);
     } catch (err) {
@@ -288,7 +359,7 @@ export function Conversations({ bots = [] }) {
     } finally {
       setSending(false);
     }
-  }, [composer, loadConversations, loadThread, selected]);
+  }, [composer, refreshOpenViews, selected]);
 
   if (!hasBots) {
     return (
@@ -314,14 +385,14 @@ export function Conversations({ bots = [] }) {
               {selectedBot ? `${selectedBot.bot_name} inbox` : "All bot inboxes"}
             </h2>
             <p className="mt-2 text-sm text-[var(--text2)]">
-              A WhatsApp-style workspace for messages, media, unread tracking, and replies, separated by bot session.
+              Live inbox updates without full-page refresh. Long replies are sent in multiple parts automatically.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             <button
               className="inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-2 text-sm text-[var(--text2)] transition hover:border-[var(--border-accent)] hover:text-[var(--text)]"
-              onClick={() => loadConversations(true)}
+              onClick={() => loadConversations({ silent: true, merge: false })}
               disabled={refreshing}
             >
               {refreshing ? <Spinner size="sm" /> : <RefreshCw size={15} />}
@@ -481,7 +552,7 @@ export function Conversations({ bots = [] }) {
               </div>
 
               <div className="min-h-0 flex-1 overflow-y-auto bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.06),transparent_40%),linear-gradient(180deg,rgba(255,255,255,0.02),rgba(0,0,0,0.06))] px-4 py-5">
-                {threadLoading ? (
+                {threadLoading && threadMessages.length === 0 ? (
                   <div className="flex h-full items-center justify-center">
                     <Spinner size="lg" />
                   </div>
@@ -578,7 +649,7 @@ export function Conversations({ bots = [] }) {
                         className="block w-full text-sm text-[var(--text2)] file:mr-3 file:rounded-full file:border-0 file:bg-[var(--accent)] file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
                       />
                       <div className="mt-2 text-xs text-[var(--text3)]">
-                        Send photos, videos, audio, PDFs, and office documents up to 16MB.
+                        Send photos, videos, audio, PDFs, and office documents up to 16MB. Long text is split automatically.
                       </div>
                     </div>
                   )}

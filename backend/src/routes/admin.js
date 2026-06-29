@@ -145,7 +145,7 @@ router.get("/activity", async (req, res) => {
 
     const { data, error } = await supabase
       .from("bot_activity")
-      .select("id, bot_id, event_type, details, created_at")
+      .select("id, bot_id, event_type, details, metadata, created_at")
       .order("created_at", { ascending: false })
       .limit(limit);
 

@@ -108,6 +108,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   const [tab, setTab]   = useState(initialBot._openQr ? "qr" : "info");
   const [form, setForm] = useState({
     bot_name:            bot.bot_name          ?? "",
+    bot_type:            bot.bot_type          ?? "dm",
     description:         bot.description       ?? "",
     webhook_url:         bot.webhook_url        ?? "",
     webhook_secret:      bot.webhook_secret     ?? "",
@@ -171,14 +172,16 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   const qrCdRef      = useRef(null);
   const qrMethodRef  = useRef(qrMethod);
   const autoPairRef  = useRef(null);
+  const botIdRef     = useRef(initialBot.id);
   const pairingStatuses = useMemo(() => new Set(["awaiting_code", "awaiting_pairing", "code_generated", "awaiting_link"]), []);
   const qrStatuses = useMemo(() => new Set(["awaiting_qr", "awaiting_qr_scan", "qr_generated"]), []);
 
-  const TABS = buildTabs(isPro, bot.bot_type);
+  const TABS = buildTabs(isPro, form.bot_type ?? bot.bot_type);
   const selectedPairCountry = getCountryByCode(pairCountry);
   const normalizedPairPhone = normalizePhoneNumber(pairCountry, phoneNumberInput);
   const hasUnsavedChanges = JSON.stringify({
     bot_name: form.bot_name,
+    bot_type: form.bot_type,
     description: form.description,
     webhook_url: form.webhook_url,
     webhook_secret: form.webhook_secret,
@@ -193,6 +196,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
     group_management_config: form.group_management_config,
   }) !== JSON.stringify({
     bot_name: bot.bot_name ?? "",
+    bot_type: bot.bot_type ?? "dm",
     description: bot.description ?? "",
     webhook_url: bot.webhook_url ?? "",
     webhook_secret: bot.webhook_secret ?? "",
@@ -245,51 +249,64 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
   }, [pairingCode, qrMethod]);
 
   useEffect(() => {
-    setBot(initialBot);
-    setTab(initialBot._openQr ? "qr" : "info");
-    setQrMethod(initialBot._preferredAuthMethod === "code" ? "code" : "qr");
-    setForm({
-      bot_name:            initialBot.bot_name          ?? "",
-      description:         initialBot.description       ?? "",
-      webhook_url:         initialBot.webhook_url        ?? "",
-      webhook_secret:      initialBot.webhook_secret     ?? "",
-      auto_reply_enabled:  initialBot.auto_reply_enabled ?? false,
-      auto_reply_message:  initialBot.auto_reply_message ?? "",
-      website_url:         initialBot.website_url        ?? "",
-      catalog_unavail_msg: initialBot.catalog_unavail_msg ?? "",
-      keyword_triggers:    Array.isArray(initialBot.keyword_triggers) ? initialBot.keyword_triggers : [],
-      sales_agent_config:  normalizeSalesAgentConfig(initialBot.sales_agent_config),
-      commands_config:     normalizeCommandsConfigState(initialBot.commands_config),
-      ai_config:           typeof initialBot.ai_config === "object" && initialBot.ai_config
-        ? {
-            conversation_memory_enabled: true,
-            memory_message_limit: 6,
-            memory_char_limit: 1200,
-            ...initialBot.ai_config,
-          }
-        : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", assistant_name: "Medara", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
-      group_management_config: typeof initialBot.group_management_config === "object" && initialBot.group_management_config
-        ? initialBot.group_management_config
-        : {
-            anti_link:           { enabled: false, action: "warn" },
-            anti_spam:           { enabled: false, threshold: 5, window_seconds: 10, action: "warn" },
-            anti_vulgar:         { enabled: false, words: [], action: "warn" },
-            auto_help_on_first_dm: false,
-            rules:               ""
-          }
-    });
-    setPairingCode(null);
-    setPairingExpiresAt(null);
-    setQrUrl(null);
-    setShowPhoneInput(false);
-    setAiKeyInput("");
-    setAiKeyCleared(false);
-    setAiKeySensitive(initialBot.ai_config?.is_sensitive ?? false);
-    setAiKeyTest({ status: "idle", msg: "" });
-    setPhoneNumberInput("");
-    setRequestedPairPhone(initialBot._autoRequestPairPhone ?? "");
-    autoPairRef.current = initialBot._autoRequestPairPhone ?? null;
-    setMsg({ text: "", ok: false });
+    if (initialBot.id !== botIdRef.current) {
+      botIdRef.current = initialBot.id;
+      setBot(initialBot);
+      setTab(initialBot._openQr ? "qr" : "info");
+      setQrMethod(initialBot._preferredAuthMethod === "code" ? "code" : "qr");
+      setForm({
+        bot_name:            initialBot.bot_name          ?? "",
+        bot_type:            initialBot.bot_type          ?? "dm",
+        description:         initialBot.description       ?? "",
+        webhook_url:         initialBot.webhook_url        ?? "",
+        webhook_secret:      initialBot.webhook_secret     ?? "",
+        auto_reply_enabled:  initialBot.auto_reply_enabled ?? false,
+        auto_reply_message:  initialBot.auto_reply_message ?? "",
+        website_url:         initialBot.website_url        ?? "",
+        catalog_unavail_msg: initialBot.catalog_unavail_msg ?? "",
+        keyword_triggers:    Array.isArray(initialBot.keyword_triggers) ? initialBot.keyword_triggers : [],
+        sales_agent_config:  normalizeSalesAgentConfig(initialBot.sales_agent_config),
+        commands_config:     normalizeCommandsConfigState(initialBot.commands_config),
+        ai_config:           typeof initialBot.ai_config === "object" && initialBot.ai_config
+          ? {
+              conversation_memory_enabled: true,
+              memory_message_limit: 6,
+              memory_char_limit: 1200,
+              ...initialBot.ai_config,
+            }
+          : { enabled: false, provider: "openai", model: "gpt-4o-mini", system_prompt: "", assistant_name: "Medara", conversation_memory_enabled: true, memory_message_limit: 6, memory_char_limit: 1200 },
+        group_management_config: typeof initialBot.group_management_config === "object" && initialBot.group_management_config
+          ? initialBot.group_management_config
+          : {
+              anti_link:           { enabled: false, action: "warn" },
+              anti_spam:           { enabled: false, threshold: 5, window_seconds: 10, action: "warn" },
+              anti_vulgar:         { enabled: false, words: [], action: "warn" },
+              auto_help_on_first_dm: false,
+              rules:               ""
+            }
+      });
+      setPairingCode(null);
+      setPairingExpiresAt(null);
+      setQrUrl(null);
+      setShowPhoneInput(false);
+      setAiKeyInput("");
+      setAiKeyCleared(false);
+      setAiKeySensitive(initialBot.ai_config?.is_sensitive ?? false);
+      setAiKeyTest({ status: "idle", msg: "" });
+      setPhoneNumberInput("");
+      setRequestedPairPhone(initialBot._autoRequestPairPhone ?? "");
+      autoPairRef.current = initialBot._autoRequestPairPhone ?? null;
+      setMsg({ text: "", ok: false });
+      return;
+    }
+
+    setBot((current) => ({
+      ...current,
+      ...initialBot,
+      status: initialBot.status ?? current.status,
+      messages_count: initialBot.messages_count ?? current.messages_count,
+      messages_this_month: initialBot.messages_this_month ?? current.messages_this_month,
+    }));
   }, [initialBot]);
 
   /* ── Fetch admin groups when Group tab is opened ─────────── */
@@ -376,7 +393,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
             setPairingExpiresAt(null);
             setQrUrl(null);
             setShowPhoneInput(false);
-            onClose();
+            setMsg({ text: "WhatsApp connected successfully. You can keep configuring this bot or close the modal.", ok: true });
           }
         }
       } catch {}
@@ -656,7 +673,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
 
   const sac      = form.sales_agent_config;
   const products = sac.products ?? [];
-  const typeIcon = bot.bot_type === "group" ? Users : bot.bot_type === "all" ? Globe : Bot;
+  const typeIcon = (form.bot_type ?? bot.bot_type) === "group" ? Users : (form.bot_type ?? bot.bot_type) === "all" ? Globe : Bot;
   const TypeIcon = typeIcon;
 
   return (
@@ -670,7 +687,7 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 700, fontSize: "1rem" }}>{bot.bot_name}</div>
             <div style={{ fontSize: "0.75rem", color: "var(--text3)", fontFamily: "monospace" }}>
-              {bot.id?.slice(0, 8)}… · {bot.bot_type ?? "dm"} bot
+              {bot.id?.slice(0, 8)}… · {form.bot_type ?? bot.bot_type ?? "dm"} bot
             </div>
           </div>
           <StatusBadge status={bot.status} />
@@ -700,13 +717,22 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
               <input className="input" placeholder="What does this bot do?" value={form.description} onChange={set("description")} />
             </div>
             <div className="field">
+              <label className="field-label">Bot mode</label>
+              <select className="input" value={form.bot_type ?? "dm"} onChange={set("bot_type")}>
+                <option value="dm">Direct messages (DM)</option>
+                <option value="group">Groups only</option>
+                <option value="all">DM + Groups</option>
+              </select>
+              <span className="field-hint">Switch between DM and group routing without disconnecting WhatsApp.</span>
+            </div>
+            <div className="field">
               <label className="field-label">Website URL <span style={{ fontSize: "0.75rem", color: "var(--text3)" }}>(used in product-not-found replies)</span></label>
               <input className="input" type="url" placeholder="https://yourstore.com" value={form.website_url} onChange={set("website_url")} />
             </div>
             <div style={{ display: "flex", gap: "1.25rem", fontSize: "0.8125rem", color: "var(--text3)", padding: "0.25rem 0" }}>
               <span>Created: <strong style={{ color: "var(--text2)" }}>{fmtDate(bot.created_at)}</strong></span>
               <span>Messages: <strong style={{ color: "var(--text2)" }}>{(bot.messages_count ?? 0).toLocaleString()}</strong></span>
-              <span>Type: <strong style={{ color: "var(--accent)" }}>{bot.bot_type ?? "dm"}</strong></span>
+              <span>Type: <strong style={{ color: "var(--accent)" }}>{form.bot_type ?? bot.bot_type ?? "dm"}</strong></span>
             </div>
           </div>
         )}
@@ -1294,7 +1320,9 @@ export function BotConfigModal({ bot: initialBot, user, onClose, onSaved }) {
                           e.target.value.split(/[\n,]/).map((value) => value.replace(/[^\d]/g, "")).filter(Boolean)
                         )}
                       />
-                      <span className="field-hint">Only these numbers can bypass receptionist mode and use the `/leads` command.</span>
+                      <span className="field-hint">
+                        Admins can chat with the assistant directly, use `/leads`, `/logs`, `/who`, and create polls with `/poll Question? | Option 1 | Option 2`.
+                      </span>
                     </div>
                   )}
 

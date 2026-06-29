@@ -4,7 +4,7 @@ import { botsApi }      from "../api/bots.js";
 import { openEventStream } from "../api/client.js";
 import { useAuth }      from "../context/AuthContext.jsx";
 
-const POLL_MS = 30_000;
+const POLL_MS = 60_000;
 const REFRESH_DEBOUNCE_MS = 400;
 
 export function useDashboard() {

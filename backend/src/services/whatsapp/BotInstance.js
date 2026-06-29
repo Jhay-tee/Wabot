@@ -35,6 +35,8 @@ import { env }           from "../../config/env.js";
 import { getAiCompletion, decryptApiKey } from "../ai/AiService.js";
 import { redactForLogs } from "../ai/PromptCompiler.js";
 import { compilePrompt } from "../ai/PromptEngine.js";
+import { splitMessageChunks } from "../../utils/messageChunks.js";
+import { isPhoneInAdminList, phonesMatch } from "../../utils/phoneMatch.js";
 
 const PLAN_MSG_LIMITS = { free: 1_000, paid: 100_000 };
 
@@ -85,6 +87,10 @@ const PAIRING_SOCKET_SETTLE_MS = 2_500;
 const PAIRING_REQUEST_TIMEOUT_MS = 45_000;
 const QR_AUTH_STATUSES = new Set(["awaiting_qr", "awaiting_qr_scan", "qr_generated"]);
 const PAIRING_AUTH_STATUSES = new Set(["awaiting_code", "awaiting_pairing", "code_generated", "awaiting_link"]);
+const CONTACT_TOUCH_MIN_MS = 2 * 60_000;
+const USER_LIMIT_CACHE_MS = 60_000;
+const LOG_FLUSH_DELAY_MS = 6_000;
+const LOG_FLUSH_BATCH_SIZE = 50;
 
 /* ── Normalise device-scoped JID to plain user JID ─────────── */
 function normalizeJid(jid = "") {
@@ -670,6 +676,8 @@ export class BotInstance {
     this._metaCache          = new Map(); // groupJid → { meta, cachedAt }
     this._seenDmContacts     = new Set();
     this._welcomedDmContacts = new Set();
+    this._contactTouchCache  = new Map();
+    this._userLimitCache     = { checkedAt: 0, usage: 0, limit: PLAN_MSG_LIMITS.free, tier: "free" };
   }
 
   onQR(cb)       { this._onQR.add(cb);     return () => this._onQR.delete(cb); }
@@ -870,10 +878,6 @@ export class BotInstance {
     if (this.status !== "connected") throw new Error("Bot is not connected. Status posting requires an active WhatsApp session.");
 
     const audience = await this._getStatusAudienceJids();
-    if (audience.length === 0) {
-      throw new Error("No active contacts available for status delivery yet. This bot needs at least one contact before posting a status.");
-    }
-
     const normalized = typeof message === "string"
       ? { payload: { text: message.trim() }, label: "Text status", metadata: { payload_type: "text" } }
       : this._normalizeOutboundMessagePayload(message);
@@ -881,7 +885,7 @@ export class BotInstance {
     const sendOptions = {};
     if (Array.isArray(options.statusJidList) && options.statusJidList.length > 0) {
       sendOptions.statusJidList = options.statusJidList;
-    } else {
+    } else if (audience.length > 0) {
       sendOptions.statusJidList = audience;
     }
 
@@ -895,14 +899,14 @@ export class BotInstance {
 
     await this._log("status_posted", `${normalized.label} posted to WhatsApp status`, {
       direction: "outbound",
-      audience_count: sendOptions.statusJidList.length,
+      audience_count: sendOptions.statusJidList?.length ?? 0,
       channel: "status",
       body: extractPreview(normalized.payload).slice(0, 2000),
       ...normalized.metadata,
     });
 
     return {
-      audienceCount: sendOptions.statusJidList.length,
+      audienceCount: sendOptions.statusJidList?.length ?? 0,
       payloadType: normalized.metadata?.payload_type || "text",
     };
   }
@@ -1204,6 +1208,7 @@ export class BotInstance {
     profilePatch = null,
     markAiResponse = false,
   } = {}) {
+    if (!this._shouldPersistConversationTurn()) return;
     const trimmed = truncateText(text, AI_MEMORY_LINE_MAX_CHARS);
     if (!conversationId || !trimmed) return;
 
@@ -1357,6 +1362,14 @@ export class BotInstance {
     const normalizedJid = normalizeJid(jid);
     if (!normalizedJid || isGroupJid(normalizedJid) || isBroadcastJid(normalizedJid)) return;
 
+    const cacheKey = normalizedJid;
+    const cached = this._contactTouchCache.get(cacheKey);
+    const now = Date.now();
+    const nameChanged = Boolean(displayName) && displayName !== cached?.displayName;
+    if (cached && !nameChanged && !archiveOverride && (now - cached.at) < CONTACT_TOUCH_MIN_MS) {
+      return;
+    }
+
     const payload = {
       user_id: this.userId,
       bot_id: this.botId,
@@ -1373,6 +1386,7 @@ export class BotInstance {
       await supabase.from("bot_contacts").upsert(payload, {
         onConflict: "bot_id,contact_jid",
       });
+      this._contactTouchCache.set(cacheKey, { at: now, displayName: payload.display_name });
     } catch (err) {
       logger.warn({ err, botId: this.botId, jid: normalizedJid }, "Failed to upsert bot contact");
     }
@@ -1391,8 +1405,111 @@ export class BotInstance {
 
   _isAssistantAdmin(senderJid) {
     const ai = this.config.ai_config ?? {};
-    const senderPhone = extractPhoneFromJid(senderJid);
-    return Array.isArray(ai.assistant_admin_numbers) && ai.assistant_admin_numbers.includes(senderPhone);
+    const adminNumbers = Array.isArray(ai.assistant_admin_numbers) ? ai.assistant_admin_numbers : [];
+    if (adminNumbers.length === 0) return false;
+
+    const normalizedSender = normalizeJid(senderJid);
+    const senderPhone = extractPhoneFromJid(normalizedSender);
+    if (senderPhone && isPhoneInAdminList(senderPhone, adminNumbers)) return true;
+
+    const botPhone = extractPhoneFromJid(this.socket?.user?.id ?? "");
+    if (botPhone && senderPhone && phonesMatch(botPhone, senderPhone)) {
+      return adminNumbers.some((admin) => phonesMatch(admin, botPhone));
+    }
+
+    return false;
+  }
+
+  _shouldPersistConversationTurn() {
+    const ai = this.config.ai_config ?? {};
+    return Boolean(
+      ai.conversation_memory_enabled ||
+      (ai.enabled && ai.assistant_enabled && this.config.plan_tier === "paid")
+    );
+  }
+
+  async _isUserOverMessageLimit() {
+    const tier = this.config.plan_tier ?? "free";
+    const limit = PLAN_MSG_LIMITS[tier] ?? PLAN_MSG_LIMITS.free;
+    const localUsage = this.config.messages_this_month ?? 0;
+    if (localUsage >= limit) return true;
+
+    const now = Date.now();
+    if (now - this._userLimitCache.checkedAt < USER_LIMIT_CACHE_MS) {
+      return this._userLimitCache.usage >= this._userLimitCache.limit;
+    }
+
+    const { data: user } = await supabase
+      .from("users")
+      .select("messages_this_month, plan_tier")
+      .eq("id", this.userId)
+      .single();
+
+    const dbUsage = user?.messages_this_month ?? 0;
+    const dbTier = user?.plan_tier ?? tier;
+    const dbLimit = PLAN_MSG_LIMITS[dbTier] ?? PLAN_MSG_LIMITS.free;
+    this._userLimitCache = { checkedAt: now, usage: dbUsage, limit: dbLimit, tier: dbTier };
+    return dbUsage >= dbLimit;
+  }
+
+  async _sendAssistantPoll(adminJid, rawInput) {
+    const parts = String(rawInput ?? "")
+      .split("|")
+      .map((part) => compactWhitespace(part))
+      .filter(Boolean);
+
+    if (parts.length < 3) {
+      await this._sendTrackedMessage(adminJid, {
+        text: "Poll format: /poll Question? | Option 1 | Option 2 [| Option 3 ...]",
+      }, {
+        eventType: "assistant_poll_help",
+        details: "Sent poll usage help to admin",
+        metadata: { channel: "assistant_mode" },
+      });
+      return;
+    }
+
+    const [question, ...options] = parts;
+    await this._sendTrackedMessage(adminJid, {
+      poll: {
+        name: question.slice(0, 255),
+        values: options.slice(0, 12).map((value) => value.slice(0, 100)),
+        selectableCount: 1,
+      },
+    }, {
+      eventType: "assistant_poll_sent",
+      details: `Admin poll created: ${question.slice(0, 80)}`,
+      metadata: { channel: "assistant_mode", options: options.length },
+    });
+  }
+
+  async _notifyAssistantAdmins({ name, phone, message, senderJid } = {}) {
+    const ai = this.config.ai_config ?? {};
+    const adminNumbers = Array.isArray(ai.assistant_admin_numbers) ? ai.assistant_admin_numbers : [];
+    if (adminNumbers.length === 0) return;
+
+    const summary = [
+      `*New lead captured*`,
+      `Name: ${name || "Unknown"}`,
+      `Phone: ${formatPhoneForHumans(phone) || "Not provided"}`,
+      `Message: ${truncateText(message, 240)}`,
+      senderJid ? `Contact: ${jidToReadableHandle(senderJid)}` : "",
+    ].filter(Boolean).join("\n");
+
+    for (const adminPhone of adminNumbers) {
+      const adminJid = toTargetJid(adminPhone);
+      if (!adminJid) continue;
+      try {
+        await this._sendTrackedMessage(adminJid, { text: summary }, {
+          eventType: "assistant_admin_notify",
+          details: "Notified assistant admin of new lead",
+          metadata: { channel: "assistant_mode" },
+          countUsage: false,
+        });
+      } catch (err) {
+        logger.warn({ err, botId: this.botId, adminJid }, "Failed to notify assistant admin");
+      }
+    }
   }
 
   async _sendAssistantLeadSummary(jid) {
@@ -1504,6 +1621,18 @@ export class BotInstance {
     }
 
     if (isAdmin) {
+      const pollMatch = trimmedBody.match(/^\/poll\s+(.+)/i) || trimmedBody.match(/^create\s+poll[:\s]+(.+)/i);
+      if (pollMatch) {
+        await this._sendAssistantPoll(jid, pollMatch[1]);
+        return true;
+      }
+
+      const wantsContactDetails = /(^\/who$)|\b(who messaged|contact details|customer details|recent contact)\b/i.test(lowerBody);
+      if (wantsContactDetails) {
+        await this._sendAssistantLogs(jid);
+        return true;
+      }
+
       return false;
     }
 
@@ -1571,6 +1700,12 @@ export class BotInstance {
     });
 
     if (stored) {
+      await this._notifyAssistantAdmins({
+        name: mergedProfile.name,
+        phone: mergedProfile.phone,
+        message: mergedProfile.lead_message ?? mergedProfile.message,
+        senderJid,
+      });
       await this._appendConversationTurn({
         conversationId: context.conversationId,
         contactJid: senderJid,
@@ -1896,22 +2031,30 @@ export class BotInstance {
       isGroup,
     });
 
-    await this._sendWithRetry(normalizedJid, payload);
+    const textBody = typeof payload?.text === "string" ? payload.text : null;
+    const chunks = textBody ? splitMessageChunks(textBody) : [payload];
 
-    if (countUsage) {
-      this._queueUsage({ totalMessages: 1, lastActivity: new Date().toISOString() });
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunkPayload = textBody ? { ...payload, text: chunks[index] } : payload;
+      await this._sendWithRetry(normalizedJid, chunkPayload);
+
+      if (countUsage && index === 0) {
+        this._queueUsage({ totalMessages: 1, lastActivity: new Date().toISOString() });
+      }
+
+      await this._log(eventType, details, {
+        direction: "outbound",
+        conversation_id: conversationId,
+        chat_jid: normalizedJid,
+        to: normalizedJid,
+        body: extractPreview(chunkPayload).slice(0, 2000),
+        isGroup,
+        chunk_index: chunks.length > 1 ? index + 1 : undefined,
+        chunk_total: chunks.length > 1 ? chunks.length : undefined,
+        ...outboundPayloadMetadata(chunkPayload),
+        ...metadata,
+      });
     }
-
-    await this._log(eventType, details, {
-      direction: "outbound",
-      conversation_id: conversationId,
-      chat_jid: normalizedJid,
-      to: normalizedJid,
-      body: extractPreview(payload).slice(0, 2000),
-      isGroup,
-      ...outboundPayloadMetadata(payload),
-      ...metadata,
-    });
 
     if (!isGroup) {
       await this._touchContact({
@@ -1920,7 +2063,7 @@ export class BotInstance {
         metadata: { last_direction: "outbound" },
       });
       const preview = extractPreview(payload);
-      if (preview) {
+      if (preview && this._shouldPersistConversationTurn()) {
         await this._appendConversationTurn({
           conversationId,
           contactJid: normalizedJid,
@@ -2081,40 +2224,34 @@ export class BotInstance {
 
     /* ── Plan limit check (fast in-memory, then DB) ─────────── */
     const limit = PLAN_MSG_LIMITS[this.config.plan_tier] ?? PLAN_MSG_LIMITS.free;
-
-    // ✅ FIX: in-memory fast-reject to avoid a DB round-trip on every message
-    //         when the bot is already known to be over limit
     const localUsage = this.config.messages_this_month ?? 0;
     if (localUsage >= limit) return;
 
-    // DB authoritative check (prevents multi-bot over-counting)
-    const { data: user } = await supabase
-      .from("users")
-      .select("messages_this_month, plan_tier")
-      .eq("id", this.userId)
-      .single();
-    const dbUsage = user?.messages_this_month ?? 0;
-    if (dbUsage >= limit) {
-      logger.warn({ botId: this.botId, userId: this.userId, dbUsage, limit }, "Monthly message limit reached");
+    if (await this._isUserOverMessageLimit()) {
+      logger.warn({ botId: this.botId, userId: this.userId, limit }, "Monthly message limit reached");
       return;
     }
 
     /* ── Increment counters ────────────────────────────────── */
-    // ✅ FIX: counters now increment AFTER the limit check (were before it previously)
     await this._incrementUserMonthlyCounter();
     this.config.messages_this_month = (this.config.messages_this_month ?? 0) + 1;
+    this._userLimitCache.usage = (this._userLimitCache.usage ?? 0) + 1;
     this._queueUsage({ messagesThisMonth: 1, totalMessages: 1, lastActivity: new Date().toISOString() });
 
-    const fromDisplay = isGroup ? jid : jid.replace("@s.whatsapp.net", "");
+    const pushName = compactWhitespace(msg.pushName ?? extra?.pushName ?? extra?.displayName ?? "");
+    const fromDisplay = isGroup ? jid : (pushName || formatPhoneForHumans(extractPhoneFromJid(jid)) || jid.replace("@s.whatsapp.net", ""));
     await this._log("message_received", `[${msgType}] from ${fromDisplay}`, {
       from: jid,
-      body: body.slice(0, 200),
+      body: body.slice(0, 2000),
       type: msgType,
       extra,
       direction: "inbound",
       conversation_id: conversationId,
       chat_jid: normalizeJid(jid),
       sender_jid: senderJid,
+      pushName: pushName || undefined,
+      displayName: pushName || extra?.displayName || undefined,
+      sender_number: extractPhoneFromJid(senderJid) || undefined,
       message_id: msg.key?.id ?? null,
       isGroup,
     });
@@ -2122,9 +2259,9 @@ export class BotInstance {
     if (!isGroup) {
       await this._touchContact({
         jid: senderJid,
-        displayName: extra?.displayName ?? "",
+        displayName: pushName || extra?.displayName || "",
         lastMessageAt: new Date().toISOString(),
-        metadata: { last_direction: "inbound" },
+        metadata: { last_direction: "inbound", pushName: pushName || null },
       });
       if (normalizedBody) {
         await this._appendConversationTurn({
@@ -3275,12 +3412,12 @@ export class BotInstance {
   }
 
   _scheduleLogFlush() {
-    if (this._pendingLogs.length >= 20) { this._flushLogs(); return; }
+    if (this._pendingLogs.length >= LOG_FLUSH_BATCH_SIZE) { this._flushLogs(); return; }
     if (this._logFlushTimer) return;
     this._logFlushTimer = setTimeout(() => {
       this._logFlushTimer = null;
       this._flushLogs();
-    }, 2000);
+    }, LOG_FLUSH_DELAY_MS);
   }
 
   async _flushLogs() {
